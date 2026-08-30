@@ -1,5 +1,8 @@
 {
   "mcpServers": {
+    "mcpjungle": {
+      "serverUrl": "http://192.168.5.22:8080/mcp"
+    },
     "playwright": {
       "command": "npx",
       "args": ["-y", "@playwright/mcp@latest"]
