@@ -4,7 +4,6 @@ import json
 import os
 import re
 import sys
-import time
 
 LIMIT = int(os.environ.get("GEMINI_DENY_LIMIT", "2"))
 STATE = os.path.expanduser("~/.gemini/tmp/denials")
@@ -35,6 +34,7 @@ def main():
     try:
         ev = json.load(sys.stdin)
     except Exception:
+        json.dump({"decision": "allow"}, sys.stdout)
         return
 
     tool_call = ev.get("toolCall", {})
@@ -61,8 +61,7 @@ def main():
             )
         }, sys.stdout)
     else:
-        # Default allow / no-op
-        json.dump({}, sys.stdout)
+        json.dump({"decision": "allow"}, sys.stdout)
 
 if __name__ == "__main__":
     main()

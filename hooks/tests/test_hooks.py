@@ -30,7 +30,7 @@ class TestHooks(unittest.TestCase):
         proc = subprocess.run([sys.executable, str(script)], input=payload, text=True, capture_output=True)
         self.assertEqual(proc.returncode, 0)
         res = json.loads(proc.stdout)
-        self.assertEqual(res, {})
+        self.assertEqual(res.get("decision"), "allow")
 
     def test_commit_gate_invalid_non_cc(self):
         script = HOOKS_DIR / "commit_gate.py"
@@ -73,7 +73,7 @@ class TestHooks(unittest.TestCase):
         proc = subprocess.run([sys.executable, str(script)], input=payload, text=True, capture_output=True)
         self.assertEqual(proc.returncode, 0)
         res = json.loads(proc.stdout)
-        self.assertEqual(res, {})
+        self.assertEqual(res.get("decision"), "allow")
 
 if __name__ == "__main__":
     unittest.main()

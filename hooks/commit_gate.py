@@ -8,17 +8,17 @@ def main():
     try:
         ev = json.load(sys.stdin)
     except Exception:
-        json.dump({}, sys.stdout)
+        json.dump({"decision": "allow"}, sys.stdout)
         return
 
     tool_call = ev.get("toolCall", {})
     if tool_call.get("name") != "run_command":
-        json.dump({}, sys.stdout)
+        json.dump({"decision": "allow"}, sys.stdout)
         return
 
     cmd = tool_call.get("args", {}).get("CommandLine", "")
     if "git commit" not in cmd:
-        json.dump({}, sys.stdout)
+        json.dump({"decision": "allow"}, sys.stdout)
         return
 
     # Extract -m message
@@ -30,7 +30,7 @@ def main():
             lines = m_here.group(2).strip().split('\n')
             subject = lines[0].strip()
         else:
-            json.dump({}, sys.stdout)
+            json.dump({"decision": "allow"}, sys.stdout)
             return
     else:
         subject = m.group(2).strip().split('\n')[0]
@@ -50,7 +50,7 @@ def main():
         }, sys.stdout)
         return
 
-    json.dump({}, sys.stdout)
+    json.dump({"decision": "allow"}, sys.stdout)
 
 if __name__ == "__main__":
     main()
