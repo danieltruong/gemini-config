@@ -1,0 +1,53 @@
+{
+  "reinforce": {
+    "PreInvocation": [
+      {
+        "type": "command",
+        "command": "python ./hooks/reinforce.py",
+        "timeout": 5
+      }
+    ]
+  },
+  "deny-circuit-breaker": {
+    "PreToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python ./hooks/deny_circuit_breaker.py",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  },
+  "commit-gate": {
+    "PreToolUse": [
+      {
+        "matcher": "run_command",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python ./hooks/commit_gate.py",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  },
+  "ai-docs-lint": {
+    "PostToolUse": [
+      {
+        "matcher": "replace_file_content|write_to_file",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python ./hooks/ai_docs_lint_hook.py",
+            "timeout": 15
+          }
+        ]
+      }
+    ]
+  }
+}

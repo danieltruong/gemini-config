@@ -1,0 +1,11 @@
+*.bak
+*.orig
+*.tmp
+__pycache__/
+*.pyc
+.DS_Store
+Thumbs.db
+settings.secrets.json
+mcp_config.secrets.json
+tmp/
+backups/
