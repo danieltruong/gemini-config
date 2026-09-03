@@ -35,19 +35,5 @@
         ]
       }
     ]
-  },
-  "ai-docs-lint": {
-    "PostToolUse": [
-      {
-        "matcher": "replace_file_content|write_to_file",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "python ./hooks/ai_docs_lint_hook.py",
-            "timeout": 15
-          }
-        ]
-      }
-    ]
   }
 }

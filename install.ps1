@@ -1,70 +1,52 @@
-# PowerShell installer for gemini-config on Windows
-# Links this repo into ~/.agents and ~/.gemini
+# PowerShell installer for gemini-config on Windows.
+# Links this repo into ~/.gemini (global rules) and ~/.gemini/config (global customizations).
 param(
-    [string]$AgentsDir = "$HOME\.agents",
-    [string]$GeminiDir = "$HOME\.gemini"
+    [string]$GeminiDir = "$HOME\.gemini",
+    [string]$AgentsSkillsDir = "$HOME\.agents\skills"
 )
 
 $ErrorActionPreference = "Stop"
 $Repo = $PSScriptRoot
+$Config = "$GeminiDir\config"
 
-Write-Host "Installing gemini-config into $AgentsDir and $GeminiDir..." -ForegroundColor Cyan
-
-# 1. Ensure target directories exist
-if (-not (Test-Path $AgentsDir)) { New-Item -ItemType Directory -Path $AgentsDir | Out-Null }
-if (-not (Test-Path $GeminiDir)) { New-Item -ItemType Directory -Path $GeminiDir | Out-Null }
-
-# 2. Hardlink GEMINI.md and AGENTS.md
-foreach ($doc in @("GEMINI.md", "AGENTS.md")) {
-    $src = "$Repo\$doc"
-    $dst = "$GeminiDir\$doc"
-    if (Test-Path $dst) { Remove-Item $dst -Force }
-    New-Item -ItemType HardLink -Path $dst -Target $src | Out-Null
-
-    $dstAgents = "$AgentsDir\$doc"
-    if (Test-Path $dstAgents) { Remove-Item $dstAgents -Force }
-    New-Item -ItemType HardLink -Path $dstAgents -Target $src | Out-Null
-}
-
-# 3. Directory junctions for shared folders (agents, hooks, scripts)
-foreach ($dir in @("agents", "hooks", "scripts")) {
-    $src = "$Repo\$dir"
-    $dst = "$AgentsDir\$dir"
+function Link-Dir($src, $dst) {
     if (Test-Path $dst) {
         $item = Get-Item $dst -Force
-        if ($item.LinkType -eq "Junction" -or $item.Attributes -match "ReparsePoint") {
-            $item.Delete()
-        } else {
-            Remove-Item -Recurse -Force $dst
-        }
+        if ($item.Attributes -match "ReparsePoint") { $item.Delete() } else { Remove-Item -Recurse -Force $dst }
     }
     New-Item -ItemType Junction -Path $dst -Target $src | Out-Null
 }
 
-# 4. Skills: link each skill individually into ~/.agents/skills/
-$skillsTarget = "$AgentsDir\skills"
-if (-not (Test-Path $skillsTarget)) { New-Item -ItemType Directory -Path $skillsTarget | Out-Null }
-
-foreach ($skillDir in Get-ChildItem -Directory "$Repo\skills") {
-    $name = $skillDir.Name
-    $dst = "$skillsTarget\$name"
-    if (Test-Path $dst) {
-        $item = Get-Item $dst -Force
-        if ($item.LinkType -eq "Junction" -or $item.Attributes -match "ReparsePoint") {
-            $item.Delete()
-        } else {
-            Remove-Item -Recurse -Force $dst
-        }
-    }
-    New-Item -ItemType Junction -Path $dst -Target $skillDir.FullName | Out-Null
-}
-
-# 5. Link hooks.json and mcp_config.json
-foreach ($cfg in @("hooks.json", "mcp_config.json")) {
-    $src = "$Repo\$cfg"
-    $dst = "$AgentsDir\$cfg"
+function Link-File($src, $dst) {
     if (Test-Path $dst) { Remove-Item $dst -Force }
-    Copy-Item $src $dst -Force
+    New-Item -ItemType HardLink -Path $dst -Target $src | Out-Null
 }
 
-Write-Host "gemini-config successfully installed and linked!" -ForegroundColor Green
+New-Item -ItemType Directory -Force -Path $Config, $AgentsSkillsDir | Out-Null
+
+# 1. Global rules
+Link-File "$Repo\GEMINI.md" "$GeminiDir\GEMINI.md"
+
+# 2. Global customizations
+foreach ($d in @("agents", "hooks", "scripts")) { Link-Dir "$Repo\$d" "$Config\$d" }
+Link-File "$Repo\hooks.json" "$Config\hooks.json"
+
+# 3. Skills into the global root and the cross-agent ~/.agents/skills dir
+Link-Dir "$Repo\skills" "$Config\skills"
+foreach ($skill in Get-ChildItem -Directory "$Repo\skills") {
+    Link-Dir $skill.FullName "$AgentsSkillsDir\$($skill.Name)"
+}
+
+# 4. MCP config: repo servers merged with machine-local mcp_config.local.json
+$local = "$Config\mcp_config.local.json"
+$out = "$Config\mcp_config.json"
+$base = Get-Content "$Repo\mcp_config.json" -Raw | ConvertFrom-Json -AsHashtable
+if (Test-Path $local) {
+    $extra = Get-Content $local -Raw | ConvertFrom-Json -AsHashtable
+    foreach ($k in $extra.mcpServers.Keys) { $base.mcpServers[$k] = $extra.mcpServers[$k] }
+} else {
+    Write-Warning "no $local; only repo MCP servers installed"
+}
+$base | ConvertTo-Json -Depth 10 | Set-Content $out -Encoding utf8
+
+Write-Host "installed into $GeminiDir and $Config" -ForegroundColor Green

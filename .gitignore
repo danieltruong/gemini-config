@@ -9,3 +9,4 @@ settings.secrets.json
 mcp_config.secrets.json
 tmp/
 backups/
+mcp_config.local.json

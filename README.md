@@ -1,36 +1,45 @@
 # gemini-config
 
-Portable configuration for Google Antigravity, Gemini CLI, and Gemini 2.5/3.0 agent workflows.
+Portable configuration for Google Antigravity (IDE and `agy` CLI).
 
-Includes global rules (`GEMINI.md`, `AGENTS.md`), portable skills (Caveman suite, Ponytail suite, A11y, MCP Builder, PDF, WebApp Testing), lifecycle hooks (`hooks.json`), and cross-platform installation scripts.
+## Install
 
-## Installation
+Windows:
 
-### Windows (PowerShell)
 ```powershell
 git clone https://github.com/danieltruong/gemini-config.git ~/gemini-config
 & ~/gemini-config/install.ps1
 ```
 
-### Linux / macOS
+Linux and macOS:
+
 ```bash
 git clone https://github.com/danieltruong/gemini-config.git ~/gemini-config
 bash ~/gemini-config/install.sh
 ```
 
-## Structure
+## What goes where
 
-- **`GEMINI.md` / `AGENTS.md`**: Global rules enforcing Caveman terseness, Ponytail bias (YAGNI/stdlib), and Gemini model tiering.
-- **`hooks.json` & `hooks/`**: Protojson lifecycle hooks for prompt reinforcement, commit message gating, denial circuit breaking, and docs linting.
-- **`skills/`**: Standard YAML frontmatter skills for accessibility, PDF processing, MCP development, web app testing, and token optimization.
-- **`agents/`**: Pre-configured subagent personas (researcher, coder, reviewer, tester, ui-designer).
-- **`mcp_config.json`**: MCP server configurations (Playwright, local tools).
-- **`scripts/`**: AI docs linter (`ai-docs-lint.py`), compressor (`caveman-compress.py`), and pre-push verification (`prepush.sh`).
+Antigravity reads global rules from `~/.gemini/GEMINI.md` and global customizations from `~/.gemini/config/`. The installer links this repo into both.
 
-## Verification
+| Repo path | Installed to | Purpose |
+|---|---|---|
+| `GEMINI.md` | `~/.gemini/GEMINI.md` | Global rules |
+| `agents/` | `~/.gemini/config/agents/` | Subagents: `researcher`, `coder`, `reviewer` |
+| `hooks.json`, `hooks/` | `~/.gemini/config/` | Lifecycle hooks |
+| `skills/` | `~/.gemini/config/skills/` and `~/.agents/skills/` | Skills |
+| `scripts/` | `~/.gemini/config/scripts/` | Linter, compressor, pre-push check |
+| `mcp_config.json` | `~/.gemini/config/mcp_config.json` | MCP servers |
 
-Run all test suites and doc linters:
+Machine-local MCP servers go in `~/.gemini/config/mcp_config.local.json`. The installer merges it over the repo file. It is not tracked.
+
+`AGENTS.md` in the repo root is a pointer for other tools that read that file. It is not installed.
+
+## Verify
+
 ```bash
 python scripts/ai-docs-lint.py --all
 python -m unittest discover -s hooks/tests
+agy mcp list
+agy agents
 ```

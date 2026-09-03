@@ -1,35 +1,36 @@
 #!/usr/bin/env bash
-# Symlink gemini-config into ~/.agents and ~/.gemini
+# Link gemini-config into ~/.gemini (global rules) and ~/.gemini/config (global customizations).
 set -euo pipefail
+command -v jq >/dev/null || { echo "jq required" >&2; exit 1; }
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-AGENTS_DIR="${AGENTS_CONFIG_DIR:-$HOME/.agents}"
 GEMINI_DIR="${GEMINI_CONFIG_DIR:-$HOME/.gemini}"
+CONFIG="$GEMINI_DIR/config"
+AGENTS_SKILLS="${AGENTS_SKILLS_DIR:-$HOME/.agents/skills}"
 
-mkdir -p "$AGENTS_DIR" "$GEMINI_DIR" "$AGENTS_DIR/skills"
+mkdir -p "$CONFIG" "$AGENTS_SKILLS"
 
-# Link global rules
-for doc in GEMINI.md AGENTS.md; do
-  ln -sfn "$REPO/$doc" "$GEMINI_DIR/$doc"
-  ln -sfn "$REPO/$doc" "$AGENTS_DIR/$doc"
-done
+# 1. Global rules
+ln -sfn "$REPO/GEMINI.md" "$GEMINI_DIR/GEMINI.md"
 
-# Link shared directories
-for d in agents hooks scripts; do
-  ln -sfn "$REPO/$d" "$AGENTS_DIR/$d"
-done
+# 2. Global customizations
+for d in agents hooks scripts; do ln -sfn "$REPO/$d" "$CONFIG/$d"; done
+ln -sfn "$REPO/hooks.json" "$CONFIG/hooks.json"
 
-# Link skills individually
+# 3. Skills into the global root and the cross-agent ~/.agents/skills dir
+ln -sfn "$REPO/skills" "$CONFIG/skills"
 for s in "$REPO"/skills/*/; do
   name="$(basename "$s")"
-  ln -sfn "${s%/}" "$AGENTS_DIR/skills/$name"
+  ln -sfn "${s%/}" "$AGENTS_SKILLS/$name"
 done
 
-# Link hooks and mcp config
-for cfg in hooks.json mcp_config.json; do
-  if [ -f "$REPO/$cfg" ]; then
-    cp "$REPO/$cfg" "$AGENTS_DIR/$cfg"
-  fi
-done
+# 4. MCP config: repo servers merged with machine-local mcp_config.local.json
+LOCAL="$CONFIG/mcp_config.local.json"
+if [ -f "$LOCAL" ]; then
+  jq -s '.[0] * .[1]' "$REPO/mcp_config.json" "$LOCAL" > "$CONFIG/mcp_config.json"
+else
+  echo "no $LOCAL; only repo MCP servers installed" >&2
+  cp "$REPO/mcp_config.json" "$CONFIG/mcp_config.json"
+fi
 
-echo "gemini-config installed into $AGENTS_DIR and $GEMINI_DIR"
+echo "installed into $GEMINI_DIR and $CONFIG"

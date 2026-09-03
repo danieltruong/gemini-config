@@ -14,10 +14,10 @@ def main():
         "injectSteps": [
             {
                 "ephemeralMessage": (
-                    "CAVEMAN & PONYTAIL MODE ACTIVE.\n"
-                    "- Terse output: drop filler, pleasantries, conversational hedging.\n"
-                    "- Exact technical details: preserve all paths, commands, code symbols, numbers, and negations.\n"
-                    "- Laziest working solution (YAGNI): minimal diff, stdlib/native features first, no unrequested abstractions."
+                    "CAVEMAN and PONYTAIL mode active.\n"
+                    "- Reply terse. Keep every path, command, symbol, number, and negation exact.\n"
+                    "- Ship the shortest working diff. Reuse the repo, then stdlib, then native platform features.\n"
+                    "- Never add filler, pleasantries, hedging, or unrequested abstractions."
                 )
             }
         ]
