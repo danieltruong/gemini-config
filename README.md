@@ -27,7 +27,7 @@ Antigravity reads global rules from `~/.gemini/GEMINI.md` and global customizati
 | `GEMINI.md` | `~/.gemini/GEMINI.md` | Global rules |
 | `agents/` | `~/.gemini/config/agents/` | Subagents, see the roster below |
 | `hooks.json`, `hooks/` | `~/.gemini/config/` | Lifecycle hooks |
-| `skills/` | `~/.gemini/config/skills/` and `~/.agents/skills/` | Skills |
+| `skills/` | `~/.gemini/config/skills/` | Skills |
 | `scripts/` | `~/.gemini/config/scripts/` | Linter, compressor, pre-push check |
 | `mcp_config.json` | `~/.gemini/config/mcp_config.json` | MCP servers |
 
@@ -99,6 +99,10 @@ The report is per-run scratch, so the gate deletes it when it lets the agent sto
 
 The verifier gate gives up after 4 attempts and the audit loop after 5, so a repo that cannot be fixed does not spin forever.
 
+## Decisions
+
+A run that picked one approach over another writes a line about it to `<workspace>/.agents/DECISIONS.md`, with the date, the decision, and why. The next run reads that file before it starts, so it does not re-argue a settled question or quietly undo one. The file stays under 200 lines: a decision that replaces an older one deletes the line it replaced instead of stacking on top of it. Unlike the audit report, this file is meant to be committed.
+
 ## Visual audit
 
 If a repo has `.agents/visual.md`, the audit round also asks for a screenshot pass. The file lists one URL per line under `## Pages` and the things each page has to get right under `## Accept`:
@@ -123,7 +127,7 @@ The agent opens each URL, screenshots it, checks every bullet, fixes what fails,
 
 While `visual.md` exists, an audit only counts as clean when `visual.failed` is 0.
 
-A dead http MCP server makes every headless run hang until the timeout expires. Setting `"disabled": true` does not help, it is ignored. Delete the entry from `~/.gemini/config/mcp_config.json` instead.
+A dead http MCP server makes every headless run hang until the timeout expires. Setting `"disabled": true` does not help, it is ignored. The installer handles this: it sends a HEAD request to every `serverUrl` with a 3 second timeout and leaves the ones that do not answer out of the installed file, printing a warning that names them. Any HTTP status counts as answering, so a server that returns 404 on `/mcp` is kept.
 
 ## Verify
 

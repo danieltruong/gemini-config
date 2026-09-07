@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Stop hook: blocks finishing while the repo's own verifier fails on files the agent changed."""
+import glob
 import json
 import os
 import re
@@ -24,6 +25,14 @@ MODEL_FINISHED = {"model_stop", "NO_TOOL_CALL"}
 WRITE_TOOLS = {"replace_file_content", "write_to_file", "multi_replace_file_content", "sed_file"}
 VERIFY_SCRIPTS = ("verify.cmd", "verify.ps1", "verify.sh")
 PYTEST_MARKERS = ("pyproject.toml", "pytest.ini", "setup.cfg")
+# marker files in the workspace root -> the steps that verify it, first match wins
+MARKER_VERIFIERS = (
+    (("Cargo.toml",), (("cargo test -q", ["cargo", "test", "-q"]),)),
+    (("go.mod",), (("go vet ./...", ["go", "vet", "./..."]),
+                   ("go test ./...", ["go", "test", "./..."]))),
+    (("*.sln", "*.csproj"), (("dotnet test", ["dotnet", "test"]),)),
+    (PYTEST_MARKERS, (("python -m pytest -q -x", [sys.executable, "-m", "pytest", "-q", "-x"]),)),
+)
 # lint report lines start with a project-relative path: "game/foo/bar.rpy:12 message"
 LINT_LINE = re.compile(r"^(\S+\.rpym?):(\d+)\s")
 IS_WINDOWS = os.name == "nt"
@@ -194,6 +203,15 @@ def renpy_lint(ws, files, deadline):
     return "renpy lint", 1 if hits else 0, hits
 
 
+def run_steps(ws, steps, deadline):
+    """The first failing step, or a pass for the last one. None when there are no steps."""
+    for label, argv in steps:
+        found = execute(ws, label, argv, deadline)
+        if found[1] != 0:
+            return found
+    return (steps[-1][0], 0, []) if steps else None
+
+
 def verify(ws, files):
     """Run the first verifier that fits this workspace. None when the repo has none."""
     deadline = time.monotonic() + VERIFY_TIMEOUT
@@ -216,15 +234,13 @@ def verify(ws, files):
         steps.append(("npm run lint", [npm, "run", "lint"]))
     if "test" in scripts:
         steps.append(("npm test", [npm, "test"]))
-    for label, argv in steps:
-        found = execute(ws, label, argv, deadline)
-        if found[1] != 0:
-            return found
-    if steps:
-        return steps[-1][0], 0, []
+    found = run_steps(ws, steps, deadline)
+    if found:
+        return found
 
-    if any(os.path.isfile(os.path.join(ws, m)) for m in PYTEST_MARKERS):
-        return execute(ws, "python -m pytest -q -x", [sys.executable, "-m", "pytest", "-q", "-x"], deadline)
+    for markers, steps in MARKER_VERIFIERS:
+        if any(glob.glob(os.path.join(ws, m)) for m in markers):
+            return run_steps(ws, steps, deadline)
 
     return None
 

@@ -1,8 +1,7 @@
 # PowerShell installer for gemini-config on Windows.
 # Links this repo into ~/.gemini (global rules) and ~/.gemini/config (global customizations).
 param(
-    [string]$GeminiDir = "$HOME\.gemini",
-    [string]$AgentsSkillsDir = "$HOME\.agents\skills"
+    [string]$GeminiDir = "$HOME\.gemini"
 )
 
 $ErrorActionPreference = "Stop"
@@ -22,7 +21,7 @@ function Link-File($src, $dst) {
     New-Item -ItemType HardLink -Path $dst -Target $src | Out-Null
 }
 
-New-Item -ItemType Directory -Force -Path $Config, $AgentsSkillsDir | Out-Null
+New-Item -ItemType Directory -Force -Path $Config | Out-Null
 
 # 1. Global rules
 Link-File "$Repo\GEMINI.md" "$GeminiDir\GEMINI.md"
@@ -31,11 +30,8 @@ Link-File "$Repo\GEMINI.md" "$GeminiDir\GEMINI.md"
 foreach ($d in @("agents", "hooks", "scripts")) { Link-Dir "$Repo\$d" "$Config\$d" }
 Link-File "$Repo\hooks.json" "$Config\hooks.json"
 
-# 3. Skills into the global root and the cross-agent ~/.agents/skills dir
+# 3. Skills. agy scans the global config dir only; ~/.agents/skills is workspace-scoped.
 Link-Dir "$Repo\skills" "$Config\skills"
-foreach ($skill in Get-ChildItem -Directory "$Repo\skills") {
-    Link-Dir $skill.FullName "$AgentsSkillsDir\$($skill.Name)"
-}
 
 # 4. MCP config: repo servers merged with machine-local mcp_config.local.json
 $local = "$Config\mcp_config.local.json"
@@ -50,6 +46,21 @@ if (Test-Path $local) {
 } else {
     Write-Warning "no $local; only repo MCP servers installed"
 }
+# A dead http server makes every headless run hang until its timeout, so drop it now.
+foreach ($k in @($base.mcpServers.PSObject.Properties.Name)) {
+    $url = $base.mcpServers.$k.serverUrl
+    if (-not $url) { continue }
+    try {
+        Invoke-WebRequest -Uri $url -Method Head -TimeoutSec 3 -UseBasicParsing | Out-Null
+    } catch {
+        # any HTTP status means something answered; no response at all means dead
+        if (-not $_.Exception.Response) {
+            Write-Warning "MCP server '$k' at $url did not answer; leaving it out"
+            $base.mcpServers.PSObject.Properties.Remove($k)
+        }
+    }
+}
+
 # BOM-less: Set-Content -Encoding utf8 adds one on 5.1, and agy's JSON parser rejects it.
 [System.IO.File]::WriteAllText($out, ($base | ConvertTo-Json -Depth 10), (New-Object System.Text.UTF8Encoding($false)))
 

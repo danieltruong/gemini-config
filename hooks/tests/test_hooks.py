@@ -432,9 +432,7 @@ class TestVerifierSelection(unittest.TestCase):
     def test_pytest_markers_detected(self):
         for marker in self.gate.PYTEST_MARKERS:
             with self.subTest(marker=marker):
-                shutil.rmtree(self.tmp, True)
-                os.makedirs(self.tmp, exist_ok=True)
-                self.ran.clear()
+                self.fresh()
                 self.write(marker)
                 label, _, _ = self.gate.verify(self.tmp, set())
                 self.assertEqual(label, "python -m pytest -q -x")
@@ -444,6 +442,35 @@ class TestVerifierSelection(unittest.TestCase):
         self.write("pyproject.toml")
         self.gate.verify(self.tmp, set())
         self.assertEqual(self.ran, ["npm test"])
+
+    def fresh(self):
+        shutil.rmtree(self.tmp, True)
+        os.makedirs(self.tmp, exist_ok=True)
+        self.ran.clear()
+
+    def test_cargo_toml_runs_cargo_test(self):
+        self.write("Cargo.toml")
+        self.assertEqual(self.gate.verify(self.tmp, set())[0], "cargo test -q")
+        self.assertEqual(self.ran, ["cargo test -q"])
+
+    def test_go_mod_runs_vet_then_test(self):
+        self.write("go.mod")
+        self.assertEqual(self.gate.verify(self.tmp, set())[0], "go test ./...")
+        self.assertEqual(self.ran, ["go vet ./...", "go test ./..."])
+
+    def test_dotnet_project_files_run_dotnet_test(self):
+        for marker in ("App.sln", "App.csproj"):
+            with self.subTest(marker=marker):
+                self.fresh()
+                self.write(marker)
+                self.assertEqual(self.gate.verify(self.tmp, set())[0], "dotnet test")
+                self.assertEqual(self.ran, ["dotnet test"])
+
+    def test_cargo_wins_over_pytest(self):
+        self.write("Cargo.toml")
+        self.write("pyproject.toml")
+        self.gate.verify(self.tmp, set())
+        self.assertEqual(self.ran, ["cargo test -q"])
 
     def test_no_verifier(self):
         self.assertIsNone(self.gate.verify(self.tmp, set()))
@@ -493,15 +520,28 @@ class TestPendingFindings(unittest.TestCase):
         self.assertIn("ai-docs-lint failed", res["injectSteps"][1]["ephemeralMessage"])
         self.assertFalse(self.pending.exists())
 
-    def test_reinforce_injects_once_only(self):
+    def test_findings_drain_once_only(self):
         self.lint_doc("x" * 20000)
         self.run_hook("reinforce.py", {"invocationNum": 1})
         res, _ = self.run_hook("reinforce.py", {"invocationNum": 2})
-        self.assertEqual(len(res["injectSteps"]), 1)
+        self.assertEqual(res["injectSteps"], [])
 
-    def test_reinforce_without_findings_is_unchanged(self):
-        res, _ = self.run_hook("reinforce.py", {"invocationNum": 0})
+    def test_banner_is_skipped_between_milestones(self):
+        for num in (2, 5, 9, 11):
+            res, _ = self.run_hook("reinforce.py", {"invocationNum": num})
+            self.assertEqual(res["injectSteps"], [], f"invocationNum {num}")
+
+    def test_banner_returns_every_tenth_invocation(self):
+        for num in (10, 20):
+            res, _ = self.run_hook("reinforce.py", {"invocationNum": num})
+            self.assertIn("CAVEMAN", res["injectSteps"][0]["ephemeralMessage"])
+
+    def test_findings_drain_without_the_banner(self):
+        self.lint_doc("x" * 20000)
+        res, _ = self.run_hook("reinforce.py", {"invocationNum": 3})
         self.assertEqual(len(res["injectSteps"]), 1)
+        self.assertIn("ai-docs-lint failed", res["injectSteps"][0]["ephemeralMessage"])
+        self.assertFalse(self.pending.exists())
 
 
 class TestTouchedFiles(unittest.TestCase):

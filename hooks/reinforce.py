@@ -18,23 +18,27 @@ def pending_findings():
         return ""
 
 
+BANNER = (
+    "CAVEMAN and PONYTAIL mode active.\n"
+    "- Reply terse. Keep every path, command, symbol, number, and negation exact.\n"
+    "- Ship the shortest working diff. Reuse the repo, then stdlib, then native platform features.\n"
+    "- Never add filler, pleasantries, hedging, or unrequested abstractions."
+)
+
+
 def main():
     try:
-        # Consume stdin context
-        _ = json.load(sys.stdin)
+        ev = json.load(sys.stdin)
     except Exception:
-        pass
+        ev = {}
 
-    steps = [
-        {
-            "ephemeralMessage": (
-                "CAVEMAN and PONYTAIL mode active.\n"
-                "- Reply terse. Keep every path, command, symbol, number, and negation exact.\n"
-                "- Ship the shortest working diff. Reuse the repo, then stdlib, then native platform features.\n"
-                "- Never add filler, pleasantries, hedging, or unrequested abstractions."
-            )
-        }
-    ]
+    try:
+        num = int(ev.get("invocationNum", 1))
+    except (TypeError, ValueError):
+        num = 1
+
+    # every turn would re-pay for a banner the model already read; every tenth keeps it in view
+    steps = [{"ephemeralMessage": BANNER}] if num == 1 or num % 10 == 0 else []
     findings = pending_findings()
     if findings:
         steps.append({"ephemeralMessage": findings})

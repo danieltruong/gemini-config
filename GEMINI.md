@@ -24,13 +24,15 @@
 
 ## Process
 
+0. Read `<ws>/.agents/DECISIONS.md` when it exist. Past run decide thing there.
 1. Explore: read every file change touch, callers too.
 2. Plan: list files and checks, one line each.
 3. Build.
-4. Verify: run repo verifier. `.agents/verify.cmd`, `.ps1` or `.sh` first; else `npm run lint` and `npm test`; else `python -m pytest -q -x`.
+4. Verify: run repo verifier. `.agents/verify.cmd`, `.ps1` or `.sh` first; else toolchain check for repo (`npm`, `pytest`, `cargo`, `go`, `dotnet`).
 5. Audit: `reviewer` subagent on diff, or read diff yourself when no subagent. Fix every bug, security, wrong-result, dead-code, over-engineering finding.
 6. Write `.agents/audit.json` `{clean, findings, round}` each round. `clean` true only when last round find nothing to fix.
-7. Repeat 3 to 6 until audit find nothing. Then finish.
+7. Repeat 3 to 6 until audit find nothing.
+8. Append one line per non-obvious decision this run to `<ws>/.agents/DECISIONS.md`: date, decision, why. Delete superseded line, keep file under 200 line. Then finish.
 
 - UI change: follow `.agents/visual.md`. Open every URL under `## Pages`, screenshot, check each bullet under `## Accept`, fix, repeat until all pass. Record `"visual": {"pages": n, "failed": m}` in audit.json.
 
@@ -43,7 +45,7 @@ You explore and plan, then delegate. Do work yourself only when change is one fi
 
 | Subagent | Job |
 |---|---|
-| built-in `research` | Read-only question about this codebase. Use instead of reading file into your context. |
+| built-in `research` | Read-only question about this codebase. Use instead of read file into your context. |
 | `researcher` | External docs, API, pricing. |
 | `coder` | One disjoint file group. |
 | `tester` | Test after coder land. Never same subagent write code and its test. |
