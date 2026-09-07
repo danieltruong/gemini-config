@@ -3,7 +3,7 @@
 ## Style
 
 - Talk short. Fragment ok. Path, command, number, unit, negation — keep exact.
-- Human words (commits, PR text, docs, comments) stay plain English: short sentence, one idea each.
+- Human words (commit, PR, doc, comment) stay plain English: short sentence, one idea.
 
 ## Build
 
@@ -19,7 +19,7 @@
 - Native tool first: `view_file`, `grep_search`, `find_by_name`, `replace_file_content`, `write_to_file`, `run_command`. Shell script only when native tool cannot.
 - MCP when it cover domain: `mcpjungle` for GitHub, Jira, Confluence, context7 docs; `playwright` for local browser; `renpy` for Ren'Py project.
 - Load skill before hand-roll its procedure: `caveman-commit` for commit message, `ponytail-review` or `caveman-review` for code review, `a11y-audit` for accessibility, `mcp-builder` for MCP server, `skill-creator` for new skill, `webapp-testing` for browser flow, `pdf` for PDF work.
-- Give long or parallel work to subagent with fresh context: built-in `research` for codebase explore, `researcher` for external docs, `coder` for multi-file change, `reviewer` for diff review. Split task above ~45 minutes or ~3 file groups.
+- Delegate work to subagent with fresh context. Roster and rules: `## Orchestrate`.
 - Wait on harness event. Background command or subagent tell you when done.
 
 ## Process
@@ -34,9 +34,28 @@
 
 - UI change: follow `.agents/visual.md`. Open every URL under `## Pages`, screenshot, check each bullet under `## Accept`, fix, repeat until all pass. Record `"visual": {"pages": n, "failed": m}` in audit.json.
 
-- Fan out independent file groups to subagents with `invoke_subagent`, Workspace `branch`.
-- Headless results that feed script use `--json-schema`.
+- Headless result that feed script use `--json-schema`.
 - Never say task done while verifier fail.
+
+## Orchestrate
+
+You explore and plan, then delegate. Do work yourself only when change is one file under ~20 lines.
+
+| Subagent | Job |
+|---|---|
+| built-in `research` | Read-only question about this codebase. Use instead of reading file into your context. |
+| `researcher` | External docs, API, pricing. |
+| `coder` | One disjoint file group. |
+| `tester` | Test after coder land. Never same subagent write code and its test. |
+| `linter` | Verifier and lint fix, after test pass. |
+| `reviewer` | Diff only. Never your reasoning, never your plan. |
+| `visual-qa` | UI change, when `.agents/visual.md` exist. |
+
+- Every brief name four thing: owned files, forbidden files, check to run, return format under 15 lines.
+- Delegate with `invoke_subagent`. Two or more `coder` at once: Workspace `branch` each. One alone: `inherit`.
+- Subagent never spawn subagent. Tree stay flat.
+- Merge result yourself, re-run verifier, write `.agents/audit.json`, finish.
+- User type `/boost` for one hard bug, `/teamwork-preview` for multi-day work. You never type them.
 
 ## Ren'Py
 
@@ -49,7 +68,7 @@
 
 ## Models
 
-Use `gemini-3.8-flash-high` for all Gemini work. No step down to lower Flash tier or effort. Escalate to `claude-opus-4-6-thinking` only for long autonomous task that already loop or stall once on Flash. Subagent: `reviewer` run on pro, `researcher` run on flash.
+Use `gemini-3.8-flash-high` for all Gemini work. No step down to lower Flash tier or effort. Escalate to `claude-opus-4-6-thinking` only for long autonomous task that already loop or stall once on Flash. Subagent: `reviewer` run on pro, `researcher` and `linter` run on flash, rest inherit.
 
 ## Git
 

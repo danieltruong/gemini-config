@@ -31,11 +31,12 @@ IS_WINDOWS = os.name == "nt"
 SDK_EXE = "renpy.exe" if IS_WINDOWS else "renpy.sh"
 
 AUDIT_REASON = (
-    "Audit round {round}: review `git diff HEAD` plus untracked files you created "
-    "(use the `reviewer` subagent when available, else inline). Fix every bug, security, "
-    "wrong-result, dead-code and over-engineering finding; re-run the verifier; then write "
-    ".agents/audit.json {{clean, findings, round}} and finish. clean is true only when the "
-    "last audit found nothing to fix."
+    "Audit round {round}: review `git diff HEAD` plus untracked files you created. "
+    "Delegate: reviewer for findings, linter for lint fixes, tester for missing tests, "
+    "visual-qa for .agents/visual.md. Work inline only when subagents are unavailable. "
+    "Fix every bug, security, wrong-result, dead-code and over-engineering finding; "
+    "re-run the verifier; then write .agents/audit.json {{clean, findings, round}} and "
+    "finish. clean is true only when the last audit found nothing to fix."
 )
 
 VISUAL_REASON = (

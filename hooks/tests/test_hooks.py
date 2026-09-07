@@ -285,6 +285,11 @@ class TestStopGate(unittest.TestCase):
         self.assertEqual(res.get("decision"), "continue")
         self.assertIn("Audit round 1:", res["reason"])
         self.assertIn("re-run the verifier", res["reason"])
+        self.assertIn(
+            "Delegate: reviewer for findings, linter for lint fixes, tester for missing tests, "
+            "visual-qa for .agents/visual.md.",
+            res["reason"],
+        )
 
     def test_stale_audit_report_continues(self):
         """A report older than the newest file this session wrote judged different code."""

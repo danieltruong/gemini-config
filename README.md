@@ -25,7 +25,7 @@ Antigravity reads global rules from `~/.gemini/GEMINI.md` and global customizati
 | Repo path | Installed to | Purpose |
 |---|---|---|
 | `GEMINI.md` | `~/.gemini/GEMINI.md` | Global rules |
-| `agents/` | `~/.gemini/config/agents/` | Subagents: `researcher`, `coder`, `reviewer` |
+| `agents/` | `~/.gemini/config/agents/` | Subagents, see the roster below |
 | `hooks.json`, `hooks/` | `~/.gemini/config/` | Lifecycle hooks |
 | `skills/` | `~/.gemini/config/skills/` and `~/.agents/skills/` | Skills |
 | `scripts/` | `~/.gemini/config/scripts/` | Linter, compressor, pre-push check |
@@ -36,6 +36,27 @@ agy 1.1.27 does not dispatch `PostToolUse` hooks. `PreToolUse`, `PreInvocation` 
 Machine-local MCP servers go in `~/.gemini/config/mcp_config.local.json`. The installer merges it over the repo file. It is not tracked.
 
 `AGENTS.md` in the repo root is a pointer for other tools that read that file. It is not installed.
+
+## Subagents
+
+The main agent explores, plans, and delegates. Each subagent starts with a clean context and one job, so nobody inherits another agent's assumptions. None of them can spawn a subagent of its own.
+
+| Agent | Model | Writes files | Returns |
+|---|---|---|---|
+| `coder` | inherit | yes, only the owned files in its brief | files changed, check results, what was left out |
+| `tester` | inherit | tests only | test files changed, verifier tail, gaps left |
+| `linter` | flash | yes, lint and format fixes only | pass or fail, files touched |
+| `reviewer` | pro | no | one line per finding, ordered by severity |
+| `visual-qa` | inherit | no | table of page, bullet, pass or fail, defect |
+| `researcher` | flash | no | answer first, then one source URL per claim |
+
+A brief has to name the owned files, the forbidden files, the check to run, and the return format. `reviewer` gets the diff and nothing else, since sharing the plan that produced the code makes it agree with the code.
+
+All of them are `mainAgent: false`, so `agy --agent <name>` and the `/agents` picker do not see them. Those only list agents that can run a session on their own; `agy --agent tester` answers `Agent "tester" not found, falling back to default` in `cli.log` and then silently uses the default agent. To check the roster really loaded, ask for it:
+
+```bash
+MSYS_NO_PATHCONV=1 agy -p "List the names of every subagent you can invoke. Names only, comma separated. Do not use any tool."
+```
 
 ## Unattended run
 
@@ -110,5 +131,6 @@ A dead http MCP server makes every headless run hang until the timeout expires. 
 python scripts/ai-docs-lint.py --all
 python -m unittest discover -s hooks/tests
 agy mcp list
-agy agents
 ```
+
+Then the subagent roster check above. `agy agents` lists nothing here, because every agent in this repo is a subagent.
