@@ -172,7 +172,7 @@ class TestStopGate(unittest.TestCase):
         self.assertEqual(res.get("decision"), "continue")
         self.assertIn("game/changed.rpy:4", res["reason"])
         self.assertNotIn("game/untouched.rpy", res["reason"])
-        self.assertIn("Fix them, re-run lint, then finish.", res["reason"])
+        self.assertIn("Fix, re-run renpy lint, then finish.", res["reason"])
 
     def test_errors_only_in_unchanged_files_stop(self):
         res = self.run_hook(self.payload(), stub=self.stub(["game/other.rpy"]))
@@ -242,6 +242,60 @@ class TestStopGate(unittest.TestCase):
         ))
         self.assertEqual(res.get("decision"), "stop")
 
+    def test_real_verify_script_failure_continues(self):
+        """End to end through subprocess: a .agents verifier that exits 1."""
+        agents = Path(self.tmp) / ".agents"
+        agents.mkdir()
+        if os.name == "nt":
+            (agents / "verify.cmd").write_text("@echo FAIL\r\n@exit /b 1\r\n", encoding="utf-8")
+            label = ".agents/verify.cmd"
+        else:
+            (agents / "verify.sh").write_text("echo FAIL\nexit 1\n", encoding="utf-8")
+            label = ".agents/verify.sh"
+        res = self.run_hook(self.payload(
+            workspacePaths=[self.tmp], transcriptPath=self.transcript_writing("src/app.py")
+        ))
+        self.assertEqual(res.get("decision"), "continue")
+        self.assertIn(f"Verifier failed ({label}):", res["reason"])
+        self.assertIn("FAIL", res["reason"])
+        self.assertIn(f"Fix, re-run {label}, then finish.", res["reason"])
+
+    def test_review_pass_fires_on_first_execution(self):
+        res = self.run_hook(self.payload(
+            executionNum=0, workspacePaths=[self.tmp],
+            transcriptPath=self.transcript_writing("src/app.py"),
+        ))
+        self.assertEqual(res.get("decision"), "continue")
+        self.assertIn("run the `reviewer` subagent on `git diff HEAD`", res["reason"])
+        self.assertIn("Do not fix nits.", res["reason"])
+
+    def test_review_pass_does_not_repeat(self):
+        res = self.run_hook(self.payload(
+            executionNum=1, workspacePaths=[self.tmp],
+            transcriptPath=self.transcript_writing("src/app.py"),
+        ))
+        self.assertEqual(res.get("decision"), "stop")
+
+    def test_review_skipped_when_only_docs_touched(self):
+        (Path(self.tmp) / "GEMINI.md").write_text("# Rules\n\n- Keep it short.\n", encoding="utf-8")
+        res = self.run_hook(self.payload(
+            executionNum=0, workspacePaths=[self.tmp],
+            transcriptPath=self.transcript_writing("GEMINI.md"),
+        ))
+        self.assertEqual(res.get("decision"), "stop")
+
+    def test_untouched_workspace_is_skipped(self):
+        """A session that wrote nothing here must not trigger the verifier."""
+        agents = Path(self.tmp) / ".agents"
+        agents.mkdir()
+        (agents / "verify.sh").write_text("exit 1\n", encoding="utf-8")
+        empty = Path(self.tmp) / "empty.jsonl"
+        empty.write_text(json.dumps({"step_index": 0, "type": "USER_INPUT"}) + "\n", encoding="utf-8")
+        res = self.run_hook(self.payload(
+            executionNum=0, workspacePaths=[self.tmp], transcriptPath=str(empty)
+        ))
+        self.assertEqual(res.get("decision"), "stop")
+
     def test_execution_num_4_stops(self):
         res = self.run_hook(self.payload(executionNum=4), stub=self.stub(["game/changed.rpy"]))
         self.assertEqual(res.get("decision"), "stop")
@@ -252,6 +306,79 @@ class TestStopGate(unittest.TestCase):
             [sys.executable, str(self.SCRIPT)], input="not json", text=True, capture_output=True, env=env
         )
         self.assertEqual(json.loads(proc.stdout).get("decision"), "stop")
+
+
+class TestVerifierSelection(unittest.TestCase):
+    """Which verifier a workspace picks. execute() is swapped for a recorder, so nothing runs."""
+
+    def setUp(self):
+        sys.path.insert(0, str(HOOKS_DIR))
+        self.addCleanup(sys.path.remove, str(HOOKS_DIR))
+        import stop_gate
+
+        self.gate = stop_gate
+        self.ran = []
+        real = stop_gate.execute
+        self.addCleanup(setattr, stop_gate, "execute", real)
+        stop_gate.execute = lambda ws, label, argv, deadline: (self.ran.append(label) or (label, 0, []))
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+
+    def write(self, rel, text="x"):
+        path = Path(self.tmp) / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+
+    def test_verify_script_wins_over_npm(self):
+        self.write(".agents/verify.sh")
+        self.write("package.json", json.dumps({"scripts": {"lint": "x", "test": "x"}}))
+        label, _, _ = self.gate.verify(self.tmp, set())
+        self.assertEqual(label, ".agents/verify.sh")
+        self.assertEqual(self.ran, [".agents/verify.sh"])
+
+    def test_cmd_preferred_over_ps1_and_sh(self):
+        for name in self.gate.VERIFY_SCRIPTS:
+            self.write(f".agents/{name}")
+        label, _, _ = self.gate.verify(self.tmp, set())
+        self.assertEqual(label, ".agents/verify.cmd")
+
+    def test_npm_runs_lint_then_test(self):
+        self.write("package.json", json.dumps({"scripts": {"lint": "x", "test": "x"}}))
+        self.gate.verify(self.tmp, set())
+        self.assertEqual(self.ran, ["npm run lint", "npm test"])
+
+    def test_npm_stops_at_first_failure(self):
+        self.write("package.json", json.dumps({"scripts": {"lint": "x", "test": "x"}}))
+        self.gate.execute = lambda ws, label, argv, deadline: (
+            self.ran.append(label) or (label, 1, ["boom"])
+        )
+        label, rc, _ = self.gate.verify(self.tmp, set())
+        self.assertEqual((label, rc), ("npm run lint", 1))
+        self.assertEqual(self.ran, ["npm run lint"])
+
+    def test_npm_without_matching_scripts_falls_through(self):
+        self.write("package.json", json.dumps({"scripts": {"build": "x"}}))
+        self.assertIsNone(self.gate.verify(self.tmp, set()))
+
+    def test_pytest_markers_detected(self):
+        for marker in self.gate.PYTEST_MARKERS:
+            with self.subTest(marker=marker):
+                shutil.rmtree(self.tmp, True)
+                os.makedirs(self.tmp, exist_ok=True)
+                self.ran.clear()
+                self.write(marker)
+                label, _, _ = self.gate.verify(self.tmp, set())
+                self.assertEqual(label, "python -m pytest -q -x")
+
+    def test_npm_wins_over_pytest(self):
+        self.write("package.json", json.dumps({"scripts": {"test": "x"}}))
+        self.write("pyproject.toml")
+        self.gate.verify(self.tmp, set())
+        self.assertEqual(self.ran, ["npm test"])
+
+    def test_no_verifier(self):
+        self.assertIsNone(self.gate.verify(self.tmp, set()))
+        self.assertEqual(self.ran, [])
 
 
 class TestPendingFindings(unittest.TestCase):

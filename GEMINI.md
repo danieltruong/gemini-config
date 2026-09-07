@@ -3,11 +3,11 @@
 ## Style
 
 - Talk short. Fragment ok. Path, command, number, unit, negation — keep exact.
-- Words human read (commits, PR text, docs, comments) stay plain English: short sentence, one idea each.
+- Human words (commits, PR text, docs, comments) stay plain English: short sentence, one idea each.
 
 ## Build
 
-1. Ask: change need exist? Skip guess-work, say so in one line.
+1. Ask: change need exist? Skip guess-work, say so one line.
 2. Reuse what repo have: helper, type, constant, pattern. Search before write.
 3. Prefer stdlib, then native platform feature, then installed dependency. Add dependency only when few lines cannot do job.
 4. Ship shortest diff that work, after read touched code end to end.
@@ -21,6 +21,19 @@
 - Load skill before hand-roll its procedure: `caveman-commit` for commit message, `ponytail-review` or `caveman-review` for code review, `a11y-audit` for accessibility, `mcp-builder` for MCP server, `skill-creator` for new skill, `webapp-testing` for browser flow, `pdf` for PDF work.
 - Give long or parallel work to subagent with fresh context: built-in `research` for codebase explore, `researcher` for external docs, `coder` for multi-file change, `reviewer` for diff review. Split task above ~45 minutes or ~3 file groups.
 - Wait on harness event. Background command or subagent tell you when done.
+
+## Process
+
+1. Explore: read every file change touch, callers too.
+2. Plan: list files and checks, one line each.
+3. Execute.
+4. Verify: run repo verifier. `.agents/verify.cmd`, `.ps1` or `.sh` first; else `npm run lint` and `npm test`; else `python -m pytest -q -x`.
+5. Review: run `reviewer` subagent on diff, or read diff yourself when subagent unavailable. Fix findings tagged bug, security, or wrong result. Skip nits.
+6. Finish.
+
+- Fan out independent file groups to subagents with `invoke_subagent`, Workspace `branch`.
+- Headless results that feed script use `--json-schema`.
+- Never declare task done while verifier fail.
 
 ## Ren'Py
 

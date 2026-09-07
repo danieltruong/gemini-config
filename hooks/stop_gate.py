@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Stop hook: blocks finishing while lint errors sit in files the agent changed."""
+"""Stop hook: blocks finishing while the repo's own verifier fails on files the agent changed."""
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -11,23 +12,33 @@ import hookpaths
 
 LOG = os.path.join(hookpaths.TMP, "stop_gate.log")
 LINT_TIMEOUT = 120
+VERIFY_TIMEOUT = 600
 MAX_EXECUTIONS = 3
 MAX_REPORTED = 40
 # agy 1.1.27 sends "NO_TOOL_CALL" here; "model_stop" is only in the docs. Every other
 # reason (ERROR, USER_CANCELED, MAX_*) means the agent did not choose to finish.
 MODEL_FINISHED = {"model_stop", "NO_TOOL_CALL"}
 WRITE_TOOLS = {"replace_file_content", "write_to_file", "multi_replace_file_content", "sed_file"}
+VERIFY_SCRIPTS = ("verify.cmd", "verify.ps1", "verify.sh")
+PYTEST_MARKERS = ("pyproject.toml", "pytest.ini", "setup.cfg")
 # lint report lines start with a project-relative path: "game/foo/bar.rpy:12 message"
 LINT_LINE = re.compile(r"^(\S+\.rpym?):(\d+)\s")
 IS_WINDOWS = os.name == "nt"
 # on Windows renpy.sh is a Linux binary and always fails, so only renpy.exe counts there
 SDK_EXE = "renpy.exe" if IS_WINDOWS else "renpy.sh"
 
+REVIEW_REASON = (
+    "Before finishing: run the `reviewer` subagent on `git diff HEAD` "
+    "(plus untracked files you created). If subagents are unavailable, read the diff "
+    "yourself against the same checklist. Fix every finding tagged bug, security, "
+    "or wrong result. Do not fix nits. Then finish."
+)
 
-def log(project, rc, errors, decision):
+
+def log(project, kind, detail):
     try:
         stamp = time.strftime("%Y-%m-%dT%H:%M:%S")
-        hookpaths.append(LOG, f"{stamp} {project} rc={rc} errors={errors} {decision}\n")
+        hookpaths.append(LOG, f"{stamp} {project} {kind} {detail}\n")
     except Exception:
         pass
 
@@ -111,35 +122,104 @@ def changed_files(project):
         return None
 
 
-def lint(project, transcript):
-    """(rc, lint report lines for files this session wrote; git-dirty files when no transcript)."""
-    sdk = find_sdk(project)
+def session_files(transcript, project):
+    """What this session wrote under project. None means unknown, so nothing gets filtered out."""
+    touched = touched_files(transcript, project) if transcript else None
+    return changed_files(project) if touched is None else touched
+
+
+def read_json(path):
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return json.load(fh)
+    except Exception:
+        return None
+
+
+def script_argv(path):
+    if path.endswith(".cmd"):
+        return ["cmd", "/c", path]
+    if path.endswith(".ps1"):
+        return ["powershell", "-ExecutionPolicy", "Bypass", "-File", path]
+    return ["bash", path]
+
+
+def execute(ws, label, argv, deadline):
+    """(label, returncode, output lines). Timeout or launch failure counts as a failure."""
+    try:
+        proc = subprocess.run(
+            argv, cwd=ws, capture_output=True, timeout=max(1, deadline - time.monotonic())
+        )
+        out = (proc.stdout + proc.stderr).decode("utf-8", "replace")
+        return label, proc.returncode, out.splitlines()
+    except subprocess.TimeoutExpired:
+        return label, 1, [f"timed out after {VERIFY_TIMEOUT}s"]
+    except Exception as exc:
+        return label, 1, [f"could not run {label}: {exc}"]
+
+
+def renpy_lint(ws, files, deadline):
+    sdk = find_sdk(ws)
     if sdk is None:
-        return None, []
+        return None
     # ponytail: re-lints the whole project on every Stop (~4 s); cache on .rpy mtimes if that drags
-    proc = subprocess.run(
-        [os.path.join(sdk, SDK_EXE), project, "lint", "--error-code"],
-        cwd=sdk, capture_output=True, timeout=LINT_TIMEOUT,
-    )
-    text = proc.stdout.decode("utf-8", "replace").lstrip("﻿")
-    changed = touched_files(transcript, project) if transcript else None
-    if changed is None:
-        changed = changed_files(project)
+    try:
+        proc = subprocess.run(
+            [os.path.join(sdk, SDK_EXE), ws, "lint", "--error-code"],
+            cwd=sdk, capture_output=True, timeout=min(LINT_TIMEOUT, max(1, deadline - time.monotonic())),
+        )
+    except Exception as exc:
+        return "renpy lint", 1, [f"could not run renpy lint: {exc}"]
+    text = proc.stdout.decode("utf-8", "replace").lstrip("\ufeff")
     hits = []
     for line in text.splitlines():
-        line = line.strip().lstrip("﻿")
+        line = line.strip().lstrip("\ufeff")
         m = LINT_LINE.match(line)
-        if m and (changed is None or m.group(1) in changed):
+        if m and (files is None or m.group(1) in files):
             hits.append(line)
-    return proc.returncode, hits
+    return "renpy lint", 1 if hits else 0, hits
 
 
-def docs_findings(project, transcript):
+def verify(ws, files):
+    """Run the first verifier that fits this workspace. None when the repo has none."""
+    deadline = time.monotonic() + VERIFY_TIMEOUT
+
+    for name in VERIFY_SCRIPTS:
+        path = os.path.join(ws, ".agents", name)
+        if os.path.isfile(path):
+            return execute(ws, f".agents/{name}", script_argv(path), deadline)
+
+    if os.path.isdir(os.path.join(ws, "game")):
+        found = renpy_lint(ws, files, deadline)
+        if found:
+            return found
+
+    pkg = read_json(os.path.join(ws, "package.json"))
+    scripts = (pkg or {}).get("scripts") or {}
+    npm = shutil.which("npm") or "npm"
+    steps = []
+    if "lint" in scripts:
+        steps.append(("npm run lint", [npm, "run", "lint"]))
+    if "test" in scripts:
+        steps.append(("npm test", [npm, "test"]))
+    for label, argv in steps:
+        found = execute(ws, label, argv, deadline)
+        if found[1] != 0:
+            return found
+    if steps:
+        return steps[-1][0], 0, []
+
+    if any(os.path.isfile(os.path.join(ws, m)) for m in PYTEST_MARKERS):
+        return execute(ws, "python -m pytest -q -x", [sys.executable, "-m", "pytest", "-q", "-x"], deadline)
+
+    return None
+
+
+def docs_findings(ws, files):
     """ai-docs-lint output for instruction docs this session wrote."""
-    touched = touched_files(transcript, project) if transcript else None
-    if not touched:
+    if not files:
         return []
-    paths = [os.path.join(project, rel) for rel in sorted(touched) if hookpaths.is_instruction_doc(rel)]
+    paths = [os.path.join(ws, rel) for rel in sorted(files) if hookpaths.is_instruction_doc(rel)]
     paths = [p for p in paths if os.path.isfile(p)]
     if not paths:
         return []
@@ -149,42 +229,62 @@ def docs_findings(project, transcript):
     return proc.stdout.splitlines() if proc.returncode else []
 
 
+def survey(spaces, transcript):
+    """(verifier failures, doc findings, whether any non-doc file was written)."""
+    failures, docs, code_touched = [], [], False
+    for ws in spaces:
+        files = session_files(transcript, ws)
+        if files is not None and not files:
+            continue
+        if files is None or any(not hookpaths.is_instruction_doc(f) for f in files):
+            code_touched = True
+        found = verify(ws, files)
+        if found and found[1] != 0:
+            failures.append((found[0], found[2]))
+        docs += docs_findings(ws, files)
+    return failures, docs, code_touched
+
+
 def main():
     stop = {"decision": "stop"}
-    project, rc, hits, note = "-", "-", [], ""
+    project, kind, detail = "-", "stop", ""
     try:
         ev = json.load(sys.stdin)
         if ev.get("terminationReason") not in MODEL_FINISHED or ev.get("fullyIdle") is False:
-            note = f" reason={ev.get('terminationReason')!r} idle={ev.get('fullyIdle')!r}"
+            detail = f"reason={ev.get('terminationReason')!r} idle={ev.get('fullyIdle')!r}"
         else:
             execution_num = ev.get("executionNum", 0)
-            transcript = ev.get("transcriptPath")
             spaces = ev.get("workspacePaths") or []
-            projects = [ws for ws in spaces if os.path.isdir(os.path.join(ws, "game"))]
-            project = ",".join(projects) or "-"
+            project = ",".join(spaces) or "-"
+            failures, docs, code_touched = survey(spaces, ev.get("transcriptPath"))
 
-            renpy_hits, doc_hits = [], []
-            for ws in projects:
-                rc, found = lint(ws, transcript)
-                renpy_hits += found
-            for ws in spaces:
-                doc_hits += docs_findings(ws, transcript)
-            hits = renpy_hits + doc_hits
+            reason = ""
+            if failures and execution_num <= MAX_EXECUTIONS:
+                kind, detail = "verifier", ",".join(label for label, _ in failures)
+                reason = "\n".join(
+                    f"Verifier failed ({label}):\n" + "\n".join(lines[-MAX_REPORTED:])
+                    + f"\nFix, re-run {label}, then finish."
+                    for label, lines in failures
+                )
+            elif docs and execution_num <= MAX_EXECUTIONS:
+                kind, detail = "docs", f"{len(docs)} findings"
+                reason = (
+                    "ai-docs-lint failed in files you changed:\n"
+                    + "\n".join(docs[:MAX_REPORTED])
+                    + "\nFix them, re-run lint, then finish."
+                )
+            elif execution_num == 0 and code_touched:
+                kind, detail, reason = "review", "diff review requested", REVIEW_REASON
 
-            parts = []
-            if renpy_hits:
-                parts.append("Ren'Py lint failed in files you changed:\n" + "\n".join(renpy_hits[:MAX_REPORTED]))
-            if doc_hits:
-                parts.append("ai-docs-lint failed in files you changed:\n" + "\n".join(doc_hits[:MAX_REPORTED]))
-            if parts and execution_num <= MAX_EXECUTIONS:
-                reason = "\n".join(parts) + "\nFix them, re-run lint, then finish."
-                log(project, rc, len(hits), "continue")
+            if reason:
+                log(project, kind, detail)
                 json.dump({"decision": "continue", "reason": reason}, sys.stdout)
                 return
-    except Exception:
-        note = " exception"
+            detail = f"execution={execution_num} code_touched={code_touched}"
+    except Exception as exc:
+        detail = f"exception {exc!r}"
 
-    log(project, rc, len(hits), "stop" + note)
+    log(project, "stop", detail)
     json.dump(stop, sys.stdout)
 
 
