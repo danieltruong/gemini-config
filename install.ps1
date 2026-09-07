@@ -40,13 +40,17 @@ foreach ($skill in Get-ChildItem -Directory "$Repo\skills") {
 # 4. MCP config: repo servers merged with machine-local mcp_config.local.json
 $local = "$Config\mcp_config.local.json"
 $out = "$Config\mcp_config.json"
-$base = Get-Content "$Repo\mcp_config.json" -Raw | ConvertFrom-Json -AsHashtable
+# PSObject rather than -AsHashtable: that switch does not exist in Windows PowerShell 5.1.
+$base = Get-Content "$Repo\mcp_config.json" -Raw | ConvertFrom-Json
 if (Test-Path $local) {
-    $extra = Get-Content $local -Raw | ConvertFrom-Json -AsHashtable
-    foreach ($k in $extra.mcpServers.Keys) { $base.mcpServers[$k] = $extra.mcpServers[$k] }
+    $extra = Get-Content $local -Raw | ConvertFrom-Json
+    foreach ($k in $extra.mcpServers.PSObject.Properties.Name) {
+        $base.mcpServers | Add-Member -NotePropertyName $k -NotePropertyValue $extra.mcpServers.$k -Force
+    }
 } else {
     Write-Warning "no $local; only repo MCP servers installed"
 }
-$base | ConvertTo-Json -Depth 10 | Set-Content $out -Encoding utf8
+# BOM-less: Set-Content -Encoding utf8 adds one on 5.1, and agy's JSON parser rejects it.
+[System.IO.File]::WriteAllText($out, ($base | ConvertTo-Json -Depth 10), (New-Object System.Text.UTF8Encoding($false)))
 
 Write-Host "installed into $GeminiDir and $Config" -ForegroundColor Green

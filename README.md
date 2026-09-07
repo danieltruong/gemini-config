@@ -31,9 +31,22 @@ Antigravity reads global rules from `~/.gemini/GEMINI.md` and global customizati
 | `scripts/` | `~/.gemini/config/scripts/` | Linter, compressor, pre-push check |
 | `mcp_config.json` | `~/.gemini/config/mcp_config.json` | MCP servers |
 
+agy 1.1.27 does not dispatch `PostToolUse` hooks. `PreToolUse`, `PreInvocation` and `Stop` all run. The `ai-docs-lint` entry stays wired for a build that ships it; until then `stop-gate` runs the same check at Stop.
+
 Machine-local MCP servers go in `~/.gemini/config/mcp_config.local.json`. The installer merges it over the repo file. It is not tracked.
 
 `AGENTS.md` in the repo root is a pointer for other tools that read that file. It is not installed.
+
+## Unattended run
+
+```bash
+cd "F:/Factory/renpy/Birth Battle"
+agy -p "<task>" --add-dir "F:/Factory/renpy/Birth Battle" --output-format json --print-timeout 45m
+```
+
+`--add-dir` is required. Without it `workspacePaths` arrives empty and the Ren'Py lint gate finds no project to check.
+
+A dead http MCP server makes every headless run hang until the timeout expires. Setting `"disabled": true` does not help, it is ignored. Delete the entry from `~/.gemini/config/mcp_config.json` instead.
 
 ## Verify
 

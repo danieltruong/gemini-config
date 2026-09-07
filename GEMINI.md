@@ -2,40 +2,49 @@
 
 ## Style
 
-- Reply terse. Fragments fine. Keep every path, command, number, unit, and negation exact.
-- Prose that people read (commits, PR text, docs, comments) stays plain English: short sentences, one idea each.
+- Talk short. Fragment ok. Path, command, number, unit, negation — keep exact.
+- Words human read (commits, PR text, docs, comments) stay plain English: short sentence, one idea each.
 
 ## Build
 
-1. Ask whether the change needs to exist. Skip speculative work and say so in one line.
-2. Reuse what the repo already has: helper, type, constant, pattern. Search before writing.
-3. Prefer stdlib, then native platform feature, then an installed dependency. Add a dependency only when a few lines cannot do the job.
-4. Ship the shortest diff that works after reading the code it touches end to end.
-5. Fix the root cause in the shared function, then check every caller.
+1. Ask: change need exist? Skip guess-work, say so in one line.
+2. Reuse what repo have: helper, type, constant, pattern. Search before write.
+3. Prefer stdlib, then native platform feature, then installed dependency. Add dependency only when few lines cannot do job.
+4. Ship shortest diff that work, after read touched code end to end.
+5. Fix root cause in shared function, then check every caller.
 6. Leave one runnable check behind for non-trivial logic.
 
 ## Tools
 
-- Use native tools first: `view_file`, `grep_search`, `find_by_name`, `replace_file_content`, `write_to_file`, `run_command`. Fall back to shell scripts only when a native tool cannot do it.
-- Use MCP when it covers the domain: `mcpjungle` for GitHub, Jira, Confluence, context7 docs; `playwright` for local browsers; `renpy` for Ren'Py projects.
-- Load a skill before hand-rolling its procedure: `caveman-commit` for commit messages, `ponytail-review` or `caveman-review` for code review, `a11y-audit` for accessibility, `mcp-builder` for MCP servers, `skill-creator` for new skills, `webapp-testing` for browser flows, `pdf` for PDF work.
-- Delegate long or parallel work to subagents with a fresh context: built-in `research` for codebase exploration, `researcher` for external docs, `coder` for a multi-file change, `reviewer` for a diff review. Split tasks above ~45 minutes or ~3 file groups.
-- Wait on harness events. A background command or subagent notifies on completion.
+- Native tool first: `view_file`, `grep_search`, `find_by_name`, `replace_file_content`, `write_to_file`, `run_command`. Shell script only when native tool cannot.
+- MCP when it cover domain: `mcpjungle` for GitHub, Jira, Confluence, context7 docs; `playwright` for local browser; `renpy` for Ren'Py project.
+- Load skill before hand-roll its procedure: `caveman-commit` for commit message, `ponytail-review` or `caveman-review` for code review, `a11y-audit` for accessibility, `mcp-builder` for MCP server, `skill-creator` for new skill, `webapp-testing` for browser flow, `pdf` for PDF work.
+- Give long or parallel work to subagent with fresh context: built-in `research` for codebase explore, `researcher` for external docs, `coder` for multi-file change, `reviewer` for diff review. Split task above ~45 minutes or ~3 file groups.
+- Wait on harness event. Background command or subagent tell you when done.
+
+## Ren'Py
+
+- SDK live at `F:/Factory/renpy`. Every project is subdirectory of it, example `F:/Factory/renpy/Birth Battle`.
+- Verify change with `F:/Factory/renpy/renpy.exe "<project>" lint --error-code`, then `F:/Factory/renpy/renpy.exe "<project>" test` for Ren'Py 8.5 testcase framework. Never call `renpy.sh` on Windows: it Linux script, always fail.
+- Answer question about `.rpy` file with `renpy` MCP tools, not grep: `renpy_run_lint`, `renpy_static_check`, `renpy_check_assets`, `renpy_find_symbol`, `renpy_get_call_graph`, `renpy_dump_symbols`.
+- Unattended run must never call `renpy_launch_game`, `renpy_wipe_persistent`, or `renpy_build_distribution`. They need human at keyboard.
+- Stop hook block finish while file you change still have lint error. Fix reported line, re-run lint, then finish.
+- Keep save loadable: add new state with `define` or `default`, never rename or drop one that ship, keep `from` clause on every existing `call`.
 
 ## Models
 
-Use `gemini-3.8-flash-high` for all Gemini work. Do not step down to a lower Flash tier or effort. Escalate to `claude-opus-4-6-thinking` only for a long autonomous task that has already looped or stalled once on Flash.
+Use `gemini-3.8-flash-high` for all Gemini work. No step down to lower Flash tier or effort. Escalate to `claude-opus-4-6-thinking` only for long autonomous task that already loop or stall once on Flash. Subagent: `reviewer` run on pro, `researcher` run on flash.
 
 ## Git
 
-- Build, lint, and tests pass before any commit. Ask before committing.
-- Conventional Commits subject, 50 characters or fewer. Body says why, only when not obvious.
-- Delete dead code, stale comments, and unused imports in the area touched. Never leave `.bak` or `.orig` files.
+- Build, lint, test pass before any commit. Ask before commit.
+- Conventional Commits subject, 50 character or fewer. Body say why, only when not obvious.
+- Delete dead code, stale comment, unused import in area touched. Never leave `.bak` or `.orig` file.
 
 ## Constraints
 
-- Never commit or push without a green build.
-- Never write a credential value into notes, docs, or commits.
-- Never add an AI attribution line to a commit or PR.
-- Never poll with tool calls. Never call `sleep` to wait.
-- Never keep a superseded note beside the new one. Replace it.
+- Never commit or push without green build.
+- Never write credential value into note, doc, or commit.
+- Never add AI attribution line to commit or PR.
+- Never poll with tool call. Never call `sleep` to wait.
+- Never keep superseded note beside new one. Replace it.
