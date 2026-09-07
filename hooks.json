@@ -36,6 +36,48 @@
       }
     ]
   },
+  "clock-wait-gate": {
+    "PreToolUse": [
+      {
+        "matcher": "run_command",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python ./hooks/clock_wait_gate.py",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  },
+  "no-ai-mentions": {
+    "PreToolUse": [
+      {
+        "matcher": "write_to_file|replace_file_content|multi_replace_file_content|sed_file|run_command",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python ./hooks/no_ai_mentions.py",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  },
+  "write-gate": {
+    "PreToolUse": [
+      {
+        "matcher": "write_to_file|replace_file_content|multi_replace_file_content|sed_file",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python ./hooks/write_gate.py",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  },
   "stop-gate": {
     "Stop": [
       {

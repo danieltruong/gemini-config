@@ -14,13 +14,44 @@
 5. Fix root cause in shared function, then check every caller.
 6. Leave one runnable check behind for non-trivial logic.
 
+## Clean
+
+- Every touch: delete dead code, stale comment, unused import, commented-out block in area you edit.
+- Doc, README or comment sentence made false by change: fix in same commit.
+- Note, TODO or DECISIONS entry superseded: update or delete it. Never append beside stale one.
+- No `.bak`, `.orig`, `.old`, `-v2`, `copy` file. Git hold history.
+- Delete temp file and scratch directory you made, before you finish. Stop hook list leftover and block.
+
+## No shortcuts
+
+- Fix root cause, not symptom. Grep every caller before you edit shared function.
+- Never suppress lint, type or test error to pass gate: no `eslint-disable`, `noqa`, `ts-ignore`, `skip`, `xfail`.
+- Never mock around real bug. Never `--no-verify`. Never widen timeout or permission to make check pass.
+- Deliberate ceiling get one `ponytail:` line naming ceiling and upgrade trigger.
+
+## Reuse
+
+- Before you write script or helper, look in `~/scripts`, `<ws>/.agents/scripts`, `~/.gemini/config/scripts`, repo. Existing tool cover it → run it. Nearly → extend it. Never copy-fork.
+- Same throwaway script or one-liner needed second time → promote it: `~/scripts/<verb-noun>.sh|.py` cross-repo, `<ws>/.agents/scripts/` one repo. Need `--help`, argument not hardcoded path, non-zero exit on fail.
+- Second copy of logic → extract shared function. Third copy mean extraction skipped: fix at root, delete copies.
+- One source of truth per fact: version, URL, port, path, threshold live one place, rest read it.
+
+## Comments
+
+- Only non-obvious why, workaround, invariant. Never narrate what code do.
+- More than 2 line of explanation → doc under `docs/`, one line link from code.
+
+## Wait
+
+- Never poll with tool call. Never `sleep`, `Start-Sleep`, `timeout /t`, `ping` delay: hook deny them.
+- Use `command_status` with `WaitDurationSeconds`, or wait tool. Background command notify you when done.
+
 ## Tools
 
 - Native tool first: `view_file`, `grep_search`, `find_by_name`, `replace_file_content`, `write_to_file`, `run_command`. Shell script only when native tool cannot.
 - MCP when it cover domain: `mcpjungle` for GitHub, Jira, Confluence, context7 docs; `playwright` for local browser; `renpy` for Ren'Py project.
 - Load skill before hand-roll its procedure: `caveman-commit` for commit message, `ponytail-review` or `caveman-review` for code review, `a11y-audit` for accessibility, `mcp-builder` for MCP server, `skill-creator` for new skill, `webapp-testing` for browser flow, `pdf` for PDF work.
 - Delegate work to subagent with fresh context. Roster and rules: `## Orchestrate`.
-- Wait on harness event. Background command or subagent tell you when done.
 
 ## Process
 
@@ -47,10 +78,12 @@ You explore and plan, then delegate. Do work yourself only when change is one fi
 |---|---|
 | built-in `research` | Read-only question about this codebase. Use instead of read file into your context. |
 | `researcher` | External docs, API, pricing. |
+| `debugger` | Cause of failure unknown. Run before `coder`, never after guess. |
 | `coder` | One disjoint file group. |
 | `tester` | Test after coder land. Never same subagent write code and its test. |
 | `linter` | Verifier and lint fix, after test pass. |
 | `reviewer` | Diff only. Never your reasoning, never your plan. |
+| `security-reviewer` | Diff touch auth, input parsing, or anything public. |
 | `visual-qa` | UI change, when `.agents/visual.md` exist. |
 
 - Every brief name four thing: owned files, forbidden files, check to run, return format under 15 lines.
@@ -58,6 +91,16 @@ You explore and plan, then delegate. Do work yourself only when change is one fi
 - Subagent never spawn subagent. Tree stay flat.
 - Merge result yourself, re-run verifier, write `.agents/audit.json`, finish.
 - User type `/boost` for one hard bug, `/teamwork-preview` for multi-day work. You never type them.
+
+## Improve config
+
+End of run, when run hit tool quirk, wrong or missing rule, missing permission, verifier gate not detect, or manual step you repeated: fix config itself.
+
+- Rule → this file, or `<ws>/.agents/rules/<topic>.md` when it only apply to that workspace.
+- Hook or verifier → `~/gemini-config/hooks/`. Script → `~/scripts`.
+- Then `bash ~/gemini-config/scripts/prepush.sh`, commit that change alone with `chore(config):` subject, reinstall with `pwsh ~/gemini-config/install.ps1`.
+- Run `bash ~/gemini-config/scripts/agy-audit.sh` weekly. Act on top line.
+- Never widen `permissions.allow`, `permissions.deny` or hook timeout to make run pass. That Daniel decision: write it to `.agents/DECISIONS.md` instead.
 
 ## Ren'Py
 
@@ -76,12 +119,11 @@ Use `gemini-3.8-flash-high` for all Gemini work. No step down to lower Flash tie
 
 - Build, lint, test pass before any commit. Ask before commit.
 - Conventional Commits subject, 50 character or fewer. Body say why, only when not obvious.
-- Delete dead code, stale comment, unused import in area touched. Never leave `.bak` or `.orig` file.
+- Never force push to `main` or `master`. Force push own branch only, branch named in command.
 
 ## Constraints
 
 - Never commit or push without green build.
 - Never write credential value into note, doc, or commit.
 - Never add AI attribution line to commit or PR.
-- Never poll with tool call. Never call `sleep` to wait.
-- Never keep superseded note beside new one. Replace it.
+- Never name Claude, Gemini, Antigravity or Copilot in code, commit or PR text. Hook deny it.

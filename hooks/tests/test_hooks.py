@@ -39,48 +39,6 @@ class TestHooks(unittest.TestCase):
         for num in (10, 20):
             self.assertIn("CAVEMAN", self.reinforce(num)[0]["ephemeralMessage"])
 
-    def test_commit_gate_valid(self):
-        script = HOOKS_DIR / "commit_gate.py"
-        payload = json.dumps({
-            "toolCall": {
-                "name": "run_command",
-                "args": {"CommandLine": 'git commit -m "feat(core): add new feature"'}
-            }
-        })
-        proc = subprocess.run([sys.executable, str(script)], input=payload, text=True, capture_output=True)
-        self.assertEqual(proc.returncode, 0)
-        res = json.loads(proc.stdout)
-        self.assertEqual(res.get("decision"), "allow")
-
-    def test_commit_gate_invalid_non_cc(self):
-        script = HOOKS_DIR / "commit_gate.py"
-        payload = json.dumps({
-            "toolCall": {
-                "name": "run_command",
-                "args": {"CommandLine": 'git commit -m "Fixed the bug"'}
-            }
-        })
-        proc = subprocess.run([sys.executable, str(script)], input=payload, text=True, capture_output=True)
-        self.assertEqual(proc.returncode, 0)
-        res = json.loads(proc.stdout)
-        self.assertEqual(res.get("decision"), "deny")
-        self.assertIn("not Conventional Commits", res.get("reason", ""))
-
-    def test_commit_gate_invalid_too_long(self):
-        script = HOOKS_DIR / "commit_gate.py"
-        long_subject = "feat: " + "a" * 50
-        payload = json.dumps({
-            "toolCall": {
-                "name": "run_command",
-                "args": {"CommandLine": f'git commit -m "{long_subject}"'}
-            }
-        })
-        proc = subprocess.run([sys.executable, str(script)], input=payload, text=True, capture_output=True)
-        self.assertEqual(proc.returncode, 0)
-        res = json.loads(proc.stdout)
-        self.assertEqual(res.get("decision"), "deny")
-        self.assertIn("limit 50", res.get("reason", ""))
-
     def test_deny_circuit_breaker(self):
         script = HOOKS_DIR / "deny_circuit_breaker.py"
         payload = json.dumps({
@@ -93,6 +51,202 @@ class TestHooks(unittest.TestCase):
         proc = subprocess.run([sys.executable, str(script)], input=payload, text=True, capture_output=True)
         self.assertEqual(proc.returncode, 0)
         res = json.loads(proc.stdout)
+        self.assertEqual(res.get("decision"), "allow")
+
+
+def gate(script, tool, args, extra=None):
+    """Decision a PreToolUse hook returns for one tool call."""
+    payload = {"toolCall": {"name": tool, "args": args}}
+    payload.update(extra or {})
+    proc = subprocess.run([sys.executable, str(HOOKS_DIR / script)],
+                          input=json.dumps(payload), text=True, capture_output=True)
+    assert proc.returncode == 0, proc.stderr
+    return json.loads(proc.stdout)
+
+
+def command(script, line):
+    return gate(script, "run_command", {"CommandLine": line})
+
+
+class TestCommitGate(unittest.TestCase):
+    def deny_reason(self, line):
+        res = command("commit_gate.py", line)
+        self.assertEqual(res.get("decision"), "deny", line)
+        return res.get("reason", "")
+
+    def assertAllowed(self, line):
+        self.assertEqual(command("commit_gate.py", line).get("decision"), "allow", line)
+
+    def test_conventional_subject_allowed(self):
+        self.assertAllowed('git commit -m "feat(core): add new feature"')
+
+    def test_non_conventional_subject_denied(self):
+        self.assertIn("not Conventional Commits", self.deny_reason('git commit -m "Fixed the bug"'))
+
+    def test_long_subject_denied(self):
+        self.assertIn("limit 50", self.deny_reason('git commit -m "feat: ' + "a" * 50 + '"'))
+
+    def test_no_verify_denied_on_commit_push_and_merge(self):
+        for line in ('git commit --no-verify -m "fix: x"',
+                     "git push --no-verify origin feat-x",
+                     "git merge --no-verify feat-x"):
+            self.assertIn("--no-verify", self.deny_reason(line))
+
+    def test_short_no_verify_denied_on_commit(self):
+        self.assertIn("--no-verify", self.deny_reason('git commit -n -m "fix: x"'))
+
+    def test_dry_run_push_allowed(self):
+        """-n means --dry-run for push, so it is not a skipped gate."""
+        self.assertAllowed("git push -n origin main")
+
+    def test_force_push_to_main_denied(self):
+        self.assertIn("Force push", self.deny_reason("git push --force origin main"))
+
+    def test_force_push_without_a_branch_denied(self):
+        self.assertIn("Force push", self.deny_reason("git push -f"))
+
+    def test_force_push_to_own_branch_allowed(self):
+        self.assertAllowed("git push --force-with-lease origin feat-discipline")
+
+    def test_unrelated_command_allowed(self):
+        self.assertAllowed("git status --short")
+
+
+class TestClockWaitGate(unittest.TestCase):
+    def decision(self, line):
+        return command("clock_wait_gate.py", line).get("decision")
+
+    def test_bare_sleep_denied(self):
+        self.assertEqual(self.decision("sleep 30"), "deny")
+
+    def test_windows_timeout_denied(self):
+        self.assertEqual(self.decision("timeout /t 10"), "deny")
+
+    def test_powershell_sleep_denied(self):
+        self.assertEqual(self.decision("powershell -c Start-Sleep -Seconds 5"), "deny")
+
+    def test_ping_delay_denied(self):
+        self.assertEqual(self.decision("ping -n 5 127.0.0.1 > nul"), "deny")
+
+    def test_polling_loop_denied(self):
+        self.assertEqual(self.decision("until curl -sf localhost:8080; do sleep 5; done"), "deny")
+
+    def test_bounded_polling_loop_still_denied(self):
+        """A timeout wrapper caps a wait; it does not make polling the right tool."""
+        self.assertEqual(
+            self.decision("timeout 300 bash -c 'until curl -sf localhost; do sleep 5; done'"),
+            "deny")
+
+    def test_sleep_inside_a_timeout_wrapper_allowed(self):
+        self.assertEqual(self.decision("timeout 60 bash -c 'sleep 5; ./check.sh'"), "allow")
+
+    def test_npm_script_named_sleep_allowed(self):
+        self.assertEqual(self.decision("npm run sleep-test"), "allow")
+
+    def test_deny_reason_names_the_replacement(self):
+        self.assertIn("command_status", command("clock_wait_gate.py", "sleep 5").get("reason", ""))
+
+    def test_other_tools_are_not_judged(self):
+        res = gate("clock_wait_gate.py", "write_to_file",
+                   {"TargetFile": "/proj/a.py", "CodeContent": "sleep 5"})
+        self.assertEqual(res.get("decision"), "allow")
+
+
+class TestNoAiMentions(unittest.TestCase):
+    def write(self, path, content):
+        return gate("no_ai_mentions.py", "write_to_file",
+                    {"TargetFile": path, "CodeContent": content})
+
+    def test_attribution_in_source_denied(self):
+        res = self.write("/proj/src/app.py", "# written by an AI agent\nx = 1\n")
+        self.assertEqual(res.get("decision"), "deny")
+
+    def test_tool_name_in_source_denied(self):
+        self.assertEqual(self.write("/proj/src/app.py", "# ask Claude\n").get("decision"), "deny")
+
+    def test_readme_may_name_the_tools(self):
+        self.assertEqual(self.write("/proj/README.md", "Runs under Antigravity and Gemini.")
+                         .get("decision"), "allow")
+
+    def test_agents_directory_is_exempt(self):
+        self.assertEqual(self.write("/proj/.agents/visual.md", "Gemini opens each page.")
+                         .get("decision"), "allow")
+
+    def test_sdk_glue_may_name_the_vendor(self):
+        self.assertEqual(self.write("/proj/sdk/gemini_client.py", "import gemini\n")
+                         .get("decision"), "allow")
+
+    def test_ordinary_source_allowed(self):
+        self.assertEqual(self.write("/proj/src/app.py", "def add(a, b):\n    return a + b\n")
+                         .get("decision"), "allow")
+
+    def test_commit_message_attribution_denied(self):
+        res = command("no_ai_mentions.py", 'git commit -m "feat: add gate" -m "Generated with x"')
+        self.assertEqual(res.get("decision"), "deny")
+
+    def test_co_authored_bot_trailer_denied(self):
+        res = command("no_ai_mentions.py",
+                      'git commit -m "feat: add gate\n\nCo-authored-by: helper bot <b@x.dev>"')
+        self.assertEqual(res.get("decision"), "deny")
+
+    def test_command_without_a_message_is_not_judged(self):
+        self.assertEqual(command("no_ai_mentions.py", "ls ~/.gemini/config").get("decision"),
+                         "allow")
+
+    def test_private_key_block_denied(self):
+        res = self.write("/proj/src/keys.py", "KEY = '''-----BEGIN PRIVATE KEY-----'''\n")
+        self.assertIn("credential", res.get("reason", ""))
+
+    def test_credential_check_applies_to_exempt_paths_too(self):
+        res = self.write("/proj/README.md", "-----BEGIN RSA PRIVATE KEY-----\n")
+        self.assertIn("credential", res.get("reason", ""))
+
+
+class TestWriteGate(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+
+    def write(self, path, content=""):
+        return gate("write_gate.py", "write_to_file",
+                    {"TargetFile": path, "CodeContent": content})
+
+    def existing(self, name, content="{}\n"):
+        path = Path(self.tmp) / name
+        path.write_text(content, encoding="utf-8")
+        return str(path)
+
+    def test_backup_suffix_denied(self):
+        for name in ("config.bak", "app.py.orig", "notes.old", "run.tmp"):
+            self.assertEqual(self.write(f"/proj/{name}").get("decision"), "deny", name)
+
+    def test_copy_names_denied(self):
+        for name in ("app-v2.py", "app_backup.py", "report - copy.md"):
+            self.assertEqual(self.write(f"/proj/{name}").get("decision"), "deny", name)
+
+    def test_ordinary_file_allowed(self):
+        self.assertEqual(self.write("/proj/src/app.py", "x = 1\n").get("decision"), "allow")
+
+    def test_existing_lint_config_denied(self):
+        res = self.write(self.existing("tsconfig.json"))
+        self.assertEqual(res.get("decision"), "deny")
+        self.assertIn("config protected", res.get("reason", ""))
+
+    def test_new_lint_config_allowed(self):
+        self.assertEqual(self.write(str(Path(self.tmp) / ".eslintrc.json")).get("decision"),
+                         "allow")
+
+    def test_ruff_section_in_pyproject_denied(self):
+        path = self.existing("pyproject.toml", "[project]\nname = 'x'\n")
+        res = self.write(path, "[tool.ruff]\nline-length = 200\n")
+        self.assertEqual(res.get("decision"), "deny")
+
+    def test_pyproject_without_tool_sections_allowed(self):
+        path = self.existing("pyproject.toml", "[project]\nname = 'x'\n")
+        self.assertEqual(self.write(path, "[project]\nversion = '2'\n").get("decision"), "allow")
+
+    def test_read_tools_are_not_judged(self):
+        res = gate("write_gate.py", "view_file", {"AbsolutePath": "/proj/config.bak"})
         self.assertEqual(res.get("decision"), "allow")
 
 
@@ -180,6 +334,34 @@ class TestStopGate(unittest.TestCase):
         self.write_audit()
         res = self.run_hook(self.payload(workspacePaths=[self.tmp]))
         self.assertEqual(res.get("decision"), "stop")
+
+    def leftover(self, name, directory=False):
+        """A stray file or directory in the workspace, with a clean audit already filed."""
+        self.write_audit()
+        path = Path(self.tmp) / name
+        path.mkdir() if directory else path.write_text("stale\n", encoding="utf-8")
+        return self.run_hook(self.payload(workspacePaths=[self.tmp]))
+
+    def test_backup_file_blocks_the_stop(self):
+        res = self.leftover("notes.bak")
+        self.assertEqual(res.get("decision"), "continue")
+        self.assertIn("delete leftovers: notes.bak", res.get("reason", ""))
+
+    def test_every_backup_suffix_is_a_leftover(self):
+        for name in ("app.py.orig", "old-plan.old", "scratch.tmp"):
+            self.assertIn(name, self.leftover(name).get("reason", ""), name)
+
+    def test_empty_directory_is_a_leftover(self):
+        self.assertIn("scratch/", self.leftover("scratch", directory=True).get("reason", ""))
+
+    def test_unignored_pycache_is_a_leftover(self):
+        """Not empty, so only the __pycache__ rule can catch it."""
+        self.write_audit()
+        cache = Path(self.tmp) / "__pycache__"
+        cache.mkdir()
+        (cache / "app.cpython-313.pyc").write_bytes(b"\x00")
+        res = self.run_hook(self.payload(workspacePaths=[self.tmp]))
+        self.assertIn("__pycache__", res.get("reason", ""))
 
     def test_shipped_no_tool_call_reason_gates(self):
         """agy sends NO_TOOL_CALL, not the documented model_stop."""

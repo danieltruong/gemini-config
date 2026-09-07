@@ -376,9 +376,32 @@ def clear_audits(spaces):
             pass
 
 
+def leftovers(ws, files):
+    """Backup files, unignored __pycache__ and empty dirs in the directories the session wrote."""
+    rels = {os.path.dirname(f) for f in files} if files else {""}
+    found = []
+    for rel in sorted(rels):
+        folder = os.path.join(ws, rel)
+        try:
+            entries = sorted(os.listdir(folder))
+        except OSError:
+            continue
+        for name in entries:
+            path = os.path.join(folder, name)
+            shown = f"{rel}/{name}" if rel else name
+            if os.path.isdir(path):
+                if name == "__pycache__" and git(ws, "check-ignore", path) is None:
+                    found.append(shown)
+                elif not os.listdir(path):
+                    found.append(shown + "/")
+            elif hookpaths.BACKUP_SUFFIX.search(name):
+                found.append(shown)
+    return found
+
+
 def survey(spaces, transcript, deadline):
-    """(verifier failures, doc findings, workspaces still owing an audit round)."""
-    failures, docs, audits = [], [], []
+    """(verifier failures, doc findings, leftovers, workspaces still owing an audit round)."""
+    failures, docs, junk, audits = [], [], [], []
     for ws in spaces:
         files = session_files(transcript, ws)
         if files is not None and not files:
@@ -387,10 +410,11 @@ def survey(spaces, transcript, deadline):
         if found and found[1] != 0:
             failures.append((found[0], found[2]))
         docs += docs_findings(ws, files, deadline)
+        junk += leftovers(ws, files)
         code = files is None or any(not hookpaths.is_instruction_doc(f) for f in files)
         if code and not audit_clean(ws, files):
             audits.append(ws)
-    return failures, docs, audits
+    return failures, docs, junk, audits
 
 
 def workspaces(raw_paths):
@@ -415,7 +439,7 @@ def decide(ev, deadline):
     if dropped:
         log(",".join(dropped), "unresolved", "workspace path dropped")
     execution_num = ev.get("executionNum", 0)
-    failures, docs, audits = survey(spaces, ev.get("transcriptPath"), deadline)
+    failures, docs, junk, audits = survey(spaces, ev.get("transcriptPath"), deadline)
     budget = f"{int(max(0, remaining(deadline)))}s of the {GATE_BUDGET}s gate budget left."
     rounds = max((next_round(ws) for ws in audits), default=0)
 
@@ -430,6 +454,10 @@ def decide(ev, deadline):
         reason = ("ai-docs-lint failed in files you changed:\n"
                   + "\n".join(docs[:MAX_REPORTED]) + "\nFix them, re-run lint, then finish.")
         kind, detail = "docs", f"{len(docs)} findings"
+    elif junk and execution_num <= MAX_EXECUTIONS:
+        reason = ("delete leftovers: " + ", ".join(sorted(set(junk))[:MAX_REPORTED])
+                  + "\nRemove them, then finish.")
+        kind, detail = "leftovers", f"{len(junk)} paths"
     elif audits and rounds <= MAX_AUDIT_ROUNDS:
         reason = audit_reason(audits)
         kind, detail = "audit", f"round {rounds}"
