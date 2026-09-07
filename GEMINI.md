@@ -8,7 +8,7 @@
 ## Build
 
 1. Ask: change need exist? Skip guess-work, say so one line.
-2. Reuse what repo have: helper, type, constant, pattern. Search before write.
+2. Reuse repo stuff: helper, type, constant, pattern. Search before write.
 3. Prefer stdlib, then native platform feature, then installed dependency. Add dependency only when few lines cannot do job.
 4. Ship shortest diff that work, after read touched code end to end.
 5. Fix root cause in shared function, then check every caller.
@@ -26,14 +26,17 @@
 
 1. Explore: read every file change touch, callers too.
 2. Plan: list files and checks, one line each.
-3. Execute.
+3. Build.
 4. Verify: run repo verifier. `.agents/verify.cmd`, `.ps1` or `.sh` first; else `npm run lint` and `npm test`; else `python -m pytest -q -x`.
-5. Review: run `reviewer` subagent on diff, or read diff yourself when subagent unavailable. Fix findings tagged bug, security, or wrong result. Skip nits.
-6. Finish.
+5. Audit: `reviewer` subagent on diff, or read diff yourself when no subagent. Fix every bug, security, wrong-result, dead-code, over-engineering finding.
+6. Write `.agents/audit.json` `{clean, findings, round}` each round. `clean` true only when last round find nothing to fix.
+7. Repeat 3 to 6 until audit find nothing. Then finish.
+
+- UI change: follow `.agents/visual.md`. Open every URL under `## Pages`, screenshot, check each bullet under `## Accept`, fix, repeat until all pass. Record `"visual": {"pages": n, "failed": m}` in audit.json.
 
 - Fan out independent file groups to subagents with `invoke_subagent`, Workspace `branch`.
 - Headless results that feed script use `--json-schema`.
-- Never declare task done while verifier fail.
+- Never say task done while verifier fail.
 
 ## Ren'Py
 

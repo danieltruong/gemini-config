@@ -14,7 +14,10 @@ LOG = os.path.join(hookpaths.TMP, "stop_gate.log")
 LINT_TIMEOUT = 120
 VERIFY_TIMEOUT = 600
 MAX_EXECUTIONS = 3
+MAX_AUDIT_ROUNDS = 5
 MAX_REPORTED = 40
+AUDIT_REL = ".agents/audit.json"
+VISUAL_REL = ".agents/visual.md"
 # agy 1.1.27 sends "NO_TOOL_CALL" here; "model_stop" is only in the docs. Every other
 # reason (ERROR, USER_CANCELED, MAX_*) means the agent did not choose to finish.
 MODEL_FINISHED = {"model_stop", "NO_TOOL_CALL"}
@@ -27,11 +30,19 @@ IS_WINDOWS = os.name == "nt"
 # on Windows renpy.sh is a Linux binary and always fails, so only renpy.exe counts there
 SDK_EXE = "renpy.exe" if IS_WINDOWS else "renpy.sh"
 
-REVIEW_REASON = (
-    "Before finishing: run the `reviewer` subagent on `git diff HEAD` "
-    "(plus untracked files you created). If subagents are unavailable, read the diff "
-    "yourself against the same checklist. Fix every finding tagged bug, security, "
-    "or wrong result. Do not fix nits. Then finish."
+AUDIT_REASON = (
+    "Audit round {round}: review `git diff HEAD` plus untracked files you created "
+    "(use the `reviewer` subagent when available, else inline). Fix every bug, security, "
+    "wrong-result, dead-code and over-engineering finding; re-run the verifier; then write "
+    ".agents/audit.json {{clean, findings, round}} and finish. clean is true only when the "
+    "last audit found nothing to fix."
+)
+
+VISUAL_REASON = (
+    "Visual audit: for each URL in .agents/visual.md, open_browser_url, "
+    "capture_browser_screenshot, check every bullet under ## Accept against the screenshot, "
+    "fix defects, repeat until every page passes. Record visual results in audit.json under "
+    '"visual": {"pages": n, "failed": m}.'
 )
 
 
@@ -125,7 +136,9 @@ def changed_files(project):
 def session_files(transcript, project):
     """What this session wrote under project. None means unknown, so nothing gets filtered out."""
     touched = touched_files(transcript, project) if transcript else None
-    return changed_files(project) if touched is None else touched
+    files = changed_files(project) if touched is None else touched
+    # the audit report is the agent's answer to the gate, never work the gate should judge
+    return files if files is None else files - {AUDIT_REL}
 
 
 def read_json(path):
@@ -229,25 +242,81 @@ def docs_findings(ws, files):
     return proc.stdout.splitlines() if proc.returncode else []
 
 
+def newest_mtime(ws, files):
+    stamps = []
+    for rel in files or ():
+        try:
+            stamps.append(os.path.getmtime(os.path.join(ws, rel)))
+        except OSError:
+            pass
+    return max(stamps) if stamps else None
+
+
+def audit_report(ws):
+    data = read_json(os.path.join(ws, AUDIT_REL))
+    return data if isinstance(data, dict) else None
+
+
+def audit_clean(ws, files):
+    """True when the audit report says the last round found nothing and predates no edit."""
+    data = audit_report(ws)
+    if not data or not data.get("clean"):
+        return False
+    newest = newest_mtime(ws, files)
+    try:
+        if newest is not None and os.path.getmtime(os.path.join(ws, AUDIT_REL)) < newest:
+            return False
+    except OSError:
+        return False
+    if os.path.isfile(os.path.join(ws, VISUAL_REL)):
+        return (data.get("visual") or {}).get("failed") == 0
+    return True
+
+
+def audit_reason(spaces):
+    rounds = []
+    for ws in spaces:
+        data = audit_report(ws) or {}
+        try:
+            rounds.append(int(data.get("round", 0)) + 1)
+        except (TypeError, ValueError):
+            rounds.append(1)
+    text = AUDIT_REASON.format(round=max(rounds))
+    if any(os.path.isfile(os.path.join(ws, VISUAL_REL)) for ws in spaces):
+        text += "\n" + VISUAL_REASON
+    return text
+
+
+def clear_audits(spaces):
+    """The audit report is per-run scratch, so the next run cannot inherit a stale pass."""
+    for ws in spaces:
+        try:
+            os.remove(os.path.join(ws, AUDIT_REL))
+        except OSError:
+            pass
+
+
 def survey(spaces, transcript):
-    """(verifier failures, doc findings, whether any non-doc file was written)."""
-    failures, docs, code_touched = [], [], False
+    """(verifier failures, doc findings, workspaces still owing an audit round)."""
+    failures, docs, audits = [], [], []
     for ws in spaces:
         files = session_files(transcript, ws)
         if files is not None and not files:
             continue
-        if files is None or any(not hookpaths.is_instruction_doc(f) for f in files):
-            code_touched = True
         found = verify(ws, files)
         if found and found[1] != 0:
             failures.append((found[0], found[2]))
         docs += docs_findings(ws, files)
-    return failures, docs, code_touched
+        code = files is None or any(not hookpaths.is_instruction_doc(f) for f in files)
+        if code and not audit_clean(ws, files):
+            audits.append(ws)
+    return failures, docs, audits
 
 
 def main():
     stop = {"decision": "stop"}
     project, kind, detail = "-", "stop", ""
+    spaces = []
     try:
         ev = json.load(sys.stdin)
         if ev.get("terminationReason") not in MODEL_FINISHED or ev.get("fullyIdle") is False:
@@ -256,7 +325,7 @@ def main():
             execution_num = ev.get("executionNum", 0)
             spaces = ev.get("workspacePaths") or []
             project = ",".join(spaces) or "-"
-            failures, docs, code_touched = survey(spaces, ev.get("transcriptPath"))
+            failures, docs, audits = survey(spaces, ev.get("transcriptPath"))
 
             reason = ""
             if failures and execution_num <= MAX_EXECUTIONS:
@@ -273,17 +342,18 @@ def main():
                     + "\n".join(docs[:MAX_REPORTED])
                     + "\nFix them, re-run lint, then finish."
                 )
-            elif execution_num == 0 and code_touched:
-                kind, detail, reason = "review", "diff review requested", REVIEW_REASON
+            elif audits and execution_num < MAX_AUDIT_ROUNDS:
+                kind, detail, reason = "audit", f"{len(audits)} workspace(s)", audit_reason(audits)
 
             if reason:
                 log(project, kind, detail)
                 json.dump({"decision": "continue", "reason": reason}, sys.stdout)
                 return
-            detail = f"execution={execution_num} code_touched={code_touched}"
+            detail = "audit cap" if audits else f"execution={execution_num}"
     except Exception as exc:
         detail = f"exception {exc!r}"
 
+    clear_audits(spaces)
     log(project, "stop", detail)
     json.dump(stop, sys.stdout)
 

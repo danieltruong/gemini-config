@@ -64,7 +64,43 @@ The `stop-gate` hook blocks an agent from finishing while the repo's own checks 
 
 Nothing matching means no gate. Give a repo its own `.agents/verify.sh` to control exactly what runs. The whole verifier gets 600 seconds.
 
-Once the verifier passes, the first stop of a session that changed code is sent back once more to run the `reviewer` subagent over the diff. Both gates give up after 4 attempts so a broken repo cannot loop forever.
+## Audit loop
+
+Once the verifier passes, a session that changed code keeps getting sent back until it reports a clean audit. The agent answers by writing `.agents/audit.json`:
+
+```json
+{"clean": false, "findings": 3, "round": 1}
+```
+
+The gate sends another round when that file is missing, when `clean` is false, or when it is stale, meaning its mtime is older than the newest file the session wrote. A stale report judged code that has since changed. `clean` is true only when the last round found nothing left to fix.
+
+The report is per-run scratch, so the gate deletes it when it lets the agent stop. Add `.agents/audit.json` to the repo's `.gitignore`.
+
+The verifier gate gives up after 4 attempts and the audit loop after 5, so a repo that cannot be fixed does not spin forever.
+
+## Visual audit
+
+If a repo has `.agents/visual.md`, the audit round also asks for a screenshot pass. The file lists one URL per line under `## Pages` and the things each page has to get right under `## Accept`:
+
+```markdown
+## Pages
+
+http://localhost:5173/
+http://localhost:5173/settings
+
+## Accept
+
+- Nav bar is visible and not overlapping the content
+- No horizontal scrollbar at 1280px wide
+```
+
+The agent opens each URL, screenshots it, checks every bullet, fixes what fails, and records the outcome in the audit report:
+
+```json
+{"clean": true, "findings": 0, "round": 2, "visual": {"pages": 2, "failed": 0}}
+```
+
+While `visual.md` exists, an audit only counts as clean when `visual.failed` is 0.
 
 A dead http MCP server makes every headless run hang until the timeout expires. Setting `"disabled": true` does not help, it is ignored. Delete the entry from `~/.gemini/config/mcp_config.json` instead.
 

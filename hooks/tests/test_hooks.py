@@ -6,6 +6,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -142,7 +143,18 @@ class TestStopGate(unittest.TestCase):
         base.update(kw)
         return base
 
+    def write_audit(self, **fields):
+        """A fresh audit report, which is what lets a code-touching session reach stop."""
+        data = {"clean": True, "findings": 0, "round": 1}
+        data.update(fields)
+        agents = Path(self.tmp) / ".agents"
+        agents.mkdir(exist_ok=True)
+        path = agents / "audit.json"
+        path.write_text(json.dumps(data), encoding="utf-8")
+        return path
+
     def test_non_renpy_workspace_stops(self):
+        self.write_audit()
         res = self.run_hook(self.payload(workspacePaths=[self.tmp]))
         self.assertEqual(res.get("decision"), "stop")
 
@@ -174,9 +186,9 @@ class TestStopGate(unittest.TestCase):
         self.assertNotIn("game/untouched.rpy", res["reason"])
         self.assertIn("Fix, re-run renpy lint, then finish.", res["reason"])
 
-    def test_errors_only_in_unchanged_files_stop(self):
+    def test_errors_only_in_unchanged_files_are_not_reported(self):
         res = self.run_hook(self.payload(), stub=self.stub(["game/other.rpy"]))
-        self.assertEqual(res.get("decision"), "stop")
+        self.assertNotIn("Verifier failed", res.get("reason", ""))
 
     def test_non_git_project_counts_all(self):
         res = self.run_hook(self.payload(), stub=self.stub(None))
@@ -227,6 +239,7 @@ class TestStopGate(unittest.TestCase):
 
     def test_non_instruction_file_is_not_docs_linted(self):
         (Path(self.tmp) / "notes.md").write_text("`~/.gemini/nope-does-not-exist`\n", encoding="utf-8")
+        self.write_audit()
         res = self.run_hook(self.payload(
             workspacePaths=[self.tmp], transcriptPath=self.transcript_writing("notes.md")
         ))
@@ -260,23 +273,74 @@ class TestStopGate(unittest.TestCase):
         self.assertIn("FAIL", res["reason"])
         self.assertIn(f"Fix, re-run {label}, then finish.", res["reason"])
 
-    def test_review_pass_fires_on_first_execution(self):
-        res = self.run_hook(self.payload(
-            executionNum=0, workspacePaths=[self.tmp],
-            transcriptPath=self.transcript_writing("src/app.py"),
-        ))
-        self.assertEqual(res.get("decision"), "continue")
-        self.assertIn("run the `reviewer` subagent on `git diff HEAD`", res["reason"])
-        self.assertIn("Do not fix nits.", res["reason"])
+    def code_payload(self, **kw):
+        """A stop after this session wrote one source file into the workspace."""
+        (Path(self.tmp) / "app.py").write_text("x = 1\n", encoding="utf-8")
+        kw.setdefault("workspacePaths", [self.tmp])
+        kw.setdefault("transcriptPath", self.transcript_writing("app.py"))
+        return self.payload(**kw)
 
-    def test_review_pass_does_not_repeat(self):
+    def test_missing_audit_report_continues(self):
+        res = self.run_hook(self.code_payload(executionNum=0))
+        self.assertEqual(res.get("decision"), "continue")
+        self.assertIn("Audit round 1:", res["reason"])
+        self.assertIn("re-run the verifier", res["reason"])
+
+    def test_stale_audit_report_continues(self):
+        """A report older than the newest file this session wrote judged different code."""
+        payload = self.code_payload()
+        self.write_audit(round=2)
+        later = time.time() + 60
+        os.utime(Path(self.tmp) / "app.py", (later, later))
+        res = self.run_hook(payload)
+        self.assertEqual(res.get("decision"), "continue")
+        self.assertIn("Audit round 3:", res["reason"])
+
+    def test_unclean_audit_report_continues(self):
+        payload = self.code_payload()
+        self.write_audit(clean=False, findings=2, round=1)
+        res = self.run_hook(payload)
+        self.assertEqual(res.get("decision"), "continue")
+        self.assertIn("Audit round 2:", res["reason"])
+
+    def test_fresh_clean_audit_stops_and_report_is_deleted(self):
+        payload = self.code_payload()
+        report = self.write_audit()
+        res = self.run_hook(payload)
+        self.assertEqual(res.get("decision"), "stop")
+        self.assertFalse(report.exists())
+
+    def test_audit_cap_stops(self):
+        res = self.run_hook(self.code_payload(executionNum=5))
+        self.assertEqual(res.get("decision"), "stop")
+        self.assertIn("audit cap", (Path(self.tmp) / "stop_gate.log").read_text(encoding="utf-8"))
+
+    def test_visual_spec_adds_visual_audit(self):
+        (Path(self.tmp) / ".agents").mkdir(exist_ok=True)
+        (Path(self.tmp) / ".agents" / "visual.md").write_text(
+            "## Pages\n\nhttp://localhost:5173/\n\n## Accept\n\n- Nav is visible\n", encoding="utf-8"
+        )
+        payload = self.code_payload()
+        self.write_audit(visual={"pages": 1, "failed": 1})
+        res = self.run_hook(payload)
+        self.assertEqual(res.get("decision"), "continue")
+        self.assertIn("capture_browser_screenshot", res["reason"])
+
+    def test_writing_the_audit_report_is_not_a_code_change(self):
+        """Otherwise answering the gate would itself keep the gate open."""
+        self.write_audit(clean=False)
         res = self.run_hook(self.payload(
-            executionNum=1, workspacePaths=[self.tmp],
-            transcriptPath=self.transcript_writing("src/app.py"),
+            workspacePaths=[self.tmp],
+            transcriptPath=self.transcript_writing(".agents/audit.json"),
         ))
         self.assertEqual(res.get("decision"), "stop")
 
-    def test_review_skipped_when_only_docs_touched(self):
+    def test_no_visual_spec_means_no_visual_text(self):
+        res = self.run_hook(self.code_payload())
+        self.assertEqual(res.get("decision"), "continue")
+        self.assertNotIn("capture_browser_screenshot", res["reason"])
+
+    def test_audit_skipped_when_only_docs_touched(self):
         (Path(self.tmp) / "GEMINI.md").write_text("# Rules\n\n- Keep it short.\n", encoding="utf-8")
         res = self.run_hook(self.payload(
             executionNum=0, workspacePaths=[self.tmp],
@@ -296,9 +360,9 @@ class TestStopGate(unittest.TestCase):
         ))
         self.assertEqual(res.get("decision"), "stop")
 
-    def test_execution_num_4_stops(self):
+    def test_execution_num_4_drops_the_verifier(self):
         res = self.run_hook(self.payload(executionNum=4), stub=self.stub(["game/changed.rpy"]))
-        self.assertEqual(res.get("decision"), "stop")
+        self.assertNotIn("Verifier failed", res.get("reason", ""))
 
     def test_bad_input_stops(self):
         env = dict(os.environ, GEMINI_HOOK_TMP=self.tmp)
