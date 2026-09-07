@@ -23,6 +23,22 @@ class TestHooks(unittest.TestCase):
         self.assertTrue(len(res["injectSteps"]) > 0)
         self.assertIn("CAVEMAN", res["injectSteps"][0]["ephemeralMessage"])
 
+    def reinforce(self, num):
+        proc = subprocess.run(
+            [sys.executable, str(HOOKS_DIR / "reinforce.py")],
+            input=json.dumps({"invocationNum": num}), text=True, capture_output=True,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        return json.loads(proc.stdout)["injectSteps"]
+
+    def test_banner_is_skipped_between_milestones(self):
+        for num in (2, 5, 9, 11):
+            self.assertEqual(self.reinforce(num), [], f"invocationNum {num}")
+
+    def test_banner_returns_every_tenth_invocation(self):
+        for num in (10, 20):
+            self.assertIn("CAVEMAN", self.reinforce(num)[0]["ephemeralMessage"])
+
     def test_commit_gate_valid(self):
         script = HOOKS_DIR / "commit_gate.py"
         payload = json.dumps({
@@ -90,9 +106,13 @@ class TestStopGate(unittest.TestCase):
         "game/untouched.rpy:9 'b' is not an image.\n"
     )
 
-    def run_hook(self, payload, stub=None):
+    def run_hook(self, payload, stub=None, trusted=True):
         env = dict(os.environ)
         env["GEMINI_HOOK_TMP"] = self.tmp
+        settings = Path(self.tmp) / "cli-settings.json"
+        roots = [self.tmp, "/proj"] if trusted else []
+        settings.write_text(json.dumps({"trustedWorkspaces": roots}), encoding="utf-8")
+        env["GEMINI_CLI_SETTINGS"] = str(settings)
         if stub:
             (Path(self.tmp) / "sitecustomize.py").write_text(stub, encoding="utf-8")
             env["PYTHONPATH"] = self.tmp
@@ -125,7 +145,10 @@ class TestStopGate(unittest.TestCase):
             "    return _run(cmd, *a, **k)\n"
             "subprocess.run = run\n"
             "_isdir = os.path.isdir\n"
-            "os.path.isdir = lambda p: p.replace('\\\\', '/').endswith('/game') or _isdir(p)\n"
+            "os.path.isdir = lambda p: p.replace('\\\\', '/').rstrip('/').endswith(('/game', '/proj')) or _isdir(p)\n"
+            "import shutil\n"
+            "_which = shutil.which\n"
+            "shutil.which = lambda n, *a, **k: None if n == 'cygpath' else _which(n, *a, **k)\n"
             "os.environ['RENPY_SDK_PATH'] = '/sdk'\n"
             "_isfile = os.path.isfile\n"
             "os.path.isfile = lambda p: 'renpy.' in os.path.basename(p) or _isfile(p)\n"
@@ -315,8 +338,16 @@ class TestStopGate(unittest.TestCase):
         self.assertEqual(res.get("decision"), "stop")
         self.assertFalse(report.exists())
 
-    def test_audit_cap_stops(self):
-        res = self.run_hook(self.code_payload(executionNum=5))
+    def test_audit_cap_counts_rounds_not_executions(self):
+        """Verifier retries burn executionNum, so the cap has to read the report's round."""
+        payload = self.code_payload(executionNum=9)
+        self.write_audit(clean=False, round=4)
+        res = self.run_hook(payload)
+        self.assertEqual(res.get("decision"), "continue")
+        self.assertIn("Audit round 5:", res["reason"])
+
+        self.write_audit(clean=False, round=5)
+        res = self.run_hook(payload)
         self.assertEqual(res.get("decision"), "stop")
         self.assertIn("audit cap", (Path(self.tmp) / "stop_gate.log").read_text(encoding="utf-8"))
 
@@ -369,6 +400,71 @@ class TestStopGate(unittest.TestCase):
         res = self.run_hook(self.payload(executionNum=4), stub=self.stub(["game/changed.rpy"]))
         self.assertNotIn("Verifier failed", res.get("reason", ""))
 
+    def test_msys_workspace_path_is_normalized(self):
+        """agy started from Git Bash sends /c/Users/...; Windows Python cannot open that."""
+        drive, rest = os.path.splitdrive(os.path.abspath(self.tmp))
+        msys = "/" + drive[0].lower() + rest.replace("\\", "/")
+        self.write_audit()
+        res = self.run_hook(self.payload(workspacePaths=[msys]))
+        self.assertEqual(res.get("decision"), "stop")
+        logged = (Path(self.tmp) / "stop_gate.log").read_text(encoding="utf-8")
+        self.assertIn(os.path.abspath(self.tmp).replace("\\", "/"), logged)
+        self.assertNotIn("unresolved", logged)
+
+    def test_unresolvable_workspace_is_dropped_and_logged(self):
+        res = self.run_hook(self.payload(workspacePaths=["/no/such/place"]))
+        self.assertEqual(res.get("decision"), "stop")
+        self.assertIn("unresolved", (Path(self.tmp) / "stop_gate.log").read_text(encoding="utf-8"))
+
+    def test_transcript_paths_match_case_insensitively(self):
+        """agy reports C:\\Users\\... while the transcript may say c:\\users\\..."""
+        (Path(self.tmp) / "app.py").write_text("x = 1\n", encoding="utf-8")
+        transcript = Path(self.tmp) / "t.jsonl"
+        transcript.write_text(json.dumps({"tool_calls": [{"name": "write_to_file", "args": {
+            "TargetFile": json.dumps(str(Path(self.tmp) / "app.py").swapcase())}}]}) + "\n",
+            encoding="utf-8")
+        self.write_audit()
+        res = self.run_hook(self.payload(
+            workspacePaths=[self.tmp], transcriptPath=str(transcript)
+        ))
+        expected = "stop" if os.name == "nt" else "continue"
+        self.assertEqual(res.get("decision"), expected)
+
+    def test_decisions_file_does_not_stale_the_audit(self):
+        """GEMINI.md writes DECISIONS.md after audit.json, so it must not count as an edit."""
+        payload = self.code_payload()
+        self.write_audit()
+        decisions = Path(self.tmp) / ".agents" / "DECISIONS.md"
+        later = time.time() + 60
+        decisions.write_text("- 2026-09-07 chose X because Y\n", encoding="utf-8")
+        os.utime(decisions, (later, later))
+        transcript = self.transcript_writing("app.py", ".agents/DECISIONS.md")
+        res = self.run_hook(self.payload(workspacePaths=[self.tmp], transcriptPath=transcript))
+        self.assertEqual(res.get("decision"), "stop")
+
+    def test_untrusted_workspace_skips_the_verify_script(self):
+        agents = Path(self.tmp) / ".agents"
+        agents.mkdir(exist_ok=True)
+        (agents / "verify.sh").write_text("exit 1\n", encoding="utf-8")
+        res = self.run_hook(self.code_payload(), trusted=False)
+        self.assertNotIn("Verifier failed", res.get("reason", ""))
+        self.assertIn("untrusted workspace, verifier skipped",
+                      (Path(self.tmp) / "stop_gate.log").read_text(encoding="utf-8"))
+
+    def test_continue_reason_reports_the_remaining_budget(self):
+        res = self.run_hook(self.payload(), stub=self.stub(["game/changed.rpy"]))
+        self.assertIn(f"s of the {800}s gate budget left.", res["reason"])
+
+    def test_exception_keeps_the_audit_report(self):
+        report = self.write_audit()
+        env = dict(os.environ, GEMINI_HOOK_TMP=self.tmp)
+        proc = subprocess.run(
+            [sys.executable, str(self.SCRIPT)], input="not json",
+            text=True, capture_output=True, env=env,
+        )
+        self.assertEqual(json.loads(proc.stdout).get("decision"), "stop")
+        self.assertTrue(report.exists())
+
     def test_bad_input_stops(self):
         env = dict(os.environ, GEMINI_HOOK_TMP=self.tmp)
         proc = subprocess.run(
@@ -392,6 +488,19 @@ class TestVerifierSelection(unittest.TestCase):
         stop_gate.execute = lambda ws, label, argv, deadline: (self.ran.append(label) or (label, 0, []))
         self.tmp = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.trust(self.tmp)
+
+    def trust(self, *roots):
+        import hookpaths
+
+        settings = Path(self.tmp) / "cli-settings.json"
+        settings.write_text(json.dumps({"trustedWorkspaces": list(roots)}), encoding="utf-8")
+        real = hookpaths.CLI_SETTINGS
+        self.addCleanup(setattr, hookpaths, "CLI_SETTINGS", real)
+        hookpaths.CLI_SETTINGS = str(settings)
+
+    def verify(self):
+        return self.gate.verify(self.tmp, set(), time.monotonic() + self.gate.GATE_BUDGET)
 
     def write(self, rel, text="x"):
         path = Path(self.tmp) / rel
@@ -401,19 +510,19 @@ class TestVerifierSelection(unittest.TestCase):
     def test_verify_script_wins_over_npm(self):
         self.write(".agents/verify.sh")
         self.write("package.json", json.dumps({"scripts": {"lint": "x", "test": "x"}}))
-        label, _, _ = self.gate.verify(self.tmp, set())
+        label, _, _ = self.verify()
         self.assertEqual(label, ".agents/verify.sh")
         self.assertEqual(self.ran, [".agents/verify.sh"])
 
     def test_cmd_preferred_over_ps1_and_sh(self):
         for name in self.gate.VERIFY_SCRIPTS:
             self.write(f".agents/{name}")
-        label, _, _ = self.gate.verify(self.tmp, set())
+        label, _, _ = self.verify()
         self.assertEqual(label, ".agents/verify.cmd")
 
     def test_npm_runs_lint_then_test(self):
         self.write("package.json", json.dumps({"scripts": {"lint": "x", "test": "x"}}))
-        self.gate.verify(self.tmp, set())
+        self.verify()
         self.assertEqual(self.ran, ["npm run lint", "npm test"])
 
     def test_npm_stops_at_first_failure(self):
@@ -421,26 +530,26 @@ class TestVerifierSelection(unittest.TestCase):
         self.gate.execute = lambda ws, label, argv, deadline: (
             self.ran.append(label) or (label, 1, ["boom"])
         )
-        label, rc, _ = self.gate.verify(self.tmp, set())
+        label, rc, _ = self.verify()
         self.assertEqual((label, rc), ("npm run lint", 1))
         self.assertEqual(self.ran, ["npm run lint"])
 
     def test_npm_without_matching_scripts_falls_through(self):
         self.write("package.json", json.dumps({"scripts": {"build": "x"}}))
-        self.assertIsNone(self.gate.verify(self.tmp, set()))
+        self.assertIsNone(self.verify())
 
     def test_pytest_markers_detected(self):
         for marker in self.gate.PYTEST_MARKERS:
             with self.subTest(marker=marker):
                 self.fresh()
                 self.write(marker)
-                label, _, _ = self.gate.verify(self.tmp, set())
+                label, _, _ = self.verify()
                 self.assertEqual(label, "python -m pytest -q -x")
 
     def test_npm_wins_over_pytest(self):
         self.write("package.json", json.dumps({"scripts": {"test": "x"}}))
         self.write("pyproject.toml")
-        self.gate.verify(self.tmp, set())
+        self.verify()
         self.assertEqual(self.ran, ["npm test"])
 
     def fresh(self):
@@ -450,12 +559,12 @@ class TestVerifierSelection(unittest.TestCase):
 
     def test_cargo_toml_runs_cargo_test(self):
         self.write("Cargo.toml")
-        self.assertEqual(self.gate.verify(self.tmp, set())[0], "cargo test -q")
+        self.assertEqual(self.verify()[0], "cargo test -q")
         self.assertEqual(self.ran, ["cargo test -q"])
 
     def test_go_mod_runs_vet_then_test(self):
         self.write("go.mod")
-        self.assertEqual(self.gate.verify(self.tmp, set())[0], "go test ./...")
+        self.assertEqual(self.verify()[0], "go test ./...")
         self.assertEqual(self.ran, ["go vet ./...", "go test ./..."])
 
     def test_dotnet_project_files_run_dotnet_test(self):
@@ -463,85 +572,18 @@ class TestVerifierSelection(unittest.TestCase):
             with self.subTest(marker=marker):
                 self.fresh()
                 self.write(marker)
-                self.assertEqual(self.gate.verify(self.tmp, set())[0], "dotnet test")
+                self.assertEqual(self.verify()[0], "dotnet test")
                 self.assertEqual(self.ran, ["dotnet test"])
 
     def test_cargo_wins_over_pytest(self):
         self.write("Cargo.toml")
         self.write("pyproject.toml")
-        self.gate.verify(self.tmp, set())
+        self.verify()
         self.assertEqual(self.ran, ["cargo test -q"])
 
     def test_no_verifier(self):
-        self.assertIsNone(self.gate.verify(self.tmp, set()))
+        self.assertIsNone(self.verify())
         self.assertEqual(self.ran, [])
-
-
-class TestPendingFindings(unittest.TestCase):
-    """ai_docs_lint_hook parks findings; reinforce injects them once and clears them."""
-
-    def setUp(self):
-        self.tmp = tempfile.mkdtemp()
-        self.addCleanup(shutil.rmtree, self.tmp, True)
-        self.env = dict(os.environ, GEMINI_HOOK_TMP=self.tmp)
-        self.pending = Path(self.tmp) / "pending_findings.txt"
-
-    def run_hook(self, script, payload):
-        proc = subprocess.run(
-            [sys.executable, str(HOOKS_DIR / script)], input=json.dumps(payload),
-            text=True, capture_output=True, env=self.env,
-        )
-        self.assertEqual(proc.returncode, 0, proc.stderr)
-        return json.loads(proc.stdout), proc.stderr
-
-    def lint_doc(self, text):
-        path = Path(self.tmp) / "GEMINI.md"
-        path.write_text(text, encoding="utf-8")
-        return self.run_hook(
-            "ai_docs_lint_hook.py",
-            {"toolCall": {"name": "write_to_file", "args": {"TargetFile": str(path)}}},
-        )
-
-    def test_failing_lint_parks_findings(self):
-        out, err = self.lint_doc("x" * 20000)
-        self.assertEqual(out, {})
-        self.assertIn("ai-docs-lint failed", self.pending.read_text(encoding="utf-8"))
-        self.assertIn("ai-docs-lint failed", err)
-
-    def test_clean_doc_parks_nothing(self):
-        self.lint_doc("# Rules\n\n- Keep it short.\n")
-        self.assertFalse(self.pending.exists())
-
-    def test_reinforce_injects_and_clears_findings(self):
-        self.lint_doc("x" * 20000)
-        res, _ = self.run_hook("reinforce.py", {"invocationNum": 1})
-        self.assertEqual(len(res["injectSteps"]), 2)
-        self.assertIn("CAVEMAN", res["injectSteps"][0]["ephemeralMessage"])
-        self.assertIn("ai-docs-lint failed", res["injectSteps"][1]["ephemeralMessage"])
-        self.assertFalse(self.pending.exists())
-
-    def test_findings_drain_once_only(self):
-        self.lint_doc("x" * 20000)
-        self.run_hook("reinforce.py", {"invocationNum": 1})
-        res, _ = self.run_hook("reinforce.py", {"invocationNum": 2})
-        self.assertEqual(res["injectSteps"], [])
-
-    def test_banner_is_skipped_between_milestones(self):
-        for num in (2, 5, 9, 11):
-            res, _ = self.run_hook("reinforce.py", {"invocationNum": num})
-            self.assertEqual(res["injectSteps"], [], f"invocationNum {num}")
-
-    def test_banner_returns_every_tenth_invocation(self):
-        for num in (10, 20):
-            res, _ = self.run_hook("reinforce.py", {"invocationNum": num})
-            self.assertIn("CAVEMAN", res["injectSteps"][0]["ephemeralMessage"])
-
-    def test_findings_drain_without_the_banner(self):
-        self.lint_doc("x" * 20000)
-        res, _ = self.run_hook("reinforce.py", {"invocationNum": 3})
-        self.assertEqual(len(res["injectSteps"]), 1)
-        self.assertIn("ai-docs-lint failed", res["injectSteps"][0]["ephemeralMessage"])
-        self.assertFalse(self.pending.exists())
 
 
 class TestTouchedFiles(unittest.TestCase):
@@ -608,45 +650,47 @@ class TestTouchedFiles(unittest.TestCase):
         self.assertIsNone(self.gate.touched_files(str(path), self.PROJECT))
 
 
-class TestAiDocsLintHook(unittest.TestCase):
-    SCRIPT = HOOKS_DIR / "ai_docs_lint_hook.py"
+class TestGateInternals(unittest.TestCase):
+    """execute, git and script_argv, called directly."""
 
-    def run_hook(self, name, path):
-        payload = json.dumps({"toolCall": {"name": name, "args": {"TargetFile": str(path)}}})
-        proc = subprocess.run(
-            [sys.executable, str(self.SCRIPT)], input=payload, text=True, capture_output=True
+    def setUp(self):
+        sys.path.insert(0, str(HOOKS_DIR))
+        self.addCleanup(sys.path.remove, str(HOOKS_DIR))
+        import stop_gate
+
+        self.gate = stop_gate
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+
+    def test_spent_budget_reports_a_finding_instead_of_running(self):
+        label, rc, lines = self.gate.execute(
+            self.tmp, "npm test", ["npm", "test"], time.monotonic() - 1
         )
-        self.assertEqual(proc.returncode, 0, proc.stderr)
-        return json.loads(proc.stdout), proc.stderr
+        self.assertEqual((label, rc), ("npm test", 1))
+        self.assertIn("verifier budget exhausted", lines[0])
 
-    def test_non_instruction_file_is_noop(self):
-        tmp = tempfile.mkdtemp()
-        self.addCleanup(shutil.rmtree, tmp, True)
-        path = Path(tmp) / "notes.md"
-        path.write_text("# notes\n", encoding="utf-8")
-        out, err = self.run_hook("write_to_file", path)
-        self.assertEqual(out, {})
-        self.assertEqual(err, "")
+    def test_cmd_script_runs_through_call(self):
+        argv = self.gate.script_argv(os.path.join(".agents", "verify.cmd"))
+        self.assertEqual(argv[:3], ["cmd", "/c", "call"])
 
-    def test_missing_file_is_noop(self):
-        out, err = self.run_hook("write_to_file", Path(tempfile.gettempdir()) / "nope" / "GEMINI.md")
-        self.assertEqual(out, {})
-        self.assertEqual(err, "")
+    def test_sh_script_without_bash_is_not_a_verifier(self):
+        agents = Path(self.tmp) / ".agents"
+        agents.mkdir()
+        (agents / "verify.sh").write_text("exit 1\n", encoding="utf-8")
+        import hookpaths
 
-    def test_clean_instruction_doc_is_silent(self):
-        out, err = self.run_hook("replace_file_content", HOOKS_DIR.parent / "AGENTS.md")
-        self.assertEqual(out, {})
-        self.assertEqual(err, "")
+        settings = Path(self.tmp) / "s.json"
+        settings.write_text(json.dumps({"trustedWorkspaces": [self.tmp]}), encoding="utf-8")
+        real = hookpaths.CLI_SETTINGS
+        self.addCleanup(setattr, hookpaths, "CLI_SETTINGS", real)
+        hookpaths.CLI_SETTINGS = str(settings)
 
-    def test_bad_instruction_doc_reports_findings(self):
-        tmp = tempfile.mkdtemp()
-        self.addCleanup(shutil.rmtree, tmp, True)
-        path = Path(tmp) / "GEMINI.md"
-        path.write_text("x" * 20000, encoding="utf-8")
-        out, err = self.run_hook("write_to_file", path)
-        self.assertEqual(out, {})
-        self.assertIn("ai-docs-lint failed", err)
+        real_which = shutil.which
+        self.addCleanup(setattr, shutil, "which", real_which)
+        shutil.which = lambda name, *a, **k: None if name == "bash" else real_which(name, *a, **k)
+        self.assertIsNone(self.gate.verify(self.tmp, set(), time.monotonic() + 600))
 
-
-if __name__ == "__main__":
-    unittest.main()
+    def test_git_returns_none_when_it_fails(self):
+        """A directory with no repo, so rev-parse exits non-zero and the filter must give up."""
+        self.assertIsNone(self.gate.git(self.tmp, "rev-parse", "--show-toplevel"))
+        self.assertIsNone(self.gate.changed_files(self.tmp))

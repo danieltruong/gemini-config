@@ -3,9 +3,8 @@
 import os
 
 TMP = os.environ.get("GEMINI_HOOK_TMP") or os.path.expanduser("~/.gemini/tmp")
-# ai_docs_lint_hook.py writes findings here; reinforce.py drains them into the next model call,
-# because PostToolUse output is spec'd as {} and cannot talk back to the agent itself.
-PENDING_FINDINGS = os.path.join(TMP, "pending_findings.txt")
+CLI_SETTINGS = (os.environ.get("GEMINI_CLI_SETTINGS")
+                or os.path.expanduser("~/.gemini/antigravity-cli/settings.json"))
 DOCS_LINT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "scripts", "ai-docs-lint.py")
 
 INSTRUCTION_DOCS = {"GEMINI.md", "AGENTS.md", "SKILL.md"}

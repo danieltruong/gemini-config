@@ -33,6 +33,15 @@ Link-File "$Repo\hooks.json" "$Config\hooks.json"
 # 3. Skills. agy scans the global config dir only; ~/.agents/skills is workspace-scoped.
 Link-Dir "$Repo\skills" "$Config\skills"
 
+# Older installs junctioned every skill into ~/.agents/skills. Drop the links, never the targets.
+$stale = "$HOME\.agents\skills"
+if (Test-Path $stale) {
+    Get-ChildItem $stale -Force | Where-Object { $_.Attributes -match "ReparsePoint" } | ForEach-Object {
+        Write-Host "removing stale skill junction $($_.Name)"
+        $_.Delete()
+    }
+}
+
 # 4. MCP config: repo servers merged with machine-local mcp_config.local.json
 $local = "$Config\mcp_config.local.json"
 $out = "$Config\mcp_config.json"

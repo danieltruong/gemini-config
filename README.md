@@ -31,7 +31,7 @@ Antigravity reads global rules from `~/.gemini/GEMINI.md` and global customizati
 | `scripts/` | `~/.gemini/config/scripts/` | Linter, compressor, pre-push check |
 | `mcp_config.json` | `~/.gemini/config/mcp_config.json` | MCP servers |
 
-agy 1.1.27 does not dispatch `PostToolUse` hooks. `PreToolUse`, `PreInvocation` and `Stop` all run. The `ai-docs-lint` entry stays wired for a build that ships it; until then `stop-gate` runs the same check at Stop.
+agy 1.1.27 does not dispatch `PostToolUse` hooks. `PreToolUse`, `PreInvocation` and `Stop` all run, so the docs lint runs inside `stop-gate` at Stop.
 
 Machine-local MCP servers go in `~/.gemini/config/mcp_config.local.json`. The installer merges it over the repo file. It is not tracked.
 
@@ -81,9 +81,12 @@ The `stop-gate` hook blocks an agent from finishing while the repo's own checks 
 1. `.agents/verify.cmd`, `.agents/verify.ps1`, or `.agents/verify.sh`, run with the workspace as the working directory
 2. a Ren'Py `game/` directory, checked with `renpy.exe <project> lint --error-code`
 3. `package.json` with a `lint` or `test` script, run as `npm run lint` then `npm test`
-4. `pyproject.toml`, `pytest.ini`, or `setup.cfg`, run as `python -m pytest -q -x`
+4. `Cargo.toml`, run as `cargo test -q`
+5. `go.mod`, run as `go vet ./...` then `go test ./...`
+6. `*.sln` or `*.csproj`, run as `dotnet test`
+7. `pyproject.toml`, `pytest.ini`, or `setup.cfg`, run as `python -m pytest -q -x`
 
-Nothing matching means no gate. Give a repo its own `.agents/verify.sh` to control exactly what runs. The whole verifier gets 600 seconds.
+A verify script only runs in a workspace listed in `trustedWorkspaces` in `~/.gemini/antigravity-cli/settings.json`; elsewhere the gate skips it and logs `untrusted workspace`. Nothing matching means no gate. Give a repo its own `.agents/verify.sh` to control exactly what runs. One 800 second budget covers every verifier, lint and docs run in the whole Stop pass.
 
 ## Audit loop
 
@@ -132,9 +135,7 @@ A dead http MCP server makes every headless run hang until the timeout expires. 
 ## Verify
 
 ```bash
-python scripts/ai-docs-lint.py --all
-python -m unittest discover -s hooks/tests
-agy mcp list
+bash scripts/prepush.sh && agy mcp list
 ```
 
 Then the subagent roster check above. `agy agents` lists nothing here, because every agent in this repo is a subagent.
