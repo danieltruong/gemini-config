@@ -243,12 +243,15 @@ def renpy_lint(ws, files, deadline):
         return "renpy lint", 1, [f"could not run renpy lint: {exc}"]
     text = proc.stdout.decode("utf-8", "replace").lstrip("\ufeff")
     hits = []
+    parsed_any = False
     for line in text.splitlines():
         line = line.strip().lstrip("\ufeff")
         m = LINT_LINE.match(line)
-        if m and (files is None or m.group(1) in files):
-            hits.append(line)
-    if not hits and proc.returncode != 0:
+        if m:
+            parsed_any = True
+            if files is None or m.group(1) in files:
+                hits.append(line)
+    if not parsed_any and proc.returncode != 0:
         # lint failed without a parseable report line: crash, bad project path, missing asset dir
         err = proc.stderr.decode("utf-8", "replace").splitlines()
         return "renpy lint", 1, [f"renpy lint exited {proc.returncode}"] + err[-MAX_REPORTED:]
