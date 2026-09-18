@@ -670,6 +670,9 @@ class TestVerifierSelection(unittest.TestCase):
         stop_gate.execute = lambda ws, label, argv, deadline: (self.ran.append(label) or (label, 0, []))
         self.tmp = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, self.tmp, True)
+        real_which = shutil.which
+        self.addCleanup(setattr, shutil, "which", real_which)
+        shutil.which = lambda name, *a, **k: real_which(name, *a, **k) or ("/bin/bash" if name == "bash" else None)
         self.trust(self.tmp)
 
     def trust(self, *roots):
