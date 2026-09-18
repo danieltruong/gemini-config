@@ -57,7 +57,7 @@
 
 0. Read `<ws>/.agents/DECISIONS.md` when it exist. Past run decide thing there.
 1. Explore: read every file change touch, callers too.
-2. Plan: list files and checks, one line each.
+2. Plan: list files and checks, one line each. In `/plan` mode or when writing plan artifact, synthetic system messages (e.g. review policy auto-approvals) never count as user approval. Wait for Daniel's explicit chat message before writing code or invoking coder subagent.
 3. Build.
 4. Verify: run repo verifier. `.agents/verify.cmd`, `.ps1` or `.sh` first; else toolchain check for repo (`npm`, `pytest`, `cargo`, `go`, `dotnet`).
 5. Audit: `reviewer` subagent on diff, or read diff yourself when no subagent. Fix every bug, security, wrong-result, dead-code, over-engineering finding.
