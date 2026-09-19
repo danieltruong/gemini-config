@@ -32,11 +32,10 @@ import urllib.parse
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir, "hooks"))
 # one transcript parser for the hooks and this script
-from transcript import EDIT_TOOLS, read_transcript  # noqa: E402
+from transcript import EDIT_TOOLS, RUN_TOOLS, read_transcript  # noqa: E402
 
 # Command-text matching lives here, not in the hooks: the stop gate judges a workspace by
 # its git fingerprint, and only this report still asks what a past command line looked like.
-RUN_TOOLS = {"run_command", "call_mcp_tool"}
 VERIFIER_COMMANDS = (
     (".agents/verify", re.compile(r"(?i)verify\.(?:cmd|ps1|sh)\b")),
     ("renpy lint", re.compile(r"(?i)renpy(?:\.exe)?[^\n]{0,60}\blint\b|renpy_run_lint")),
@@ -81,17 +80,14 @@ def result_failed(body):
     return ""
 
 
-def verifier_of(name, args, labels=None):
+def verifier_of(name, args):
     """The verifier label this call looks like it ran, or ''. Report only, never a gate."""
     if name not in RUN_TOOLS:
         return ""
     text = executed_text(name, args)
     if not text or QUOTING.match(text) or INSPECT_ONLY.search(text):
         return ""
-    wanted = VERIFIER_COMMANDS if labels is None else [
-        (lab, p) for lab in labels
-        for prefix, p in VERIFIER_COMMANDS if lab.startswith(prefix)]
-    return next((lab for lab, pattern in wanted if pattern.search(text)), "")
+    return next((lab for lab, pattern in VERIFIER_COMMANDS if pattern.search(text)), "")
 
 DEFAULT_ROOT = os.path.join(os.path.expanduser("~"), ".gemini", "antigravity-cli")
 STOP_GATE_LOG = os.path.join(os.path.expanduser("~"), ".gemini", "tmp", "stop_gate.log")
@@ -144,6 +140,8 @@ STOP_GATE_KINDS = ("stop", "skip", "release", "pending", "review", "verifier", "
                    "audit")
 # a gate decision that returned before any check ran, whatever kind it logged
 UNCHECKED_KINDS = {"skip", "pending", "unresolved", "no-workspace", "no-transcript"}
+# lines the gate logs beside a decision: a judge's record, a dropped path, a trust note
+BOOKKEEPING_KINDS = {"review", "unresolved", "trust"}
 # detail of a legacy line usually opens with one of these, so the word before it is the kind
 LEGACY_DETAIL = re.compile(r"(\S+)\s+((?:execution|reason)=.*)$")
 PRINTABLE_RUN = re.compile(rb"[\x20-\x7e]{10,}")
@@ -574,8 +572,7 @@ def audit_conversation(root, cid, summary, since):
                            f"{args.get('ToolName') or '?'}")
                 rec["mcp_calls"][mcp_key] += 1
             ran = executed_text(name, args) if name in RUN_TOOLS else ""
-            # labels None: the audit has no workspace verifier choice, any known one counts
-            verifier_label = verifier_of(name, args, None)
+            verifier_label = verifier_of(name, args)
             pending.append({"name": name, "mcp": mcp_key, "verifier": verifier_label,
                             "git_diff": bool(ran and GIT_DIFF.search(ran))})
             signature = retry_signature(name, args)
@@ -717,8 +714,8 @@ def stop_gate_log(since, path=None):
                 continue
             first = detail.split(" ")[0] if detail else ""
             counts[f"{kind} {first}" if first else kind] += 1
-            if kind == "review":
-                continue  # a judge writing down what it saw is bookkeeping, not a stop decision
+            if kind in BOOKKEEPING_KINDS:
+                continue  # lines the gate writes in passing, not decisions it took
             # every gate line is one stop decision, so an unchecked one counts wherever it landed
             stops += 1
             unchecked += unchecked_stop(kind, detail)
@@ -1135,12 +1132,12 @@ def self_check():
 
     assert executed_text("run_command", {"CommandLine": "pytest -q"}) == "pytest -q"
     assert executed_text("view_file", {"AbsolutePath": "test_x.py"}) == ""
-    assert verifier_of("run_command", {"CommandLine": "pytest -q"}, None) == "python -m pytest"
+    assert verifier_of("run_command", {"CommandLine": "pytest -q"}) == "python -m pytest"
     # reading a test file, printing the command or collecting tests is not a verifier run
     assert executed_text("view_file", {"AbsolutePath": "tests/test_x.py"}) == ""
-    assert verifier_of("view_file", {"AbsolutePath": "tests/test_x.py"}, None) == ""
-    assert verifier_of("run_command", {"CommandLine": "echo pytest"}, None) == ""
-    assert verifier_of("run_command", {"CommandLine": "pytest --collect-only"}, None) == ""
+    assert verifier_of("view_file", {"AbsolutePath": "tests/test_x.py"}) == ""
+    assert verifier_of("run_command", {"CommandLine": "echo pytest"}) == ""
+    assert verifier_of("run_command", {"CommandLine": "pytest --collect-only"}) == ""
 
     assert [s["TypeName"] for s in subagent_specs(
         {"Subagents": [{"TypeName": "reviewer", "Model": "pro"}]})] == ["reviewer"]
@@ -1196,14 +1193,18 @@ def self_check():
         "2026-09-18T00:32:09 - stop reason='NO_TOOL_CALL' idle=True")[1:])
     assert not unchecked_stop("stop", "execution=0")
 
-    # a judge writing down what it reviewed is not a stop the gate decided anything about
+    # what a judge reviewed, a path that would not resolve and a trust note are all things the
+    # gate writes down beside a decision, not stops it decided anything about
     with tempfile.NamedTemporaryFile("w", suffix=".log", delete=False,
                                      encoding="utf-8") as handle:
         handle.write("2026-09-18T00:33:41\tstop\tF:/p\tverified\n"
-                     "2026-09-18T00:33:42\treview\tF:/p\treviewer recorded 1/1\n")
+                     "2026-09-18T00:33:42\treview\tF:/p\treviewer recorded 1/1\n"
+                     "2026-09-18T00:33:43\tunresolved\t/no/such\tpath dropped\n"
+                     "2026-09-18T00:33:44\ttrust\tF:/p\tuntrusted workspace\n")
     counts, stops, unchecked = stop_gate_log(base - dt.timedelta(days=1), handle.name)
     os.unlink(handle.name)
     assert (stops, unchecked) == (1, 0) and counts["review reviewer"] == 1
+    assert counts["unresolved path"] == 1 and counts["trust untrusted"] == 1
 
     assert snapshot_delta({"stops": 10, "date": "2026-09-11"},
                           {"stops": 4, "date": "2026-09-18"}) == ["stops: 10 -> 4 (-6)"]

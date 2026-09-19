@@ -26,10 +26,12 @@ def note_start(cid, spaces):
     """Fingerprint each workspace before the turn runs.
 
     This is the baseline the stop gate compares against: what a reviewer saw when it started,
-    and which untracked files were already there before anyone wrote anything.
+    and which untracked files were already there before anyone wrote anything. A fallback
+    record that a Stop had to write is replaced here, because this runs before the work.
     """
     for ws in spaces:
-        if not gitstate.seen(cid, ws):  # only the first turn pays for the git calls
+        record = gitstate.seen(cid, ws)
+        if not record or record.get("fallback"):  # else no turn pays for the git calls twice
             gitstate.note_seen(cid, ws, gitstate.fingerprint(ws))
 
 

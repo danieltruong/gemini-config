@@ -14,9 +14,10 @@ import hookpaths
 
 EDIT_TOOLS = {"replace_file_content", "write_to_file", "multi_replace_file_content",
               "sed_file", "edit_file", "create_file"}
-RUN_TOOL = "run_command"
+RUN_TOOLS = {"run_command", "call_mcp_tool"}
+SPAWN_TOOL = "invoke_subagent"
 # a call that could have changed a tree, whatever it was actually spelled to do
-WORK_TOOLS = EDIT_TOOLS | {RUN_TOOL}
+WORK_TOOLS = EDIT_TOOLS | RUN_TOOLS | {SPAWN_TOOL}
 # a subagent record with no readable type still marks a subagent, which owes no review
 UNKNOWN_TYPE = "subagent"
 # delegation that judges work instead of changing it
@@ -152,6 +153,24 @@ def did_work(calls_made):
     matching it is what the old transcript-reading gate did, and it was gamed.
     """
     return any(name in WORK_TOOLS for _index, name, _args in calls_made or ())
+
+
+def run_dirs(calls_made, outside=()):
+    """Directories a run tool worked in, artifact and brain directories left out.
+
+    A shell write names no file, so its working directory is the only workspace it points at.
+    """
+    out = []
+    for _index, name, args in calls_made or ():
+        if name not in RUN_TOOLS:
+            continue
+        path = unwrap(args.get("Cwd"))
+        if not path:
+            continue
+        full = os.path.abspath(hookpaths.real_path(path)).replace("\\", "/")
+        if not any(under(full, root) for root in outside if root) and full not in out:
+            out.append(full)
+    return out
 
 
 def targets(args):

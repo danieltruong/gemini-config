@@ -45,8 +45,23 @@ def lines(ws, *args):
             if ln.strip()]
 
 
-def is_repo(ws):
-    return text(ws, "rev-parse", "--git-dir") is not None
+def same_dir(one, other):
+    return os.path.normcase(os.path.realpath(one)) == os.path.normcase(os.path.realpath(other))
+
+
+def repo_state(ws):
+    """(repository root, HEAD) in one git call, or None when ws is not in a repository."""
+    out = text(ws, "rev-parse", "--show-toplevel", "HEAD")
+    found = (out or "").splitlines()  # one per line: a repository path can hold spaces
+    if len(found) >= 2:
+        return found[0].strip(), found[1].strip()
+    root = text(ws, "rev-parse", "--show-toplevel")
+    return None if root is None else (root.strip(), "no-head")
+
+
+def hash_map(value):
+    """A record's untracked hashes. A record that stored names only counts as unknown."""
+    return value if isinstance(value, dict) else {}
 
 
 def toplevel(path):
@@ -77,12 +92,15 @@ def file_hash(path):
 
 def tracked_hash(ws):
     """HEAD plus the diff against it, hashed. None when ws is not a git repository."""
-    if not is_repo(ws):
+    state = repo_state(ws)
+    if state is None:
         return None
-    head = (text(ws, "rev-parse", "HEAD") or "no-head").strip()
-    # the stash is repo-wide, and stashing work away leaves a clean tree that otherwise
-    # looks exactly like the one the conversation started from
-    stash = (text(ws, "rev-parse", "--verify", "-q", "refs/stash") or "no-stash").strip()
+    root, head = state
+    # stashing work away leaves a clean tree that otherwise looks exactly like the one the
+    # conversation started from. The stash is repo-wide, so it only counts at the repo root.
+    stash = ""
+    if same_dir(root, ws):
+        stash = (text(ws, "rev-parse", "--verify", "-q", "refs/stash") or "no-stash").strip()
     # --binary so a changed image or archive moves the hash like any other file
     diff = git(ws, "diff", "--binary", "HEAD", *HERE)
     if diff is None:
@@ -195,10 +213,18 @@ def note_seen(cid, ws, fp, fallback=False):
     if not cid or fp is None:
         return
     path = record_path(SEEN, ws, cid)
-    if read_record(path):
+    old = read_record(path)
+    # a real baseline replaces a fallback: the next PreInvocation knows what the tree holds
+    # before its turn runs, which is exactly what the fallback could not say
+    if old and not (old.get("fallback") and not fallback):
         return
     hookpaths.write_json_file(path, {"at": time.time(), "workspace": ws, "fallback": fallback,
-                                     "tracked": fp.tracked, "untracked": sorted(fp.untracked)})
+                                     "tracked": fp.tracked, "untracked": fp.untracked})
+
+
+def seen(cid, ws):
+    """The oldest record of this workspace in this conversation, real baseline or fallback."""
+    return read_record(record_path(SEEN, ws, cid))
 
 
 def baseline(cid, ws):
@@ -207,25 +233,25 @@ def baseline(cid, ws):
     return None if not start or start.get("fallback") else start
 
 
-def seen(cid, ws):
-    return read_record(record_path(SEEN, ws, cid))
-
-
 def moved(cid, ws, fp):
-    """Has the workspace changed since this conversation's own baseline was taken?"""
-    start = baseline(cid, ws)
+    """Has the workspace changed since the gate first saw it in this conversation?
+
+    A fallback record is a floor rather than a baseline: it cannot date work that happened
+    before it, but anything after it still shows up here.
+    """
+    start = seen(cid, ws)
     if not start or fp is None:
         return False
     return (start.get("tracked") != fp.tracked
-            or sorted(start.get("untracked") or []) != sorted(fp.untracked))
+            or hash_map(start.get("untracked")) != fp.untracked)
 
 
 def new_untracked(cid, ws, fp):
-    """Untracked, unignored paths this conversation added since its baseline."""
-    start = baseline(cid, ws)
+    """Untracked, unignored paths that appeared since the gate first saw this workspace."""
+    start = seen(cid, ws)
     if not start or fp is None:
         return []
-    return sorted(set(fp.untracked) - set(start.get("untracked") or []))
+    return sorted(set(fp.untracked) - set(hash_map(start.get("untracked"))))
 
 
 def save_review(cid, ws, kind, fp):
@@ -233,16 +259,17 @@ def save_review(cid, ws, kind, fp):
 
     The judge's own baseline says what it started from: a judge that changed tracked content,
     or that never got a real baseline, proves nothing about what is in the tree now. Only the
-    untracked files present at both ends count as reviewed, so a file the judge created is
-    still new work for its parent.
+    untracked files present at both ends count as reviewed, and by content, so a file the
+    judge created, or one rewritten after it stopped, is still new work for its parent.
     """
     start = baseline(cid, ws)
     if fp is None or not start or start.get("tracked") != fp.tracked:
         return False
+    both = set(hash_map(start.get("untracked"))) & set(fp.untracked)
     hookpaths.write_json_file(
         record_path(REVIEWED, ws, kind),
         {"at": time.time(), "workspace": ws, "by": cid, "tracked": fp.tracked,
-         "untracked": sorted(set(start.get("untracked") or []) & set(fp.untracked))})
+         "untracked": {rel: fp.untracked[rel] for rel in both}})
     return True
 
 

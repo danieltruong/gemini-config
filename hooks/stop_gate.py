@@ -26,8 +26,6 @@ DOCS_TIMEOUT = 30
 # answers before agy kills it and loses the decision.
 GATE_BUDGET = 700
 MIN_STEP = 5
-# forced continues per gap kind and per fingerprint; hookpaths caps the total per conversation
-MAX_RETRIES = 1
 MAX_REPORTED = 40
 VISUAL_REL = ".agents/visual.md"
 # agy 1.2.6 sends "NO_TOOL_CALL" here; "model_stop" is only in the docs. Every other
@@ -35,14 +33,21 @@ VISUAL_REL = ".agents/visual.md"
 MODEL_FINISHED = {"model_stop", "NO_TOOL_CALL"}
 VERIFY_SCRIPTS = ("verify.cmd", "verify.ps1", "verify.sh")
 PYTEST_MARKERS = ("pyproject.toml", "pytest.ini", "setup.cfg")
+PYTEST_LABEL = "python -m pytest -q -x"
+# pytest exits 5 when it collected nothing: that repo has no tests, it has no failure
+NO_TESTS_CODE = 5
 RENPY_LABEL = "renpy lint"
+# one stop runs a workspace's verifier at a time; a lock this old outlived its hook timeout
+LOCKS = os.path.join(hookpaths.TMP, "locks")
+LOCK_MAX_AGE = 900
+LOCK_POLL = 2
 # marker files in the workspace root -> the steps that verify it, first match wins
 MARKER_VERIFIERS = (
     (("Cargo.toml",), (("cargo test -q", ["cargo", "test", "-q"]),)),
     (("go.mod",), (("go vet ./...", ["go", "vet", "./..."]),
                    ("go test ./...", ["go", "test", "./..."]))),
     (("*.sln", "*.csproj"), (("dotnet test", ["dotnet", "test"]),)),
-    (PYTEST_MARKERS, (("python -m pytest -q -x", [sys.executable, "-m", "pytest", "-q", "-x"]),)),
+    (PYTEST_MARKERS, ((PYTEST_LABEL, [sys.executable, "-m", "pytest", "-q", "-x"]),)),
 )
 # lint report lines start with a project-relative path: "game/foo/bar.rpy:12 message"
 LINT_LINE = re.compile(r"^(\S+\.rpym?):(\d+)\s")
@@ -60,15 +65,23 @@ UNTRUSTED_REASON = (
     "reports, or add the workspace to that list so the gate can check it."
 )
 
-REVIEW_REASON = (
-    "Blocked: {why} in {ws}. invoke_subagent with TypeName {kind} and a real Prompt on "
-    "`git diff HEAD`, fix its findings, then finish."
+# gaps the gate reports without running anything and without forcing a retry
+NOT_CHECKED = {"untrusted", "no-git"}
+
+NO_GIT_REASON = (
+    "Not checked, {ws} is not a git repository, so the gate cannot tell what changed there "
+    "or prove that anything reviewed it. Check the work yourself before you finish."
 )
 
-VISUAL_REASON = (
-    "Blocked: {why} in {ws}. invoke_subagent with TypeName visual-qa and a real Prompt on "
-    "the URLs in {rel}, fix what fails ## Accept, then finish."
+REVIEW_REASON = (
+    "Blocked: {why} in {ws}. invoke_subagent with TypeName {kind} and a real Prompt on "
+    "{subject}, fix its findings, then finish."
 )
+# per judge: the gap kind logged when it is missing, and what that judge is asked to look at
+REVIEW_KINDS = {
+    "reviewer": ("no-review", "`git diff HEAD`"),
+    "visual-qa": ("no-visual", f"the URLs in {VISUAL_REL}, then on what fails ## Accept"),
+}
 
 DOCS_REASON = ("ai-docs-lint failed in files you changed:\n{lines}\n"
                "Fix them, then finish.")
@@ -179,9 +192,11 @@ def renpy_lint(ws, files, deadline):
 
 
 def run_steps(ws, steps, deadline):
-    """The first failing step, or a pass for the last one. None when there are no steps."""
+    """The first failing step, or a pass for the last one. None when nothing was verified."""
     for label, argv in steps:
         found = execute(ws, label, argv, deadline)
+        if label == PYTEST_LABEL and found[1] == NO_TESTS_CODE:
+            return None  # no tests here, so this repo has no verifier rather than a failure
         if found[1] != 0:
             return found
     return (steps[-1][0], 0, []) if steps else None
@@ -272,16 +287,15 @@ def touched(ws, cid, fp, worked, edited):
     excuse the review the parent still owes for the same tree.
     """
     if fp is None:
-        # not a git repository, so an edit tool naming a file here is the only signal left;
-        # None means the transcript could not be read, which is not proof of nothing
-        return edited is None or bool(edited)
+        # not a git repository, so an edit tool naming a file here is the only signal left
+        return bool(edited)
     if fp.names and not work_names(fp.names):
         return False
-    if not gitstate.baseline(cid, ws):
-        # no baseline of this conversation's own, so dirt here may well predate it: the
-        # question becomes whether the run called anything that could have written at all
-        return worked
-    return gitstate.moved(cid, ws, fp)
+    if gitstate.baseline(cid, ws):
+        return gitstate.moved(cid, ws, fp)
+    # only a fallback record: it is still a floor for anything that happened after it, and a
+    # work tool call in the transcript is the other half of the answer
+    return gitstate.moved(cid, ws, fp) or worked
 
 
 def cached_pass(ws, fp):
@@ -289,6 +303,35 @@ def cached_pass(ws, fp):
     rec = gitstate.verified(ws)
     return bool(rec.get("digest")) and fp is not None and rec["digest"] == gitstate.digest(
         gitstate.without(fp, rec.get("artifacts") or []))
+
+
+def lock_file(ws):
+    return os.path.join(LOCKS, hookpaths.ws_key(ws) + ".json")
+
+
+def locked(ws):
+    """Is another stop running this workspace's verifier right now?"""
+    rec = hookpaths.read_json_file(lock_file(ws)) or {}
+    try:
+        age = time.time() - float(rec.get("at") or 0)
+    except (TypeError, ValueError):
+        return False
+    return bool(rec) and age < LOCK_MAX_AGE and rec.get("pid") != os.getpid()
+
+
+def hold_lock(ws, deadline):
+    """Wait out another stop's verifier run, then claim the workspace. False when out of budget."""
+    while locked(ws) and remaining(deadline) > MIN_STEP:
+        time.sleep(LOCK_POLL)
+    hookpaths.write_json_file(lock_file(ws), {"at": time.time(), "pid": os.getpid()})
+    return True
+
+
+def drop_lock(ws):
+    try:
+        os.remove(lock_file(ws))
+    except OSError:
+        pass
 
 
 def verifier_gap(ws, fp, names, deadline):
@@ -301,6 +344,16 @@ def verifier_gap(ws, fp, names, deadline):
         log(ws, "trust", "untrusted workspace, verifier not run")
         return "untrusted", UNTRUSTED_REASON.format(ws=ws, cmds=verifier_hint(steps),
                                                     settings=hookpaths.CLI_SETTINGS)
+    hold_lock(ws, deadline)
+    try:
+        if cached_pass(ws, fp):
+            return None  # a concurrent stop just ran it, and its pass covers this tree
+        return run_verifier(ws, fp, names, steps, deadline)
+    finally:
+        drop_lock(ws)
+
+
+def run_verifier(ws, fp, names, steps, deadline):
     found = verify(ws, names, steps, deadline)
     if found and found[1] != 0:
         return "verifier", VERIFIER_REASON.format(
@@ -316,26 +369,27 @@ def verifier_gap(ws, fp, names, deadline):
 
 def review_why(ws, fp, kind, ignore):
     """Why this kind of review does not cover the tree in front of us, or ''."""
-    if fp is None:
-        # no fingerprint to tie a record to, so nothing here can be shown to have been reviewed
-        return f"{kind} cover cannot be proved without git in this workspace"
     rec = gitstate.review(ws, kind)
     if not rec:
         return f"no {kind} has seen the current state"
     if rec.get("tracked") != fp.tracked:
         return f"tracked files changed after the {kind} run, so it did not see this tree"
-    fresh = sorted(set(fp.untracked) - set(rec.get("untracked") or []) - ignore)
+    seen_now = gitstate.hash_map(rec.get("untracked"))
+    # by content, not by name: a file rewritten after the run was never reviewed either
+    fresh = sorted(rel for rel, digest in fp.untracked.items()
+                   if rel not in ignore and seen_now.get(rel) != digest)
     return f"{fresh[0]} is new since the {kind} run" if fresh else ""
 
 
 def review_gap(ws, fp, ignore):
-    why = review_why(ws, fp, "reviewer", ignore)
-    if why:
-        return "no-review", REVIEW_REASON.format(why=why, ws=ws, kind="reviewer")
+    kinds = ["reviewer"]
     if os.path.isfile(os.path.join(ws, VISUAL_REL)):
-        why = review_why(ws, fp, "visual-qa", ignore)
+        kinds.append("visual-qa")
+    for kind in kinds:
+        why = review_why(ws, fp, kind, ignore)
         if why:
-            return "no-visual", VISUAL_REASON.format(why=why, ws=ws, rel=VISUAL_REL)
+            gap, subject = REVIEW_KINDS[kind]
+            return gap, REVIEW_REASON.format(why=why, ws=ws, kind=kind, subject=subject)
     return None
 
 
@@ -375,15 +429,20 @@ def workspace_gap(ws, cid, fp, role, outside, deadline):
     # a subagent answers to the run that spawned it, and a docs change is its own check
     if role or only_docs:
         return None
+    if fp is None:
+        return "no-git", NO_GIT_REASON.format(ws=ws)
     return review_gap(ws, fp, ignore)
 
 
 def derived_spaces(calls, outside):
-    """Repository roots holding the files an edit tool named, for stops that carry no workspace."""
+    """Repository roots the run wrote in, for a stop that carries no workspace of its own.
+
+    An edit tool names its file; a shell write names nothing, so its working directory counts.
+    """
     roots, out = {}, []
-    for path in transcript.written_paths(calls, outside):
-        parent = os.path.dirname(path)
-        if parent not in roots:  # many edits share a directory, and each lookup is a git call
+    dirs = [os.path.dirname(path) for path in transcript.written_paths(calls, outside)]
+    for parent in dirs + transcript.run_dirs(calls, outside):
+        if parent not in roots:  # many calls share a directory, and each lookup is a git call
             top = gitstate.toplevel(parent)
             roots[parent] = os.path.abspath(top) if top else ""
         top = roots[parent]
@@ -404,10 +463,11 @@ def workspaces(ev, calls, outside):
     return (good or derived_spaces(calls, outside)), dropped
 
 
-def clear_verified(spaces):
-    """Drop a pending marker only where the tree in front of us is one the gate proved."""
+def clear_markers(cid, spaces, prints):
+    """Drop a pending marker where the gate proved this tree, or where the work is gone."""
     for ws in spaces:
-        if cached_pass(ws, gitstate.fingerprint(ws)):
+        reverted = gitstate.seen(cid, ws) and not gitstate.moved(cid, ws, prints[ws])
+        if cached_pass(ws, prints[ws]) or reverted:
             hookpaths.clear_pending(ws)
 
 
@@ -422,21 +482,22 @@ def first_gap(spaces, find):
 
 def release_reason(kind, ledger, message):
     """What the terminal is told when the gate lets an unmet stop through."""
-    if kind == "untrusted":
+    if kind in NOT_CHECKED:
         return message  # nothing ran and nothing was forced, so retry wording would be a lie
     if hookpaths.forced_count(ledger) >= hookpaths.MAX_FORCED:
         return CEILING_NOTE.format(n=hookpaths.MAX_FORCED, summary=message)
     return HUMAN_NOTE.format(summary=message)
 
 
-def answer(gap, culprit, cid, fp, spaces, deadline, detail):
+def answer(gap, culprit, cid, fp, spaces, deadline, detail, tag=""):
     """Force one more turn for this gap, or release the stop and leave a marker."""
     kind, message = gap
     budget = f"{int(max(0, remaining(deadline)))}s of the {GATE_BUDGET}s gate budget left."
-    # without a conversation id the workspace is the ledger, so the gate still blocks once
-    ledger = cid or f"workspace {hookpaths.ws_key(culprit)}"
+    # with no conversation id the ledger is this workspace and this tree, so the gate still
+    # blocks once without two such stops sharing one ceiling
+    ledger = cid or f"workspace {hookpaths.ws_key(culprit)} {tag}"
     allowance = f"{kind}:{gitstate.digest(fp) or 'nogit'}"
-    if kind != "untrusted" and hookpaths.take_retry(ledger, allowance, MAX_RETRIES):
+    if kind not in NOT_CHECKED and hookpaths.take_retry(ledger, allowance):
         return {"decision": "continue", "reason": message + "\n" + budget}, kind, detail, spaces
     hookpaths.write_pending(culprit, [message])
     return ({"decision": "stop", "reason": release_reason(kind, ledger, message)},
@@ -462,9 +523,15 @@ def decide(ev, deadline):
     for ws in spaces:
         gitstate.note_seen(cid, ws, prints[ws], fallback=True)
 
+    reason = ev.get("terminationReason")
+    finished = reason in MODEL_FINISHED
+
     if role in transcript.JUDGE_TYPES:
         # a judge owes no verifier run and no review: it records what it saw, but it still
-        # has to clean up after itself
+        # has to clean up after itself. A run that was cut short judged nothing.
+        if not finished:
+            return ({"decision": "stop"}, "review",
+                    f"{role} recorded nothing, reason={reason!r}", spaces)
         kept = [ws for ws in spaces if gitstate.save_review(cid, ws, role, prints[ws])]
         detail = f"{role} recorded {len(kept)}/{len(spaces)}"
         gap, culprit = first_gap(spaces, lambda ws: leftover_gap(
@@ -476,22 +543,19 @@ def decide(ev, deadline):
     if not spaces:
         return {"decision": "stop"}, "no-workspace", "no workspace to judge", spaces
 
-    # with no baseline of its own the gate cannot tell this run's work from older dirt, so any
-    # call that could have written counts as work in every workspace of this stop
-    worked = steps is None or transcript.did_work(calls)
-    edited = {ws: (None if steps is None else transcript.edits(calls, ws, outside))
-              for ws in spaces}
+    # with only a fallback record the gate cannot date the dirt it finds, so a call that could
+    # have written counts as work in every workspace of this stop. No transcript is not a call.
+    worked = transcript.did_work(calls)
+    edited = {ws: transcript.edits(calls, ws, outside) for ws in spaces}
     dirty = [ws for ws in spaces if touched(ws, cid, prints[ws], worked, edited[ws])]
-    finished = ev.get("terminationReason") in MODEL_FINISHED
 
     if not dirty:
-        clear_verified(spaces)
+        clear_markers(cid, spaces, prints)
         return {"decision": "stop"}, "stop", "unchanged", spaces
 
     if not finished:
         # the run did not choose to finish, so the gate leaves a marker rather than spend a
         # verifier run on work the user just interrupted
-        reason = ev.get("terminationReason")
         for ws in dirty:
             hookpaths.write_pending(ws, [UNFINISHED_NOTE.format(reason=reason)])
         return ({"decision": "stop"}, "pending",
@@ -500,10 +564,11 @@ def decide(ev, deadline):
     gap, culprit = first_gap(dirty, lambda ws: workspace_gap(
         ws, cid, prints[ws], role, outside, deadline))
     if not gap:
-        clear_verified(dirty)
+        clear_markers(cid, dirty, prints)
         return {"decision": "stop"}, "stop", "verified", spaces
     return answer(gap, culprit, cid, prints[culprit], spaces, deadline,
-                  f"{role or 'top-level'} {culprit}")
+                  f"{role or 'top-level'} {culprit}",
+                  tag=tpath or gitstate.digest(prints[culprit]))
 
 
 def main():

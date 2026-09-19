@@ -16,7 +16,8 @@ DOCS_LINT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "scri
 PENDING = os.path.join(TMP, "pending")
 # forced continues already spent, one file per conversation
 RETRIES = os.path.join(TMP, "retries")
-# forced continues one conversation may spend in total, however many gaps it hits
+# forced continues per gap kind and fingerprint, then per conversation whatever the gap
+MAX_PER_GAP = 1
 MAX_FORCED = 3
 # ledger key for that total; every gap kind carries a ":" so neither can shadow the other
 TOTAL_KEY = "total"
@@ -195,7 +196,7 @@ def forced_count(ledger):
         return 0
 
 
-def take_retry(ledger, kind, limit=1, ceiling=MAX_FORCED):
+def take_retry(ledger, kind):
     """Spend one forced continue for this (ledger, gap kind, fingerprint). False when spent.
 
     An unreadable file counts as spent: a conversation that corrupts its own retry state must
@@ -211,7 +212,7 @@ def take_retry(ledger, kind, limit=1, ceiling=MAX_FORCED):
         total = int(data.get(TOTAL_KEY) or 0)
     except (TypeError, ValueError):
         return False
-    if used >= limit or total >= ceiling:
+    if used >= MAX_PER_GAP or total >= MAX_FORCED:
         return False
     data[kind] = used + 1
     data[TOTAL_KEY] = total + 1
