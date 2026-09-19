@@ -629,6 +629,16 @@ class TestChangeDetection(GateCase):
         self.assertEqual(res.get("decision"), "stop", res)
         self.assertEqual(self.runs(), 0)
 
+    def test_a_fallback_record_is_replaced_by_the_next_baseline(self):
+        """Once a PreInvocation runs, dirt it saw before the turn is not the turn's work."""
+        self.verifier()
+        self.assertEqual(self.stop().get("decision"), "stop")  # fallback record, pristine tree
+        self.write("app.py", "x = 2\n")
+        self.turn()  # replaces the fallback, so this dirt is now part of the baseline
+        res = self.stop(transcriptPath=self.transcript(("edit", "app.py")))
+        self.assertEqual(res.get("decision"), "stop", res)
+        self.assertEqual(self.runs(), 0)
+
     def test_a_fallback_baseline_is_a_floor_for_the_next_stop(self):
         self.verifier()
         self.assertEqual(self.stop().get("decision"), "stop")  # writes the fallback record
