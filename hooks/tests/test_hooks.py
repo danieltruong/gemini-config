@@ -1761,3 +1761,262 @@ class TestGateInternals(unittest.TestCase):
 
     def test_a_conversation_without_an_id_gets_no_retry(self):
         self.assertFalse(self.retry("verifier:aaa", cid=""))
+
+
+REPO_ROOT = HOOKS_DIR.parent
+
+
+def link(target, where):
+    """A junction or symlink at where pointing at target, or '' when the platform refuses one."""
+    try:
+        if os.name == "nt":
+            proc = subprocess.run(["cmd", "/c", "mklink", "/J", str(where), str(target)],
+                                  capture_output=True, text=True)
+            return str(where) if proc.returncode == 0 else ""
+        os.symlink(str(target), str(where))
+        return str(where)
+    except (OSError, NotImplementedError):
+        return ""
+
+
+def msys(path):
+    """The MSYS form Git Bash hands agy: a Windows path with a leading drive letter."""
+    drive, rest = os.path.splitdrive(str(path))
+    return f"/{drive[0].lower()}{rest}".replace("\\", "/")
+
+
+class TestOwnerOnlyWrites(unittest.TestCase):
+    """The gate's own files, the verifier definition and test files are not a run's to write."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.home = Path(self.tmp) / "gemini"  # stands in for ~/.gemini
+        for rel in ("tmp/verified", "config/hooks", "antigravity-cli",
+                    "brain/cid-1/.system_generated/subagents"):
+            (self.home / rel).mkdir(parents=True, exist_ok=True)
+        self.ws = Path(self.tmp) / "ws"
+        (self.ws / "src").mkdir(parents=True)
+        (self.ws / ".agents" / "rules").mkdir(parents=True)
+        self.artifacts = self.home / "brain" / "cid-1" / "artifacts"
+        self.artifacts.mkdir(parents=True)
+
+    def env(self):
+        return dict(os.environ, GEMINI_HOME=str(self.home),
+                    GEMINI_HOOK_TMP=str(self.home / "tmp"))
+
+    def decide(self, tool, args, **extra):
+        """(decision, stderr) for one tool call, the hook run the way agy runs it."""
+        payload = {"toolCall": {"name": tool, "args": args},
+                   "workspacePaths": [str(self.ws)], "stepIdx": 3}
+        payload.update(extra)
+        proc = subprocess.run([sys.executable, str(HOOKS_DIR / "write_gate.py")],
+                              input=json.dumps(payload), text=True, capture_output=True,
+                              env=self.env())
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        return json.loads(proc.stdout), proc.stderr
+
+    def write(self, path, **extra):
+        res, _err = self.decide("write_to_file", {"TargetFile": str(path), "CodeContent": "x"},
+                                **extra)
+        return res
+
+    def deny_reason(self, path, **extra):
+        res = self.write(path, **extra)
+        self.assertEqual(res.get("decision"), "deny", f"{path} -> {res}")
+        return res.get("reason", "")
+
+    def assertAllowed(self, path, **extra):
+        res = self.write(path, **extra)
+        self.assertEqual(res.get("decision"), "allow", f"{path} -> {res}")
+
+    def subagent(self, kind, cid="sub-1", record=True):
+        """Payload fields for a subagent conversation of this type, as its parent recorded it."""
+        logs = self.home / "brain" / cid / ".system_generated" / "logs"
+        logs.mkdir(parents=True, exist_ok=True)
+        (logs / "transcript.jsonl").write_text("{}\n", encoding="utf-8")
+        if record:
+            records = self.home / "brain" / "cid-1" / ".system_generated" / "subagents"
+            (records / f"{cid}.json").write_text(
+                json.dumps({"subagentDescriptor": {"typeName": kind}}), encoding="utf-8")
+        return {"conversationId": cid, "transcriptPath": str(logs / "transcript.jsonl")}
+
+    # ------------------------------------------------------------------ rule 1
+    def test_gate_state_and_cli_config_denied(self):
+        for rel in ("tmp/verified/x.json", "config/hooks/stop_gate.py",
+                    "antigravity-cli/settings.json",
+                    "brain/cid-1/.system_generated/subagents/sub-1.json"):
+            self.assertIn("owner-only", self.deny_reason(self.home / rel), rel)
+
+    def test_gate_code_and_scripts_denied(self):
+        for path in (HOOKS_DIR / "stop_gate.py", HOOKS_DIR / "gitstate.py",
+                     REPO_ROOT / "hooks.json", REPO_ROOT / "scripts" / "agy-audit.py"):
+            self.assertIn("owner-only", self.deny_reason(path), path)
+
+    def test_a_write_through_a_junction_is_the_same_file(self):
+        where = link(HOOKS_DIR, Path(self.tmp) / "hooks-link")
+        if not where:
+            self.skipTest("this platform will not create a junction or symlink here")
+        self.assertIn("owner-only", self.deny_reason(Path(where) / "stop_gate.py"))
+
+    def test_a_write_through_a_state_junction_is_the_same_directory(self):
+        where = link(self.home / "tmp", Path(self.tmp) / "tmp-link")
+        if not where:
+            self.skipTest("this platform will not create a junction or symlink here")
+        self.assertIn("owner-only", self.deny_reason(Path(where) / "verified" / "x.json"))
+
+    def test_an_msys_path_is_the_same_file(self):
+        if os.name != "nt":
+            self.skipTest("MSYS drive paths only reach the hooks on Windows")
+        self.assertIn("owner-only", self.deny_reason(msys(HOOKS_DIR / "stop_gate.py")))
+
+    def test_a_differently_cased_path_is_the_same_file(self):
+        if os.path.normcase("A") != "a":
+            self.skipTest("this filesystem is case sensitive, so the case is a different file")
+        shouted = str(HOOKS_DIR / "stop_gate.py").replace("hooks", "HOOKS")
+        self.assertIn("owner-only", self.deny_reason(shouted))
+
+    def test_a_relative_target_resolves_against_the_workspace(self):
+        self.assertIn("defines what checks", self.deny_reason(".agents/verify.sh"))
+
+    def test_the_conversations_own_artifact_directory_is_writable(self):
+        self.assertAllowed(self.artifacts / "diff.md",
+                           artifactDirectoryPath=str(self.artifacts))
+
+    def test_another_conversations_artifact_directory_is_not(self):
+        self.assertIn("owner-only",
+                      self.deny_reason(self.home / "brain" / "cid-2" / "artifacts" / "diff.md",
+                                       artifactDirectoryPath=str(self.artifacts)))
+
+    # ------------------------------------------------------------------ rule 2
+    def test_verifier_definition_denied(self):
+        for rel in (".agents/verify.cmd", ".agents/verify.ps1", ".agents/verify.sh",
+                    ".agents/visual.md", ".agents/rules/renpy.md"):
+            self.assertIn("by hand", self.deny_reason(self.ws / rel), rel)
+
+    def test_verifier_definition_denied_through_a_junction(self):
+        where = link(self.ws, Path(self.tmp) / "ws-link")
+        if not where:
+            self.skipTest("this platform will not create a junction or symlink here")
+        self.assertIn("by hand", self.deny_reason(Path(where) / ".agents" / "verify.sh"))
+
+    def test_verifier_definition_denied_in_msys_and_shouted_form(self):
+        if os.name != "nt":
+            self.skipTest("MSYS drive paths only reach the hooks on Windows")
+        self.assertIn("by hand", self.deny_reason(msys(self.ws / ".agents" / "verify.sh")))
+        self.assertIn("by hand", self.deny_reason(
+            str(self.ws / ".agents" / "verify.sh").replace(".agents", ".AGENTS")))
+
+    def test_other_files_under_dot_agents_are_writable(self):
+        self.assertAllowed(self.ws / ".agents" / "DECISIONS.md")
+
+    # ------------------------------------------------------------------ rule 3
+    def test_test_files_denied_for_the_main_agent(self):
+        for rel in ("tests/test_app.py", "src/app_test.py", "src/app.test.tsx",
+                    "src/app.spec.ts", "conftest.py", "game/tests/smoke.rpy",
+                    "game/testcases/smoke.rpy"):
+            self.assertIn("tester", self.deny_reason(self.ws / rel), rel)
+
+    def test_test_files_denied_for_another_subagent_type(self):
+        reason = self.deny_reason(self.ws / "tests" / "test_app.py", **self.subagent("coder"))
+        self.assertIn("`coder` subagent", reason)
+
+    def test_test_files_allowed_for_the_tester_subagent(self):
+        self.assertAllowed(self.ws / "tests" / "test_app.py", **self.subagent("tester"))
+
+    def test_test_files_denied_for_a_subagent_with_no_record(self):
+        reason = self.deny_reason(self.ws / "tests" / "test_app.py",
+                                  **self.subagent("tester", cid="ghost", record=False))
+        self.assertIn("main agent", reason)
+
+    def test_a_test_file_junction_and_case_are_the_same_file(self):
+        where = link(self.ws, Path(self.tmp) / "ws-tests-link")
+        if not where:
+            self.skipTest("this platform will not create a junction or symlink here")
+        self.assertIn("tester", self.deny_reason(Path(where) / "tests" / "test_app.py"))
+        if os.name == "nt":
+            self.assertIn("tester", self.deny_reason(msys(self.ws / "tests" / "test_app.py")))
+            self.assertIn("tester", self.deny_reason(
+                str(self.ws / "tests" / "test_app.py").replace("tests", "TESTS")))
+
+    def test_the_tester_still_cannot_write_the_gate(self):
+        self.assertIn("owner-only",
+                      self.deny_reason(HOOKS_DIR / "stop_gate.py", **self.subagent("tester")))
+
+    # --------------------------------------------------------------- fast path
+    def test_an_ordinary_source_write_is_allowed_and_fast(self):
+        start = time.monotonic()
+        self.assertAllowed(self.ws / "src" / "app.py")
+        self.assertLess(time.monotonic() - start, 3.0, "the gate must not slow a plain write")
+
+    def test_the_owners_escape_hatch_allows_a_protected_write(self):
+        payload = {"toolCall": {"name": "write_to_file",
+                                "args": {"TargetFile": str(HOOKS_DIR / "stop_gate.py")}}}
+        proc = subprocess.run([sys.executable, str(HOOKS_DIR / "write_gate.py")],
+                              input=json.dumps(payload), text=True, capture_output=True,
+                              env=dict(self.env(), AGY_WRITE_GATE_OFF="1"))
+        self.assertEqual(json.loads(proc.stdout).get("decision"), "allow", proc.stdout)
+
+    # ------------------------------------------------------------------ rule 4
+    def tripwire(self, line):
+        res, _err = self.decide("run_command", {"CommandLine": line, "Cwd": str(self.ws)})
+        return res
+
+    def test_shell_tripwire_denies_a_write_at_a_protected_location(self):
+        for line in ("echo x > ~/.gemini/tmp/verified/x.json",
+                     "cp app.py C:\\Users\\Daniel\\gemini-config\\hooks\\x.py",
+                     "python -c \"open('stop_gate.py','w')\"",
+                     "sed -i s/x/y/ hooks/gitstate.py",
+                     "rm -rf brain/cid-1/.system_generated/subagents"):
+            res = self.tripwire(line)
+            self.assertEqual(res.get("decision"), "deny", line)
+            self.assertIn("protected location", res.get("reason", ""))
+
+    def test_shell_tripwire_lets_a_read_of_the_same_words_through(self):
+        # the near miss: reading notes about the gate is how a run learns what it owes
+        for line in ("cat docs/stop_gate_notes.md",
+                     "grep -n guard hooks/gitstate.py",
+                     "git -C C:/Users/Daniel/gemini-config/hooks status",
+                     "cd C:/Users/Daniel/gemini-config && git diff",
+                     "ls ~/.gemini/config/hooks"):
+            self.assertEqual(self.tripwire(line).get("decision"), "allow", line)
+
+    def test_a_read_command_that_redirects_is_not_a_read(self):
+        self.assertEqual(
+            self.tripwire("cat app.py > ~/.gemini/tmp/verified/x.json").get("decision"), "deny")
+
+    def test_an_ordinary_command_is_not_judged(self):
+        self.assertEqual(self.tripwire("git status").get("decision"), "allow")
+
+    # ------------------------------------------------------------- broken hook
+    def test_a_malformed_payload_allows_and_logs(self):
+        proc = subprocess.run([sys.executable, str(HOOKS_DIR / "write_gate.py")],
+                              input="{not json", text=True, capture_output=True, env=self.env())
+        self.assertEqual(json.loads(proc.stdout).get("decision"), "allow")
+        self.assertIn("unreadable payload", proc.stderr)
+
+    def test_a_payload_the_gate_chokes_on_allows_and_logs(self):
+        res, err = self.decide("write_to_file", "TargetFile=/proj/app.py")
+        self.assertEqual(res.get("decision"), "allow", err)
+        self.assertTrue(err.strip(), "a gate that crashed has to say so")
+
+
+class TestGuardedFiles(GateCase):
+    """Rule 5: the stop gate reports a protected file that moved under it."""
+
+    MOVED = "changed since this conversation started"
+
+    def test_a_moved_verifier_blocks_the_stop_and_names_the_file(self):
+        label = self.verifier()
+        self.turn()
+        self.write(label, "exit 0\n")
+        reason = self.gap()
+        self.assertIn(os.path.basename(label), reason)
+        self.assertIn(self.MOVED, reason)
+        self.assertTrue(self.markers(), "the next conversation has to hear about it")
+
+    def test_an_untouched_verifier_is_not_a_guard_gap(self):
+        self.verifier()
+        self.turn()
+        self.write("app.py", "x = 2\n")
+        self.assertNotIn(self.MOVED, self.gap())

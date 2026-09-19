@@ -30,9 +30,7 @@ GENERATED_DIR = ".system_generated"
 SUBAGENT_RECORDS = os.path.join("*", GENERATED_DIR, "subagents")
 
 
-def norm(path):
-    """Case-folded, forward-slash form for comparing two paths on either platform."""
-    return os.path.normcase(path).replace("\\", "/")
+norm = hookpaths.norm
 
 
 def under(path, root):

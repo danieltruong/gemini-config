@@ -31,7 +31,7 @@ def force_target(cmd):
     return refs[-1].split(":")[-1] if len(refs) > 1 else None
 
 
-def check(tool, args):
+def check(tool, args, _event):
     if tool != "run_command":
         return None
     cmd = args.get("CommandLine", "")

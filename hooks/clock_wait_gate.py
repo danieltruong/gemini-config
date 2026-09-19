@@ -16,7 +16,7 @@ REASON = ("Clock wait. Use command_status with WaitDurationSeconds or the wait t
           "inside a bounded `timeout <sec>` wrapper.")
 
 
-def check(tool, args):
+def check(tool, args, _event):
     if tool != "run_command":
         return None
     cmd = args.get("CommandLine", "")

@@ -56,7 +56,7 @@ def findings(text, mentions=True):
     return None
 
 
-def check(tool, args):
+def check(tool, args, _event):
     if tool == "run_command":
         cmd = args.get("CommandLine", "")
         return findings(message_text(cmd)) if MESSAGE_COMMANDS.search(cmd) else None

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Paths and helpers shared by the Antigravity hooks."""
+import glob
 import hashlib
 import json
 import os
@@ -7,10 +8,24 @@ import re
 import sys
 import time
 
-TMP = os.environ.get("GEMINI_HOOK_TMP") or os.path.expanduser("~/.gemini/tmp")
+GEMINI_HOME = os.environ.get("GEMINI_HOME") or os.path.expanduser("~/.gemini")
+TMP = os.environ.get("GEMINI_HOOK_TMP") or os.path.join(GEMINI_HOME, "tmp")
 CLI_SETTINGS = (os.environ.get("GEMINI_CLI_SETTINGS")
-                or os.path.expanduser("~/.gemini/antigravity-cli/settings.json"))
-DOCS_LINT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "scripts", "ai-docs-lint.py")
+                or os.path.join(GEMINI_HOME, "antigravity-cli", "settings.json"))
+# the repo the hooks really live in, so a write through the installed junction lands here too
+REPO = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+DOCS_LINT = os.path.join(REPO, "scripts", "ai-docs-lint.py")
+# only the owner edits these: the gate's own code and scripts, its state, and the CLI's config
+OWNER_ROOTS = (GEMINI_HOME, os.path.join(REPO, "hooks"), os.path.join(REPO, "hooks.json"),
+               os.path.join(REPO, "scripts"))
+# a workspace's verifier definition, held as suffixes so any workspace is covered
+OWNER_RELS = (".agents/verify.cmd", ".agents/verify.ps1", ".agents/verify.sh",
+              ".agents/visual.md")
+OWNER_REL_DIRS = (".agents/rules/",)
+# the owner's escape hatch for editing a protected file from inside a run
+GATE_OFF = "AGY_WRITE_GATE_OFF"
+# files the stop gate trusts, so one that moves between baseline and stop is worth reporting
+GUARD_GLOBS = ("hooks/*.py", "hooks.json")
 
 # work a run left unverified: one marker per workspace, read on the next invocation
 PENDING = os.path.join(TMP, "pending")
@@ -70,13 +85,15 @@ def tool_text(args):
 
 
 def pre_tool_gate(check):
-    """Run a PreToolUse check(tool, args) that returns a deny reason, or None to allow."""
+    """Run a PreToolUse check(tool, args, event) returning a deny reason, or None to allow."""
     try:
-        call = (json.load(sys.stdin) or {}).get("toolCall") or {}
-    except Exception:
-        call = {}
+        event = json.load(sys.stdin) or {}
+    except Exception as exc:
+        event = {}
+        print(f"{os.path.basename(sys.argv[0])}: unreadable payload {exc!r}", file=sys.stderr)
+    call = event.get("toolCall") or {} if isinstance(event, dict) else {}
     try:
-        reason = check(call.get("name") or "", call.get("args") or {})
+        reason = check(call.get("name") or "", call.get("args") or {}, event)
     except Exception as exc:
         # a broken gate must not stop the agent working, so it logs and allows
         reason = None
@@ -95,6 +112,46 @@ def real_path(path):
         if m:
             return f"{m.group(1).upper()}:{m.group(2) or '/'}"
     return path
+
+
+def norm(path):
+    """Case-folded, forward-slash form for comparing two paths on either platform."""
+    return os.path.normcase(path).replace("\\", "/")
+
+
+def resolved(path, workspace=""):
+    """An edit target as one absolute path: ~, MSYS drive, workspace-relative, junction, case."""
+    full = real_path(path)
+    if not full:
+        return ""
+    if not os.path.isabs(full) and workspace:
+        full = os.path.join(real_path(workspace), full)
+    try:
+        return norm(os.path.realpath(os.path.abspath(full)))
+    except (OSError, ValueError):
+        return norm(os.path.abspath(full))
+
+
+def inside(target, root):
+    """Is an already resolved path inside this root? The root is resolved the same way."""
+    if not target or not root:
+        return False
+    parent = resolved(root)
+    if not parent:
+        return False
+    return target == parent or target.rstrip("/").startswith(parent.rstrip("/") + "/")
+
+
+def guard_paths(workspace=""):
+    """The files the stop gate trusts: its own code, plus this workspace's verifier definition."""
+    out = []
+    for pattern in GUARD_GLOBS:
+        out.extend(sorted(glob.glob(os.path.join(REPO, pattern))))
+    for rel in OWNER_RELS:
+        full = os.path.join(workspace, rel.replace("/", os.sep)) if workspace else ""
+        if full and os.path.isfile(full):
+            out.append(full)
+    return out
 
 
 def read_json_file(path):

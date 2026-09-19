@@ -89,6 +89,12 @@ REVIEW_KINDS = {
     "visual-qa": ("no-visual", f"the URLs in {VISUAL_REL}, then on what fails ## Accept"),
 }
 
+GUARD_REASON = (
+    "Blocked: {paths} changed since this conversation started, and the gate reads that file to "
+    "judge this run, so nothing it says about this tree can be trusted. Restore the file from "
+    "git, then finish. Daniel changes it by hand, outside agy."
+)
+
 DOCS_REASON = ("ai-docs-lint failed in files you changed:\n{lines}\n"
                "Fix them, then finish.")
 
@@ -272,6 +278,20 @@ def docs_only(names):
     """Did this change touch nothing but instruction docs? ai-docs-lint covers those."""
     work = work_names(names)
     return bool(work) and all(hookpaths.is_instruction_doc(rel) for rel in work)
+
+
+def guard_gap(cid, ws):
+    """A file the gate trusts that moved during this conversation, named so the run can undo it.
+
+    The marker is written here rather than on release: a conversation that is forced to continue
+    must not be the only one that ever hears about this.
+    """
+    moved = gitstate.guard_moved(cid, ws)
+    if not moved:
+        return None
+    message = GUARD_REASON.format(paths=", ".join(moved[:MAX_REPORTED]))
+    hookpaths.write_pending(ws, [message])
+    return "guard", message
 
 
 def docs_findings(ws, names, deadline):
@@ -636,6 +656,15 @@ def decide(ev, deadline):
 
     reason = ev.get("terminationReason")
     finished = reason in MODEL_FINISHED
+
+    if finished:
+        # checked before anything else this stop would judge, and for every conversation: the
+        # files that answer "did this pass" are worth nothing once the run has rewritten them
+        gap, culprit = first_gap(spaces, lambda ws: guard_gap(cid, ws))
+        if gap:
+            return answer(gap, culprit, cid, prints[culprit], spaces, deadline,
+                          f"{role or 'top-level'} {culprit}",
+                          tag=tpath or gitstate.digest(prints[culprit]))
 
     if role in transcript.JUDGE_TYPES:
         # a judge owes no verifier run and no review: it records what it saw, but it still

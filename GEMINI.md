@@ -69,6 +69,7 @@
 
 - Stop gate watches the git tree, not typed commands: work means the tree moved since the conversation started. It runs the workspace verifier itself, but run it yourself first anyway — a red verifier still forces a continue, and each conversation gets at most 3 before it releases with a marker. Editing only instruction docs owes neither verifier nor review.
 - Review counts only when a `reviewer` subagent (UI work: also `visual-qa`) finishes clean on the current tree and changed no tracked file. Any edit after that makes it stale, so review last, once the verifier is green. A reviewer must not edit or create files in the workspace.
+- Verifier, `.agents/rules/`, hooks and everything under `~/.gemini/` are Daniel's: hook deny the write, report what need changing instead. Test file edit go through `tester` subagent.
 - Put scratch file (diff dump, note, log) in the conversation's artifact directory or a git-ignored path, never the repo root: an untracked file in the workspace counts as both a change and a leftover.
 - An untrusted workspace or a folder with no git is reported as not checked, not blocked.
 - One conversation per plan. After plan work verify and review clean, or after first compaction notice, write short handoff and tell Daniel to open new conversation.

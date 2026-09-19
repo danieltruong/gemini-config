@@ -137,11 +137,12 @@ DB_STATUS_ERROR = 7
 STOP_GATE_KINDS = ("stop", "skip", "release", "pending", "review", "verifier", "docs",
                    "leftovers", "no-review", "no-visual", "untrusted", "no-workspace",
                    "no-transcript", "no-verifier", "no-reviewer", "trust", "unresolved",
-                   "lock", "audit")
+                   "lock", "audit", "guard")
 # a gate decision that returned before any check ran, whatever kind it logged
 UNCHECKED_KINDS = {"skip", "pending", "unresolved", "no-workspace", "no-transcript"}
-# lines the gate logs beside a decision: a judge's record, a dropped path, a trust or lock note
-BOOKKEEPING_KINDS = {"review", "unresolved", "trust", "lock"}
+# lines the gate logs beside a decision: a judge's record, a dropped path, a trust or lock
+# note, and a guard line, which reports a protected file that moved rather than judging the work
+BOOKKEEPING_KINDS = {"review", "unresolved", "trust", "lock", "guard"}
 # detail of a legacy line usually opens with one of these, so the word before it is the kind
 LEGACY_DETAIL = re.compile(r"(\S+)\s+((?:execution|reason)=.*)$")
 PRINTABLE_RUN = re.compile(rb"[\x20-\x7e]{10,}")
@@ -1200,11 +1201,14 @@ def self_check():
         handle.write("2026-09-18T00:33:41\tstop\tF:/p\tverified\n"
                      "2026-09-18T00:33:42\treview\tF:/p\treviewer recorded 1/1\n"
                      "2026-09-18T00:33:43\tunresolved\t/no/such\tpath dropped\n"
-                     "2026-09-18T00:33:44\ttrust\tF:/p\tuntrusted workspace\n")
+                     "2026-09-18T00:33:44\ttrust\tF:/p\tuntrusted workspace\n"
+                     "2026-09-18T00:33:45\tguard\tF:/p\t.agents/verify.sh moved\n")
     counts, stops, unchecked = stop_gate_log(base - dt.timedelta(days=1), handle.name)
     os.unlink(handle.name)
     assert (stops, unchecked) == (1, 0) and counts["review reviewer"] == 1
     assert counts["unresolved path"] == 1 and counts["trust untrusted"] == 1
+    # a protected file that moved is counted, and is not a verdict about the work either
+    assert counts["guard .agents/verify.sh"] == 1
 
     assert snapshot_delta({"stops": 10, "date": "2026-09-11"},
                           {"stops": 4, "date": "2026-09-18"}) == ["stops: 10 -> 4 (-6)"]

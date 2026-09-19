@@ -204,6 +204,25 @@ def save_verified(ws, fp, made):
                                "artifacts": sorted(made)})
 
 
+def guard_hashes(ws):
+    """Content hash per file the gate trusts: its own code, and this workspace's verifier."""
+    return {hookpaths.norm(path): file_hash(path) for path in hookpaths.guard_paths(ws)}
+
+
+def guard_moved(cid, ws):
+    """Protected files that differ from this conversation's baseline, added ones included.
+
+    Detection, not prevention: a shell command can still write these, and this state file
+    with them. It names what moved so the next run does not trust the gate's own verdict.
+    """
+    before = (seen(cid, ws) or {}).get("guard")
+    if not isinstance(before, dict) or not before:
+        return []
+    now = guard_hashes(ws)
+    return sorted([rel for rel, digest in before.items() if now.get(rel) != digest]
+                  + [rel for rel in now if rel not in before])
+
+
 def note_seen(cid, ws, fp, fallback=False):
     """Record what this workspace looked like when the conversation first reached a hook.
 
@@ -220,7 +239,8 @@ def note_seen(cid, ws, fp, fallback=False):
     if old and not (old.get("fallback") and not fallback):
         return
     hookpaths.write_json_file(path, {"at": time.time(), "workspace": ws, "fallback": fallback,
-                                     "tracked": fp.tracked, "untracked": fp.untracked})
+                                     "tracked": fp.tracked, "untracked": fp.untracked,
+                                     "guard": guard_hashes(ws)})
 
 
 def seen(cid, ws):
