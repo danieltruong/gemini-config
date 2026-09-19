@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
-"""Stop hook: blocks finishing until the transcript proves the changed code was verified."""
-import collections
+"""Stop hook: blocks finishing until the gate itself has seen the changed workspace pass.
+
+Nothing here reads the transcript for evidence. A workspace changed when its git
+fingerprint moved; it is verified when this hook ran its verifier and got exit 0 on that
+fingerprint; it is reviewed when a reviewer subagent's own Stop recorded that fingerprint.
+"""
 import glob
 import json
 import os
@@ -10,18 +14,20 @@ import subprocess
 import sys
 import time
 
+import gitstate
 import hookpaths
 import transcript
 
 LOG = os.path.join(hookpaths.TMP, "stop_gate.log")
 LINT_TIMEOUT = 120
-# one budget for the whole gate: every lint, verifier and docs run across every workspace
-GATE_BUDGET = 800
+DOCS_TIMEOUT = 30
+# hooks.json allows the Stop hook 900s. The verifier gets the bulk of this budget; the docs
+# lint, every git call and the renpy lint are capped on their own, so the gate always
+# answers before agy kills it and loses the decision.
+GATE_BUDGET = 700
 MIN_STEP = 5
-# forced continues per conversation, counted separately for each kind of gap
+# forced continues per conversation, counted per gap kind and per fingerprint
 MAX_RETRIES = 1
-EVIDENCE_RETRY = "evidence"
-CHECK_RETRY = "checks"
 MAX_REPORTED = 40
 VISUAL_REL = ".agents/visual.md"
 # agy 1.2.6 sends "NO_TOOL_CALL" here; "model_stop" is only in the docs. Every other
@@ -40,36 +46,38 @@ MARKER_VERIFIERS = (
 )
 # lint report lines start with a project-relative path: "game/foo/bar.rpy:12 message"
 LINT_LINE = re.compile(r"^(\S+\.rpym?):(\d+)\s")
-IS_WINDOWS = os.name == "nt"
 # on Windows renpy.sh is a Linux binary and always fails, so only renpy.exe counts there
-SDK_EXE = "renpy.exe" if IS_WINDOWS else "renpy.sh"
+SDK_EXE = "renpy.exe" if hookpaths.IS_WINDOWS else "renpy.sh"
+PYCACHE = "__pycache__"
 
 VERIFIER_REASON = (
-    "Blocked: no passing verifier run after your last change (step {step}). "
-    "Run {cmds}, fix what it reports, then finish."
+    "Verifier failed ({label}) in {ws}:\n{lines}\nFix what it reports, then finish."
 )
 
-REVIEWER_REASON = (
-    "Blocked: {why}. invoke_subagent with TypeName reviewer and a real Prompt on "
-    "`git diff HEAD` in {ws}, fix its findings, then finish."
+UNTRUSTED_REASON = (
+    "Blocked once: {ws} changed but is not in trustedWorkspaces in {settings}, so the gate "
+    "will not run anything there. Run {cmds} yourself and fix what it reports, or add the "
+    "workspace to that list so the gate can check it."
 )
 
-VISUAL_QA_REASON = (
-    "Blocked: no visual-qa subagent after your last change (step {step}). "
-    "invoke_subagent with TypeName visual-qa and a real Prompt on the URLs in {rel} "
-    "in {ws}, fix what fails ## Accept, then finish."
+REVIEW_REASON = (
+    "Blocked: {why} in {ws}. invoke_subagent with TypeName {kind} and a real Prompt on "
+    "`git diff HEAD`, fix its findings, then finish."
 )
 
-NO_TRANSCRIPT_REASON = (
-    "Blocked: the gate could not read this conversation's transcript ({path}), so nothing "
-    "proves the work was checked. Run the verifier and a reviewer, then finish."
+VISUAL_REASON = (
+    "Blocked: {why} in {ws}. invoke_subagent with TypeName visual-qa and a real Prompt on "
+    "the URLs in {rel}, fix what fails ## Accept, then finish."
 )
+
+DOCS_REASON = ("ai-docs-lint failed in files you changed:\n{lines}\n"
+               "Fix them, then finish.")
+
+LEFTOVERS_REASON = "delete leftovers: {paths}\nRemove them, then finish."
+
+UNFINISHED_NOTE = "changed but not verified: this run ended as {reason}"
 
 HUMAN_NOTE = "Stop allowed after one forced retry, still unmet: {summary}"
-
-# what the transcript says this conversation changed: the step span, the files each
-# workspace saw, and the steps whose changes cannot be tied to a file
-Changes = collections.namedtuple("Changes", "first last files opaque spaces unknown")
 
 
 def remaining(deadline):
@@ -99,53 +107,6 @@ def find_sdk(project):
         d = parent
 
 
-def git(project, *args):
-    """stdout, or None when git fails: no commits yet, not a repo, git missing."""
-    try:
-        proc = subprocess.run(["git", *args], cwd=project, capture_output=True, timeout=30)
-    except Exception:
-        return None
-    return proc.stdout.decode("utf-8", "replace") if proc.returncode == 0 else None
-
-
-def changed_files(project):
-    """Project-relative paths git reports as modified or untracked, or None when not a git repo."""
-    try:
-        top = git(project, "rev-parse", "--show-toplevel")
-        if not top or not top.strip():
-            return None
-        top = top.strip()
-        rel = os.path.relpath(os.path.abspath(project), os.path.abspath(top)).replace("\\", "/")
-        prefix = "" if rel == "." else rel + "/"
-        names = (git(project, "diff", "--name-only", "HEAD") or "").splitlines()
-        names += (git(project, "ls-files", "--others", "--exclude-standard") or "").splitlines()
-        out = set()
-        for n in names:
-            n = n.strip().replace("\\", "/")
-            if n and n.startswith(prefix):
-                out.add(n[len(prefix):])
-        return out
-    except Exception:
-        return None
-
-
-def session_files(ch, ws):
-    """What this session changed under ws. None means unknown, so nothing gets filtered out."""
-    files = set(ch.files.get(ws) or ())
-    if not files and (ch.unknown or ch.opaque):
-        # delegated work and shell writes name no files, so git is the only witness
-        return changed_files(ws)
-    return files
-
-
-def read_json(path):
-    try:
-        with open(path, encoding="utf-8") as fh:
-            return json.load(fh)
-    except Exception:
-        return None
-
-
 def script_argv(path):
     """Argv for a verify script, or None when the interpreter it needs is missing."""
     if path.endswith(".cmd"):
@@ -159,7 +120,7 @@ def script_argv(path):
 
 def trusted(ws):
     """agy only runs commands in workspaces the user trusted; the gate honours that list."""
-    roots = (read_json(hookpaths.CLI_SETTINGS) or {}).get("trustedWorkspaces") or []
+    roots = (hookpaths.read_json_file(hookpaths.CLI_SETTINGS) or {}).get("trustedWorkspaces") or []
     norm = transcript.norm
     target = norm(os.path.abspath(ws)).rstrip("/")
     return any(target == norm(r).rstrip("/") or target.startswith(norm(r).rstrip("/") + "/")
@@ -188,11 +149,12 @@ def renpy_lint(ws, files, deadline):
     left = remaining(deadline)
     if left < MIN_STEP:
         return RENPY_LABEL, 1, [f"verifier budget exhausted: {GATE_BUDGET}s spent before lint ran"]
-    # ponytail: re-lints the whole project on every Stop (~4 s); cache on .rpy mtimes if that drags
+    # ponytail: re-lints the whole project on every changed fingerprint (~4 s); cache per
+    # fingerprint with the verified record if that drags
     try:
         proc = subprocess.run(
             [os.path.join(sdk, SDK_EXE), ws, "lint", "--error-code"],
-            cwd=sdk, capture_output=True, timeout=min(LINT_TIMEOUT, max(1, deadline - time.monotonic())),
+            cwd=sdk, capture_output=True, timeout=min(LINT_TIMEOUT, max(1, left)),
         )
     except Exception as exc:
         return RENPY_LABEL, 1, [f"could not run renpy lint: {exc}"]
@@ -227,9 +189,6 @@ def verifier_steps(ws):
     for name in VERIFY_SCRIPTS:
         if not os.path.isfile(os.path.join(ws, ".agents", name)):
             continue
-        if not trusted(ws):
-            log(ws, "trust", "untrusted workspace, verifier skipped")
-            break
         argv = script_argv(os.path.join(".agents", name))
         if argv:
             return [(f".agents/{name}", argv)]
@@ -238,7 +197,7 @@ def verifier_steps(ws):
     if os.path.isdir(os.path.join(ws, "game")) and find_sdk(ws):
         return [(RENPY_LABEL, None)]
 
-    scripts = (read_json(os.path.join(ws, "package.json")) or {}).get("scripts") or {}
+    scripts = (hookpaths.read_json_file(os.path.join(ws, "package.json")) or {}).get("scripts") or {}
     npm = shutil.which("npm") or "npm"
     steps = []
     if "lint" in scripts:
@@ -262,15 +221,25 @@ def verify(ws, files, steps, deadline):
 
 
 def verifier_hint(steps):
-    """The command the agent is expected to have run, or '' when the repo has no verifier."""
+    """The command the agent is expected to run, or '' when the repo has no verifier."""
     return " then ".join(f"`{label}`" for label, _argv in steps)
 
 
-def docs_findings(ws, files, deadline):
-    """ai-docs-lint output for instruction docs this session wrote."""
-    if not files:
-        return []
-    paths = [os.path.join(ws, rel) for rel in sorted(files) if hookpaths.is_instruction_doc(rel)]
+def work_names(names):
+    """Changed paths the gate judges: the answer file it asked for is not work."""
+    return set(names or ()) - transcript.SCRATCH_FILES
+
+
+def docs_only(names):
+    """Did this change touch nothing but instruction docs? ai-docs-lint covers those."""
+    work = work_names(names)
+    return bool(work) and all(hookpaths.is_instruction_doc(rel) for rel in work)
+
+
+def docs_findings(ws, names, deadline):
+    """ai-docs-lint output for instruction docs this change touched."""
+    paths = [os.path.join(ws, rel) for rel in sorted(work_names(names))
+             if hookpaths.is_instruction_doc(rel)]
     paths = [p for p in paths if os.path.isfile(p)]
     if not paths:
         return []
@@ -280,221 +249,194 @@ def docs_findings(ws, files, deadline):
     try:
         proc = subprocess.run(
             [sys.executable, hookpaths.DOCS_LINT, *paths],
-            capture_output=True, text=True, timeout=min(30, left),
+            capture_output=True, text=True, timeout=min(DOCS_TIMEOUT, left),
         )
     except Exception as exc:
         return [f"could not run ai-docs-lint: {exc}"]
     return proc.stdout.splitlines() if proc.returncode else []
 
 
-def leftovers(ws, files):
-    """Backup files, unignored __pycache__ and empty dirs in the directories the session wrote."""
-    rels = {os.path.dirname(f) for f in files} if files else {""}
-    found = []
-    for rel in sorted(rels):
-        folder = os.path.join(ws, rel)
-        try:
-            entries = sorted(os.listdir(folder))
-        except OSError:
-            continue
-        for name in entries:
-            path = os.path.join(folder, name)
-            shown = f"{rel}/{name}" if rel else name
-            if os.path.isdir(path):
-                if name == "__pycache__" and git(ws, "check-ignore", path) is None:
-                    found.append(shown)
-                elif not os.listdir(path):
-                    found.append(shown + "/")
-            elif hookpaths.BACKUP_SUFFIX.search(name):
-                found.append(shown)
-    return found
+def is_junk(rel):
+    """A path the gate refuses to leave behind: a backup file or a committed cache."""
+    parts = rel.split("/")
+    return PYCACHE in parts or bool(hookpaths.BACKUP_SUFFIX.search(parts[-1]))
 
 
-def survey(ch, verifiers, deadline):
-    """(verifier failures, doc findings, leftovers) from the checks that run commands."""
-    failures, docs, junk = [], [], []
-    for ws in ch.spaces:
-        files = session_files(ch, ws)
-        if files is not None and not files:
-            continue
-        found = verify(ws, files, verifiers[ws], deadline)
-        if found and found[1] != 0:
-            failures.append((found[0], found[2]))
-        docs += docs_findings(ws, files, deadline)
-        junk += leftovers(ws, files)
-    return failures, docs, junk
+def touched(ws, cid, fp, edited, names):
+    """Is there work in this workspace the gate has to account for?
+
+    Not the same question as "is it verified": a subagent's passing verifier run does not
+    excuse the review the parent still owes for the same tree.
+    """
+    if fp is None:
+        # not a git repository, so an edit tool naming a file here is the only signal left;
+        # None means the transcript could not be read, which is not proof of nothing
+        return edited is None or bool(edited)
+    if names and not work_names(names):
+        return False
+    # a tree that matches its own HEAD, with nothing untracked and nothing moved, owes nothing
+    return gitstate.moved(cid, ws, fp) or not gitstate.clean(ws)
 
 
-def workspaces(raw_paths):
-    """(usable Windows-form paths, paths dropped because they do not resolve)."""
+def verifier_gap(ws, fp, names, deadline):
+    if fp is not None and gitstate.verified_digest(ws) == gitstate.digest(fp):
+        return None  # this exact tree already passed, so running it again proves nothing
+    steps = verifier_steps(ws)
+    if not steps:
+        return None
+    if not trusted(ws):
+        log(ws, "trust", "untrusted workspace, verifier not run")
+        return "untrusted", UNTRUSTED_REASON.format(ws=ws, cmds=verifier_hint(steps),
+                                                    settings=hookpaths.CLI_SETTINGS)
+    found = verify(ws, names, steps, deadline)
+    if found and found[1] != 0:
+        return "verifier", VERIFIER_REASON.format(
+            label=found[0], ws=ws, lines="\n".join(found[2][-MAX_REPORTED:]))
+    if fp is not None:
+        # after the run, so output the verifier itself leaves does not look like a new change
+        gitstate.save_verified(ws, gitstate.fingerprint(ws))
+    return None
+
+
+def review_why(ws, fp, kind):
+    """Why this kind of review does not cover the tree in front of us, or ''."""
+    rec = gitstate.review(ws, kind)
+    if fp is None:
+        return "" if rec else f"no {kind} has seen this workspace"
+    if not rec:
+        return f"no {kind} has seen the current state"
+    if rec.get("tracked") != fp[0]:
+        return f"tracked files changed after the {kind} run, so it did not see this tree"
+    fresh = sorted(set(fp[1]) - set(rec.get("untracked") or []))
+    return f"{fresh[0]} is new since the {kind} run" if fresh else ""
+
+
+def review_gap(ws, fp):
+    why = review_why(ws, fp, "reviewer")
+    if why:
+        return "no-review", REVIEW_REASON.format(why=why, ws=ws, kind="reviewer")
+    if os.path.isfile(os.path.join(ws, VISUAL_REL)):
+        why = review_why(ws, fp, "visual-qa")
+        if why:
+            return "no-visual", VISUAL_REASON.format(why=why, ws=ws, rel=VISUAL_REL)
+    return None
+
+
+def workspace_gap(ws, cid, fp, names, role, deadline):
+    """The first piece of missing proof for one changed workspace, or None."""
+    only_docs = docs_only(names)
+    if not only_docs:
+        found = verifier_gap(ws, fp, names, deadline)
+        if found:
+            return found
+    docs = docs_findings(ws, names, deadline)
+    if docs:
+        return "docs", DOCS_REASON.format(lines="\n".join(docs[:MAX_REPORTED]))
+    junk = [rel for rel in gitstate.new_untracked(cid, ws, fp) if is_junk(rel)]
+    if junk:
+        return "leftovers", LEFTOVERS_REASON.format(paths=", ".join(sorted(junk)[:MAX_REPORTED]))
+    # a subagent answers to the run that spawned it, and a docs change is its own check
+    if role or only_docs:
+        return None
+    return review_gap(ws, fp)
+
+
+def derived_spaces(calls, outside):
+    """Repository roots holding the files an edit tool named, for stops that carry no workspace."""
+    out = []
+    for path in transcript.written_paths(calls, outside):
+        top = gitstate.toplevel(os.path.dirname(path))
+        top = os.path.abspath(top) if top else ""
+        if top and os.path.isdir(top) and top not in out:
+            out.append(top)
+    return out
+
+
+def workspaces(ev, calls, outside):
+    """(workspaces to judge, payload paths dropped because they do not resolve)."""
     good, dropped = [], []
-    for raw in raw_paths:
-        ws = hookpaths.real_path(raw)
+    for raw in ev.get("workspacePaths") or []:
+        ws = os.path.abspath(hookpaths.real_path(raw))
         if os.path.isdir(ws):
             good.append(ws)
         else:
             dropped.append(raw)
-    return good, dropped
+    return (good or derived_spaces(calls, outside)), dropped
 
 
-def ignore_check(spaces):
-    """Does git ignore this path? One `git check-ignore` per distinct path per stop."""
-    seen = {}
-
-    def ignored(path):
-        if path not in seen:
-            ws = next((w for w in spaces if transcript.under(path, w)), "")
-            seen[path] = bool(ws) and git(ws, "check-ignore", "-q", path) is not None
-        return seen[path]
-
-    return ignored
-
-
-def changes(spaces, calls, outside, unknown, artifact=""):
-    """Everything this conversation changed, whether or not an edit tool named the file."""
-    files = {ws: transcript.edits(calls, ws, outside) for ws in spaces}
-    opaque = transcript.opaque_changes(calls, spaces, artifact, ignore_check(spaces))
-    marks = [i for ws in spaces for pair in files[ws].values() for i in pair] + opaque
-    return Changes(min(marks, default=None), max(marks, default=None), files, opaque,
-                   spaces, unknown)
-
-
-def docs_only(ch):
-    """Did this conversation change nothing but instruction docs? ai-docs-lint covers those."""
-    if ch.opaque:
-        return False
-    return all(hookpaths.is_instruction_doc(rel) for ws in ch.spaces for rel in ch.files[ws])
-
-
-def stale_review(ch, reviews):
-    """Why the review no longer covers the tree, or '' when it does."""
-    if not reviews:
-        return f"no reviewer spawned after your first change (step {ch.first})"
-    newest = max(reviews)
-    late = [i for i in ch.opaque if i > newest]
-    if late:
-        return (f"a delegated or shell change at step {max(late)} came after the review at step "
-                f"{newest}, so what was reviewed is not what is in the tree")
-    fresh = sorted(rel for ws in ch.spaces for rel, (first, _last) in ch.files[ws].items()
-                   if first > newest)
-    if fresh:
-        return f"{fresh[0]} was first changed after the review at step {newest}"
-    return ""
-
-
-def verifier_gap(ch, calls, verifiers):
-    """The verifier evidence still missing: (log kind, message), or None."""
-    if any(index > ch.last and ok
-           for ws in ch.spaces
-           for index, ok in transcript.verifier_runs(
-               calls, [label for label, _argv in verifiers[ws]], ws)):
-        return None
-    cmds = [f"{verifier_hint(verifiers[ws])} in {ws}" for ws in ch.spaces if verifiers[ws]]
-    if not cmds:
-        return None
-    return "no-verifier", VERIFIER_REASON.format(step=ch.last, cmds="; ".join(cmds))
-
-
-def review_gap(ch, calls):
-    """The review a top-level run still owes: (log kind, message), or None."""
-    ws = ch.spaces[0] if ch.spaces else "."
-    # a review must cover every change, so it counts from the first one, and later work
-    # may only touch files that review already saw
-    why = stale_review(ch, [i for i in transcript.spawns(calls, "reviewer") if i > ch.first])
-    if why:
-        return "no-reviewer", REVIEWER_REASON.format(why=why, ws=ws)
-    specs = [w for w in ch.spaces if os.path.isfile(os.path.join(w, VISUAL_REL))]
-    if specs and not any(i > ch.last for i in transcript.spawns(calls, "visual-qa")):
-        return "no-visual", VISUAL_QA_REASON.format(step=ch.last, rel=VISUAL_REL, ws=specs[0])
-    return None
-
-
-def gap_of(ch, calls, verifiers, subagent):
-    """The first piece of missing evidence, or None when the transcript proves the work."""
-    if ch.last is None or docs_only(ch):
-        return None
-    # a subagent answers to the run that spawned it, so only a top-level run owes a review
-    return verifier_gap(ch, calls, verifiers) or (None if subagent else review_gap(ch, calls))
-
-
-def changed_spaces(ch):
-    """Workspaces this conversation actually changed."""
-    return [ws for ws in ch.spaces if ch.files[ws] or ch.opaque or ch.unknown]
-
-
-def mark_pending(ch, note):
-    for ws in changed_spaces(ch):
-        hookpaths.write_pending(ws, [note])
+def clear_verified(spaces):
+    """Drop a pending marker only where the tree in front of us is one the gate proved."""
+    for ws in spaces:
+        record = gitstate.verified_digest(ws)
+        if record and record == gitstate.digest(gitstate.fingerprint(ws)):
+            hookpaths.clear_pending(ws)
 
 
 def decide(ev, deadline):
     """(result, log kind, log detail, workspaces)."""
-    spaces, dropped = workspaces(ev.get("workspacePaths") or [])
-    if dropped:
-        log(",".join(dropped), "unresolved", "workspace path dropped")
     tpath = hookpaths.real_path(ev.get("transcriptPath") or "")
     artifact = hookpaths.real_path(ev.get("artifactDirectoryPath") or "")
     brain = transcript.brain_root(tpath)
-    cid = ev.get("conversationId") or ""
+    cid = ev.get("conversationId") or transcript.conversation_of(tpath)
     steps = transcript.load(tpath)
-    subagent = transcript.is_subagent(cid, brain)
-    verifiers = {ws: verifier_steps(ws) for ws in spaces}
     calls = transcript.calls(steps)
-    ch = changes(spaces, calls, (artifact, brain), steps is None, artifact)
+    outside = (artifact, brain)
+    spaces, dropped = workspaces(ev, calls, outside)
+    if dropped:
+        log(",".join(dropped), "unresolved", "workspace path dropped")
+    prints = {ws: gitstate.fingerprint(ws) for ws in spaces}
+    role = transcript.subagent_type(cid, brain)
+    # reinforce.py records this at PreInvocation; a first Stop is the fallback
+    for ws in spaces:
+        gitstate.note_seen(cid, ws, prints[ws])
+
+    if role in transcript.JUDGE_TYPES:
+        # a judging subagent owes nothing: it records what it saw and gets out of the way
+        kept = [ws for ws in spaces if gitstate.save_review(cid, ws, role, prints[ws])]
+        return ({"decision": "stop"}, "review",
+                f"{role} recorded {len(kept)}/{len(spaces)}", spaces)
+
+    if not spaces:
+        return {"decision": "stop"}, "no-workspace", "no workspace to judge", spaces
+
+    names = {ws: gitstate.changed_names(ws) for ws in spaces}
+    edited = {ws: (None if steps is None else transcript.edits(calls, ws, outside))
+              for ws in spaces}
+    dirty = [ws for ws in spaces if touched(ws, cid, prints[ws], edited[ws], names[ws])]
     finished = ev.get("terminationReason") in MODEL_FINISHED
 
-    if tpath and steps is None:
-        # a transcript the gate cannot read is missing evidence, not evidence of nothing to do
-        gap = ("no-transcript", NO_TRANSCRIPT_REASON.format(path=tpath))
-    else:
-        gap = gap_of(ch, calls, verifiers, subagent)
-
-    if gap:
-        kind, message = gap
-        detail = f"{'subagent' if subagent else 'top-level'} step {ch.last}"
-        if finished and hookpaths.take_retry(cid, EVIDENCE_RETRY, MAX_RETRIES):
-            return {"decision": "continue", "reason": message}, kind, detail, spaces
-        mark_pending(ch, message)
-        if not finished:
-            return ({"decision": "stop"}, "pending",
-                    f"{kind} reason={ev.get('terminationReason')!r}", spaces)
-        return ({"decision": "stop", "reason": HUMAN_NOTE.format(summary=message)},
-                "release", f"{kind} {detail}", spaces)
+    if not dirty:
+        clear_verified(spaces)
+        return {"decision": "stop"}, "stop", "unchanged", spaces
 
     if not finished:
-        return ({"decision": "stop"}, "skip",
-                f"reason={ev.get('terminationReason')!r} idle={ev.get('fullyIdle')!r}", spaces)
+        # the run did not choose to finish, so the gate leaves a marker rather than spend a
+        # verifier run on work the user just interrupted
+        reason = ev.get("terminationReason")
+        for ws in dirty:
+            hookpaths.write_pending(ws, [UNFINISHED_NOTE.format(reason=reason)])
+        return ({"decision": "stop"}, "pending",
+                f"reason={reason!r} changed={len(dirty)}", spaces)
 
-    # only the checks below run commands of their own, so they wait for the background tasks
-    if ev.get("fullyIdle") is False:
-        return {"decision": "stop"}, "stop", "background tasks still running", spaces
+    gap, culprit = None, dirty[0]
+    for ws in dirty:
+        gap = workspace_gap(ws, cid, prints[ws], names[ws], role, deadline)
+        if gap:
+            culprit = ws
+            break
 
-    failures, docs, junk = survey(ch, verifiers, deadline)
-    budget = f"{int(max(0, remaining(deadline)))}s of the {GATE_BUDGET}s gate budget left."
-    if failures:
-        message = "\n".join(
-            f"Verifier failed ({label}):\n" + "\n".join(lines[-MAX_REPORTED:])
-            + f"\nFix, re-run {label}, then finish."
-            for label, lines in failures
-        )
-        kind, detail = "verifier", ",".join(label for label, _ in failures)
-    elif docs:
-        message = ("ai-docs-lint failed in files you changed:\n"
-                   + "\n".join(docs[:MAX_REPORTED]) + "\nFix them, re-run lint, then finish.")
-        kind, detail = "docs", f"{len(docs)} findings"
-    elif junk:
-        message = ("delete leftovers: " + ", ".join(sorted(set(junk))[:MAX_REPORTED])
-                   + "\nRemove them, then finish.")
-        kind, detail = "leftovers", f"{len(junk)} paths"
-    else:
-        for ws in spaces:
-            hookpaths.clear_pending(ws)
+    if not gap:
+        clear_verified(dirty)
         return {"decision": "stop"}, "stop", "verified", spaces
 
-    if hookpaths.take_retry(cid, CHECK_RETRY, MAX_RETRIES):
+    kind, message = gap
+    detail = f"{role or 'top-level'} {culprit}"
+    budget = f"{int(max(0, remaining(deadline)))}s of the {GATE_BUDGET}s gate budget left."
+    allowance = f"{kind}:{gitstate.digest(prints[culprit]) or 'nogit'}"
+    if kind != "untrusted" and hookpaths.take_retry(cid, allowance, MAX_RETRIES):
         return {"decision": "continue", "reason": message + "\n" + budget}, kind, detail, spaces
-    mark_pending(ch, f"{kind}: {detail}")
-    return ({"decision": "stop", "reason": HUMAN_NOTE.format(summary=f"{kind}: {detail}")},
+    hookpaths.write_pending(culprit, [message])
+    return ({"decision": "stop", "reason": HUMAN_NOTE.format(summary=message)},
             "release", f"{kind} {detail}", spaces)
 
 

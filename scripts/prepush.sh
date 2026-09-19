@@ -10,4 +10,7 @@ python3 "$REPO_ROOT/scripts/ai-docs-lint.py" --all
 echo "=== 2. Hook Unit Tests ==="
 python3 -m unittest discover -s "$REPO_ROOT/hooks/tests"
 
+echo "=== 3. Audit Self-Check ==="
+python3 "$REPO_ROOT/scripts/agy-audit.py" --self-check
+
 echo "=== All pre-push checks passed ==="

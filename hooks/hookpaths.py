@@ -3,8 +3,6 @@
 import json
 import os
 import re
-import shutil
-import subprocess
 import sys
 import time
 
@@ -23,6 +21,9 @@ IS_WINDOWS = os.name == "nt"
 MSYS_DRIVE = re.compile(r"^/([a-zA-Z])(/.*)?$")
 
 INSTRUCTION_DOCS = {"GEMINI.md", "AGENTS.md", "SKILL.md"}
+# directories of instruction docs, counted at the repo root or under .agents/ only,
+# so src/agents/x.py is source code
+INSTRUCTION_DIRS = {"agents", "skills", "rules"}
 # leftovers the write gate refuses to create and the stop gate refuses to leave behind
 BACKUP_SUFFIX = re.compile(r"\.(?:bak|orig|old|tmp)$", re.I)
 BACKUP_NAME = re.compile(BACKUP_SUFFIX.pattern
@@ -30,9 +31,14 @@ BACKUP_NAME = re.compile(BACKUP_SUFFIX.pattern
 
 
 def is_instruction_doc(path):
-    """True for GEMINI.md, AGENTS.md, SKILL.md, or any file under a dir named agents."""
-    parts = path.replace("\\", "/").split("/")
-    return parts[-1] in INSTRUCTION_DOCS or "agents" in parts[:-1]
+    """True for a Markdown file the docs linter owns: a named doc, or one in an instruction dir."""
+    parts = [p for p in path.replace("\\", "/").split("/") if p and p != "."]
+    if not parts or not parts[-1].lower().endswith(".md"):
+        return False
+    if parts[-1] in INSTRUCTION_DOCS:
+        return True
+    head = parts[1:] if parts[0] == ".agents" else parts
+    return bool(head[:-1]) and head[0] in INSTRUCTION_DIRS
 
 
 PATH_KEYS = ("TargetFile", "AbsolutePath", "DirectoryPath", "SearchPath", "FilePath")
@@ -79,15 +85,6 @@ def real_path(path):
         return ""
     path = os.path.expanduser(path)
     if IS_WINDOWS and path.startswith("/"):
-        cygpath = shutil.which("cygpath")
-        if cygpath:
-            try:
-                proc = subprocess.run([cygpath, "-w", path], capture_output=True, text=True,
-                                      timeout=10)
-                if proc.returncode == 0 and proc.stdout.strip():
-                    return proc.stdout.strip().replace("\\", "/")
-            except Exception:
-                pass
         m = MSYS_DRIVE.match(path)
         if m:
             return f"{m.group(1).upper()}:{m.group(2) or '/'}"
@@ -103,18 +100,33 @@ def read_json_file(path):
 
 
 def write_json_file(path, data):
+    """Write through a temp file, so a hook killed mid-write leaves the old state readable."""
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w", encoding="utf-8") as fh:
+    temp = f"{path}.{os.getpid()}.tmp"
+    with open(temp, "w", encoding="utf-8") as fh:
         json.dump(data, fh)
+    os.replace(temp, path)
+
+
+def stale(data):
+    """True when a state file's timestamp is missing, unreadable, or more than a day old."""
+    try:
+        return time.time() - float(data.get("at") or 0) > MARKER_MAX_AGE
+    except (TypeError, ValueError):
+        return True
 
 
 def slug_of(value):
     return SLUG.sub("-", os.path.normcase(value)).strip("-")[-120:] or "none"
 
 
+def ws_key(workspace):
+    """One state-file name per workspace, the same in every hook and every state directory."""
+    return slug_of(os.path.abspath(real_path(workspace)))
+
+
 def pending_path(workspace):
-    """One marker per workspace, keyed on the same normalised path in every hook."""
-    return os.path.join(PENDING, slug_of(os.path.abspath(real_path(workspace))) + ".json")
+    return os.path.join(PENDING, ws_key(workspace) + ".json")
 
 
 def read_pending(workspace):
@@ -122,7 +134,7 @@ def read_pending(workspace):
     data = read_json_file(pending_path(workspace))
     if not isinstance(data, dict):
         return None
-    if time.time() - float(data.get("at") or 0) > MARKER_MAX_AGE:
+    if stale(data):
         clear_pending(workspace)
         return None
     return data
@@ -137,7 +149,11 @@ def write_pending(workspace, notes):
                      "said": list(old.get("said") or [])})
 
 
-def mark_said(workspace, marker, cid):
+def mark_said(workspace, cid):
+    """Note that this conversation has been told. Re-reads first: the gate may have written since."""
+    marker = read_pending(workspace)
+    if not marker:
+        return
     marker["said"] = sorted(set(marker.get("said") or []) | {cid})
     write_json_file(pending_path(workspace), marker)
 
@@ -150,13 +166,27 @@ def clear_pending(workspace):
 
 
 def take_retry(conversation, kind, limit=1):
-    """Spend one forced continue of this kind for this conversation. False when it is used up."""
-    path = os.path.join(RETRIES, slug_of(conversation or "none") + ".json")
-    data = read_json_file(path) or {}
-    used = int(data.get(kind) or 0)
+    """Spend one forced continue for this (conversation, gap kind, fingerprint). False when spent.
+
+    An unreadable file counts as spent: a conversation that corrupts its own retry state must
+    not win an extra continue, and must not crash the gate into releasing the stop either.
+    """
+    if not conversation:
+        return False
+    path = os.path.join(RETRIES, slug_of(conversation) + ".json")
+    data = read_json_file(path)
+    if data is None and os.path.exists(path):
+        return False
+    if not isinstance(data, dict) or stale(data):
+        data = {}
+    try:
+        used = int(data.get(kind) or 0)
+    except (TypeError, ValueError):
+        return False
     if used >= limit:
         return False
     data[kind] = used + 1
+    data["at"] = time.time()
     write_json_file(path, data)
     return True
 

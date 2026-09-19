@@ -80,7 +80,7 @@ Commands still need a rule in `permissions.allow` in `~/.gemini/antigravity-cli/
 
 ## Verifier and review pass
 
-The `stop-gate` hook blocks an agent from finishing while the repo's own checks fail on files it wrote this session. It picks one verifier per workspace, first match wins:
+The `stop-gate` hook blocks an agent from finishing while the repo's own checks have not passed on the tree in front of it. It picks one verifier per workspace, first match wins:
 
 1. `.agents/verify.cmd`, `.agents/verify.ps1`, or `.agents/verify.sh`, run with the workspace as the working directory
 2. a Ren'Py `game/` directory, checked with `renpy.exe <project> lint --error-code`
@@ -90,30 +90,40 @@ The `stop-gate` hook blocks an agent from finishing while the repo's own checks 
 6. `*.sln` or `*.csproj`, run as `dotnet test`
 7. `pyproject.toml`, `pytest.ini`, or `setup.cfg`, run as `python -m pytest -q -x`
 
-A verify script only runs in a workspace listed in `trustedWorkspaces` in `~/.gemini/antigravity-cli/settings.json`; elsewhere the gate skips it and logs `untrusted workspace`. The gate also refuses to finish while the directories the session wrote still hold `.bak`, `.orig`, `.old` or `.tmp` files, an unignored `__pycache__`, or an empty directory. Nothing matching means no gate. Give a repo its own `.agents/verify.sh` to control exactly what runs. One 800 second budget covers every verifier, lint and docs run in the whole Stop pass.
+The gate runs nothing at all in a workspace that is not listed in `trustedWorkspaces` in `~/.gemini/antigravity-cli/settings.json`. Such a workspace gets one message naming the verifier to run by hand and the list to add itself to, and then the stop goes through. Give a repo its own `.agents/verify.sh` to control exactly what runs. One 700 second budget covers every verifier, lint and docs run in the whole Stop pass, which leaves room under the 900 second hook timeout.
 
-## Evidence from the transcript
+## What counts as changed
 
-Before it runs anything, the gate reads the conversation transcript and looks at what the session actually did. A change is an edit tool naming a file, a subagent spawned to do work rather than to judge it, or a command that writes files (a redirect, `tee`, `sed -i`, `git apply`, `Set-Content` and friends). If the session changed anything in a workspace, it may only stop when the transcript shows:
+The gate does not read the transcript to work out what happened. It fingerprints each workspace with git:
 
-- a verifier run that exited 0, after the last change, and
-- a `reviewer` subagent spawned with `invoke_subagent` after the first change, with a real prompt and a result that is not an error.
+- `git rev-parse HEAD` and `git diff --binary HEAD`, hashed together as the tracked part
+- every path from `git ls-files --others --exclude-standard`, each with a hash of its content; a file over 2 MB is hashed by its size and mtime instead
 
-For a write that names where it goes, the target decides. A path outside every workspace, inside the conversation's artifact directory, or one git ignores is not a change, so dumping a diff for the reviewer costs nothing. A target the line does not spell out, because it comes from a variable or a substitution, stays a change. So does a workspace file git does not ignore, whatever produced it: `git show HEAD~3:game/x.rpy > game/x.rpy` only reads, but the redirect rewrites source.
+A workspace has work in it when that fingerprint differs from the one the conversation started with, or when `git status --porcelain` is not empty. It does not matter what moved it: an edit tool, `echo x>app.py`, `cp`, `rm`, `patch`, `git reset --hard`, a `Set-Content` from PowerShell, or a subagent. Adding the new file to `.gitignore` does not hide it either, because `.gitignore` is itself tracked. A tree that matches its own HEAD with nothing untracked owes nothing.
 
-The verifier run has to be the one this workspace selected above, started with the workspace as its working directory. A command that only prints or searches for it, or that collects tests without running them, proves nothing, and neither does a run whose result never reports an exit code, which is what a backgrounded or truncated command looks like.
+The first fingerprint of a conversation is taken by the `PreInvocation` hook, before the turn runs. That baseline is what "new since this run started" means for leftovers and for reviews.
 
-Changes made after the review may only touch files the review already saw. A file first written after it, or a delegated or shell change the gate cannot attribute to a file, needs a new review; fixing what the reviewer found does not. The verifier still has to pass after the last of those fixes.
+A workspace that is not a git repository has no fingerprint, so there the edit-tool targets in the transcript are the only change signal, and a transcript that cannot be read counts as a change rather than as proof of nothing.
 
-A run that is itself a subagent, which the gate detects from its parent's record under `brain/<parent>/.system_generated/subagents/`, owes the verifier run but not a reviewer: the agent that spawned it reviews the work. A session that changed nothing stops straight away. A session that changed only instruction docs (`GEMINI.md`, `AGENTS.md`, `SKILL.md`, anything under an `agents/` directory) owes neither, because the `ai-docs-lint.py` run is the check for those. Writes under the conversation's artifact directory are not workspace changes.
+## What counts as checked
 
-If `transcriptPath` is set but the file cannot be read, the gate blocks once and logs `no-transcript`: missing evidence is not proof there was nothing to check.
+**The verifier**: the gate runs it itself and records the fingerprint it passed on. Nothing in the transcript is evidence: a `pytest || true` that reports exit 0, an `ls .agents/verify.sh`, a pass in another workspace and a backgrounded run all leave the gate to run the real thing. A fingerprint already recorded as passing is not re-run, so an unchanged tree costs no time. This happens on every stop the model chose, including one where `fullyIdle` is false. A stop the model did not choose (cancelled, errored, out of steps) runs nothing and only leaves a marker.
 
-This check runs on every stop, including one where `fullyIdle` is false, because it only reads the transcript. The checks that execute something wait for an idle stop.
+**The review**: subagent Stop events reach this hook too, and the gate identifies the conversation from its parent's record under `brain/<parent>/.system_generated/subagents/<cid>.json`. When a subagent whose `typeName` is exactly `reviewer` (or `visual-qa`, where the workspace has `.agents/visual.md`) stops, the gate records the workspace fingerprint it saw. The record is only written when the tracked part is the same at the start and at the end of that subagent's run, so a `reviewer` that edits code reviews nothing. Any other type never counts, however its prompt is worded.
 
-The gate forces one retry per kind of gap per conversation, then lets the stop through, prints one line to the terminal and writes a marker in `~/.gemini/tmp/pending/` naming what is still owed. Work that stops unverified is therefore visible rather than blocked forever. Any stop that leaves a gap writes that marker, however the run ended. The next invocation in that workspace reads it out once per conversation; only a clean stop clears it, and a marker older than a day is dropped unread.
+The parent may stop when the tracked part still equals the reviewed one and no untracked file has appeared that the reviewer did not see itself. A file the reviewer created while it worked, a scratch diff or an artifact, is part of what it recorded, so it costs nothing.
 
-Known gap until the write gate lands: nothing stops an agent from editing `.agents/verify.*`, the files under `hooks/`, or a subagent record under `~/.gemini/`, so a determined agent can still forge the evidence this gate reads.
+The gate never reads the reviewer's answer. A reviewer that looks at the diff and says nothing useful still satisfies this check; the gate proves that a reviewer saw this exact tree, not that it did a good job.
+
+A subagent that is not a judge owes the verifier but not a review: the run that spawned it reviews the work. A change that touches nothing but instruction docs owes neither, because `ai-docs-lint.py` is the check for those. Instruction docs are Markdown only: `GEMINI.md`, `AGENTS.md`, `SKILL.md`, and anything under `agents/`, `skills/` or `rules/` at the repo root or under `.agents/`. `src/agents/x.py` is source code.
+
+The gate also refuses to finish while an untracked `.bak`, `.orig`, `.old`, `.tmp` or `__pycache__` path has appeared since the conversation started. A directory that was already there, empty or not, is not the run's mess.
+
+When `workspacePaths` arrives empty, which is most stops, the gate derives the workspaces from the paths the edit tools named, through `git rev-parse --show-toplevel`. When `conversationId` is missing it comes from the `brain/<cid>/` directory of the transcript path; retries are never pooled under a shared key.
+
+The gate forces one retry per conversation, per kind of gap, per fingerprint: fixing something moves the fingerprint and earns a fresh try. After that it lets the stop through, prints one line to the terminal and writes a marker in `~/.gemini/tmp/pending/` naming what is still owed. The next invocation in that workspace reads it out once per conversation; only a stop over a verified fingerprint clears it, and every state file older than a day is dropped unread. An unreadable state file counts as a retry already spent.
+
+Known gap until the write gate lands: nothing stops an agent from editing `.agents/verify.*`, the files under `hooks/`, the gate's own state under `~/.gemini/tmp/`, or a subagent record under `~/.gemini/`, so a determined agent can still forge what this gate reads.
 
 ## Discipline
 
@@ -161,7 +171,7 @@ http://localhost:5173/settings
 - No horizontal scrollbar at 1280px wide
 ```
 
-The gate enforces it the same way as the review: with that file in the workspace, the transcript has to show a `visual-qa` subagent spawned after the last change, with a real prompt and a result that is not an error. That agent opens each URL, screenshots it and checks every bullet; the run fixes what fails before it finishes.
+The gate enforces it the same way as the review: with that file in the workspace, a `visual-qa` subagent has to have stopped over the current fingerprint. That agent opens each URL, screenshots it and checks every bullet; the run fixes what fails before it finishes.
 
 A dead http MCP server makes every headless run hang until the timeout expires. Setting `"disabled": true` does not help, it is ignored. The installer handles this: it sends a HEAD request to every `serverUrl` with a 3 second timeout and leaves the ones that do not answer out of the installed file, printing a warning that names them. Any HTTP status counts as answering, so a server that returns 404 on `/mcp` is kept.
 
