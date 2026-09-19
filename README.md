@@ -99,6 +99,8 @@ Before it runs anything, the gate reads the conversation transcript and looks at
 - a verifier run that exited 0, after the last change, and
 - a `reviewer` subagent spawned with `invoke_subagent` after the first change, with a real prompt and a result that is not an error.
 
+For a write that names where it goes, the target decides. A path outside every workspace, inside the conversation's artifact directory, or one git ignores is not a change, so dumping a diff for the reviewer costs nothing. A target the line does not spell out, because it comes from a variable or a substitution, stays a change. So does a workspace file git does not ignore, whatever produced it: `git show HEAD~3:game/x.rpy > game/x.rpy` only reads, but the redirect rewrites source.
+
 The verifier run has to be the one this workspace selected above, started with the workspace as its working directory. A command that only prints or searches for it, or that collects tests without running them, proves nothing, and neither does a run whose result never reports an exit code, which is what a backgrounded or truncated command looks like.
 
 Changes made after the review may only touch files the review already saw. A file first written after it, or a delegated or shell change the gate cannot attribute to a file, needs a new review; fixing what the reviewer found does not. The verifier still has to pass after the last of those fixes.

@@ -337,10 +337,23 @@ def workspaces(raw_paths):
     return good, dropped
 
 
-def changes(spaces, calls, outside, unknown):
+def ignore_check(spaces):
+    """Does git ignore this path? One `git check-ignore` per distinct path per stop."""
+    seen = {}
+
+    def ignored(path):
+        if path not in seen:
+            ws = next((w for w in spaces if transcript.under(path, w)), "")
+            seen[path] = bool(ws) and git(ws, "check-ignore", "-q", path) is not None
+        return seen[path]
+
+    return ignored
+
+
+def changes(spaces, calls, outside, unknown, artifact=""):
     """Everything this conversation changed, whether or not an edit tool named the file."""
     files = {ws: transcript.edits(calls, ws, outside) for ws in spaces}
-    opaque = transcript.opaque_changes(calls, spaces)
+    opaque = transcript.opaque_changes(calls, spaces, artifact, ignore_check(spaces))
     marks = [i for ws in spaces for pair in files[ws].values() for i in pair] + opaque
     return Changes(min(marks, default=None), max(marks, default=None), files, opaque,
                    spaces, unknown)
@@ -427,7 +440,7 @@ def decide(ev, deadline):
     subagent = transcript.is_subagent(cid, brain)
     verifiers = {ws: verifier_steps(ws) for ws in spaces}
     calls = transcript.calls(steps)
-    ch = changes(spaces, calls, (artifact, brain), steps is None)
+    ch = changes(spaces, calls, (artifact, brain), steps is None, artifact)
     finished = ev.get("terminationReason") in MODEL_FINISHED
 
     if tpath and steps is None:

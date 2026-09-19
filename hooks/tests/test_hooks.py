@@ -685,6 +685,18 @@ class TestStopGate(unittest.TestCase):
         self.assertEqual(res.get("decision"), "continue", res)
         self.assertIn("delete leftovers: app.py.bak", res["reason"])
 
+    def test_a_diff_dumped_to_an_ignored_path_is_not_a_change(self):
+        """End to end, through a real `git check-ignore` in a real repository."""
+        script = self.verify_script()
+        subprocess.run(["git", "init", "-q"], cwd=self.tmp, capture_output=True)
+        (Path(self.tmp) / ".gitignore").write_text("scratch/\n", encoding="utf-8")
+        (Path(self.tmp) / "scratch").mkdir()
+        (Path(self.tmp) / "scratch" / "diff.txt").write_text("diff --git\n", encoding="utf-8")
+        res = self.run_hook(self.code_payload(transcriptPath=self.transcript_of(
+            ("edit", "app.py"), ("run", script, 0), ("reviewer",),
+            ("run", "git diff HEAD > scratch/diff.txt", 0))))
+        self.assertEqual(res.get("decision"), "stop", res)
+
     def test_unreadable_transcript_blocks_once(self):
         truncated = Path(self.tmp) / "truncated.jsonl"
         truncated.write_text('{"step_index": 0, "type": "PLANNER_RESP', encoding="utf-8")
@@ -1084,6 +1096,42 @@ class TestTranscript(unittest.TestCase):
         calls, _runs = self.runs(("edit", "a.py"), ("edit", "b.py"), ("edit", "a.py"))
         self.assertEqual(self.mod.edits(calls, self.tmp),
                          {"a.py": (0, 8), "b.py": (4, 4)})
+
+    def opaque(self, line, artifact="", ignored=None):
+        """Step indexes this command line counts as a change, judged by its target."""
+        calls = [(0, "run_command", {"CommandLine": line, "Cwd": self.tmp}, None)]
+        return self.mod.opaque_changes(calls, [self.tmp], artifact, ignored)
+
+    def test_a_write_outside_every_workspace_is_not_a_change(self):
+        outside = os.path.join(tempfile.gettempdir(), "elsewhere", "diff.txt")
+        self.assertEqual(self.opaque(f'git diff HEAD > "{outside}"'), [])
+
+    def test_a_write_into_the_artifact_directory_is_not_a_change(self):
+        artifact = os.path.join(self.tmp, "brain", "cid")
+        self.assertEqual(self.opaque("git diff HEAD > brain/cid/diff.txt", artifact), [])
+
+    def test_a_write_to_an_ignored_path_is_not_a_change(self):
+        ignored = os.path.abspath(os.path.join(self.tmp, "scratch", "diff.txt"))
+        self.assertEqual(
+            self.opaque("git diff HEAD > scratch/diff.txt", ignored=lambda p: p == ignored), [])
+
+    def test_a_target_the_line_does_not_spell_out_stays_a_change(self):
+        self.assertEqual(self.opaque('git diff HEAD > "$out"'), [0])
+        self.assertEqual(self.opaque("git diff HEAD | tee $(mktemp)"), [0])
+
+    def test_a_write_to_a_workspace_file_stays_a_change(self):
+        for line in ("git diff HEAD > diff.txt", "git diff HEAD | tee notes.txt",
+                     "git diff HEAD | Out-File -Encoding utf8 loop_diff.txt",
+                     "Copy-Item game/a.rpy game/b.rpy", "sed -i 's/a/b/' game/a.rpy"):
+            with self.subTest(line=line):
+                self.assertEqual(self.opaque(line), [0], line)
+
+    def test_restoring_an_old_revision_over_a_source_file_is_a_change(self):
+        """The command only reads, but the redirect rewrites the file it names."""
+        self.assertEqual(self.opaque("git show HEAD~3:game/x.rpy > game/x.rpy"), [0])
+
+    def test_a_discarded_redirect_is_not_a_change(self):
+        self.assertEqual(self.opaque("git diff HEAD > /dev/null"), [])
 
     def subagent_record(self, cid, type_name):
         records = Path(self.tmp) / "parent" / ".system_generated" / "subagents"

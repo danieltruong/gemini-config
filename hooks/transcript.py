@@ -8,6 +8,8 @@ import json
 import os
 import re
 
+import hookpaths
+
 EDIT_TOOLS = {"replace_file_content", "write_to_file", "multi_replace_file_content",
               "sed_file", "edit_file", "create_file"}
 # only these actually execute something, so only these can be a verifier run
@@ -38,12 +40,27 @@ VERIFIER_COMMANDS = (
 QUOTING = re.compile(r"(?i)^\s*(?:echo|printf|cat|type|less|more|head|tail|grep|rg|findstr"
                      r"|git\s+(?:log|grep|show|diff))\b")
 INSPECT_ONLY = re.compile(r"(?i)--collect-only|--co\b|--help\b|--version\b|--dry-run\b|\s-h\b")
-# commands that write files without going through an edit tool
-REDIRECT = re.compile(r"(?:^|\s)\d?>>?\s*(?!&)(?!/dev/null\b)(?!nul\b)[^\s&]")
+# writes whose target is not a path the command line spells out, so they always count
 WRITE_COMMAND = re.compile(
-    r"(?i)\|\s*tee\b|\bsed\s+-i\b|\bgit\s+(?:apply|checkout|restore|stash\s+pop)\b"
-    r"|\bpython\d?(?:\.exe)?\s+-c\b[^\n]*open\([^\n]*['\"][wax]"
+    r"(?i)\bsed\s+-i\b|\bgit\s+(?:apply|checkout|restore|stash\s+pop)\b"
+    r"|\bpython\d?(?:\.exe)?\s+-c\b[^\n]*open\([^\n]*['\"][wax]")
+# writes that name where they go: the target decides whether the tree really changed
+TARGETED_WRITE = re.compile(
+    r"(?i)(?:^|\s)\d?>>?\s*(?!&)[^\s&]|\|\s*tee\b"
     r"|\bSet-Content\b|\bAdd-Content\b|\bOut-File\b|\bCopy-Item\b|\bMove-Item\b")
+QUOTED = r"(?:\"[^\"]+\"|'[^']+'|[^\s;|&<>]+)"
+WRITE_TARGETS = (
+    re.compile(r"(?:^|\s)\d?>>?\s*(?!&)(" + QUOTED + ")"),
+    re.compile(r"(?i)\|\s*tee\s+(?:-a\s+)?(" + QUOTED + ")"),
+    re.compile(r"(?i)\b(?:Set-Content|Add-Content|Out-File)\b"
+               r"(?:\s+-(?:Encoding|Force|Append|NoNewline|NoClobber)(?:\s+\S+)?)*"
+               r"\s+(?:-(?:FilePath|Path|LiteralPath)\s+)?(" + QUOTED + ")"),
+    re.compile(r"(?i)\b(?:Copy-Item|Move-Item)\b(?:\s+-\w+)*\s+" + QUOTED
+               + r"\s+(?:-(?:Destination|LiteralPath)\s+)?(" + QUOTED + ")"),
+)
+# a target built from a variable or a substitution cannot be resolved, so it stays a change
+UNRESOLVABLE = re.compile(r"[$%`]|\(\)")
+DISCARDED = ("/dev/null", "nul", "$null")
 
 EXIT_CODE = re.compile(r'"exit_code"\s*:\s*(-?\d+)')
 # run_command reports its status as prose at the head of the result, not as JSON;
@@ -234,7 +251,58 @@ def spec_list(args):
     return [s for s in specs if isinstance(s, dict)] if isinstance(specs, list) else []
 
 
-def opaque_changes(calls_made, spaces=()):
+def write_targets(text):
+    """Paths a targeted write names, as written on the command line."""
+    out = []
+    for pattern in WRITE_TARGETS:
+        for match in pattern.finditer(text):
+            out.append(match.group(1).strip("\"'"))
+    return out
+
+
+def resolve(token, cwd):
+    """The absolute path a target token means, or None when the line does not say."""
+    if not token or UNRESOLVABLE.search(token):
+        return None
+    path = hookpaths.real_path(token)
+    if not os.path.isabs(path) and ":" not in path[:2]:
+        if not cwd:
+            return None
+        path = os.path.join(hookpaths.real_path(cwd), path)
+    return os.path.abspath(path)
+
+
+def wrote_in_tree(text, cwd, spaces, artifact="", ignored=None):
+    """Did this command change a file the gate has to account for?
+
+    A write whose target lands outside every workspace, in the conversation's artifact
+    directory, or on a path git ignores leaves the tree the reviewer saw intact. A target
+    the line does not spell out stays a change, because nothing rules it out.
+    """
+    if WRITE_COMMAND.search(text):
+        return True
+    if not TARGETED_WRITE.search(text):
+        return False
+    targets = write_targets(text)
+    if not targets:
+        return True
+    for token in targets:
+        if token.lower() in DISCARDED:
+            continue
+        path = resolve(token, cwd)
+        if path is None:
+            return True
+        if not any(under(path, ws) for ws in spaces or ()):
+            continue
+        if artifact and under(path, artifact):
+            continue
+        if ignored and ignored(path):
+            continue
+        return True
+    return False
+
+
+def opaque_changes(calls_made, spaces=(), artifact="", ignored=None):
     """Step indexes of changes the transcript cannot attribute to a file.
 
     Delegated work and shell writes change the tree without an edit tool, so the gate
@@ -247,10 +315,10 @@ def opaque_changes(calls_made, spaces=()):
                    for spec in spec_list(args)):
                 out.append(index)
         elif name == "run_command":
-            text = str(args.get("CommandLine") or "")
             cwd = unwrap(args.get("Cwd"))
-            if (REDIRECT.search(text) or WRITE_COMMAND.search(text)) and (
-                    not spaces or any(under(cwd, ws) for ws in spaces)):
+            if spaces and not any(under(cwd, ws) for ws in spaces):
+                continue
+            if wrote_in_tree(str(args.get("CommandLine") or ""), cwd, spaces, artifact, ignored):
                 out.append(index)
     return out
 
