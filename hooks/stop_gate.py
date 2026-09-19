@@ -39,9 +39,10 @@ NO_TESTS_CODE = 5
 RENPY_LABEL = "renpy lint"
 # one stop runs a workspace's verifier at a time
 LOCKS = os.path.join(hookpaths.TMP, "locks")
-# a lock has to age out well inside one gate budget, or a lock left by a gate agy killed would
-# stall every later stop for its whole budget
-LOCK_MAX_AGE = 120
+# the holder touches its lock every LOCK_POLL seconds while the verifier runs, so this is "no
+# heartbeat for this long", not "this run is too slow": a few missed beats, not a whole budget,
+# is what a waiter pays for a lock whose gate agy killed
+LOCK_MAX_AGE = 30
 LOCK_POLL = 2
 # waiting out another stop is only worth it when enough budget is left to then verify
 LOCK_FLOOR = 60
@@ -148,22 +149,37 @@ def trusted(ws):
                for r in roots)
 
 
-def execute(ws, label, argv, deadline):
+def wait_for(proc, left, beat):
+    """(stdout, stderr) once the child is done, calling beat while it is still running."""
+    end = time.monotonic() + left
+    while True:
+        try:
+            return proc.communicate(timeout=max(0.1, min(LOCK_POLL, end - time.monotonic())))
+        except subprocess.TimeoutExpired:
+            if time.monotonic() >= end:
+                proc.kill()
+                proc.communicate()
+                raise
+            if beat:
+                beat()
+
+
+def execute(ws, label, argv, deadline, beat=None):
     """(label, returncode, output lines). Timeout or launch failure counts as a failure."""
     left = remaining(deadline)
     if left < MIN_STEP:
         return label, 1, [f"verifier budget exhausted: {GATE_BUDGET}s spent before {label} ran"]
     try:
-        proc = subprocess.run(argv, cwd=ws, capture_output=True, timeout=left)
-        out = (proc.stdout + proc.stderr).decode("utf-8", "replace")
-        return label, proc.returncode, out.splitlines()
+        proc = subprocess.Popen(argv, cwd=ws, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        out, err = wait_for(proc, left, beat)
+        return label, proc.returncode, (out + err).decode("utf-8", "replace").splitlines()
     except subprocess.TimeoutExpired:
         return label, 1, [f"timed out after {int(left)}s"]
     except Exception as exc:
         return label, 1, [f"could not run {label}: {exc}"]
 
 
-def renpy_lint(ws, files, deadline):
+def renpy_lint(ws, files, deadline, beat=None):
     sdk = find_sdk(ws)
     if sdk is None:
         return None
@@ -173,13 +189,12 @@ def renpy_lint(ws, files, deadline):
     # ponytail: re-lints the whole project on every changed fingerprint (~4 s); cache per
     # fingerprint with the verified record if that drags
     try:
-        proc = subprocess.run(
-            [os.path.join(sdk, SDK_EXE), ws, "lint", "--error-code"],
-            cwd=sdk, capture_output=True, timeout=min(LINT_TIMEOUT, max(1, left)),
-        )
+        proc = subprocess.Popen([os.path.join(sdk, SDK_EXE), ws, "lint", "--error-code"],
+                                cwd=sdk, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        out, err = wait_for(proc, min(LINT_TIMEOUT, max(1, left)), beat)
     except Exception as exc:
         return RENPY_LABEL, 1, [f"could not run renpy lint: {exc}"]
-    text = proc.stdout.decode("utf-8", "replace").lstrip("﻿")
+    text = out.decode("utf-8", "replace").lstrip("﻿")
     hits = []
     parsed_any = False
     for line in text.splitlines():
@@ -191,15 +206,15 @@ def renpy_lint(ws, files, deadline):
                 hits.append(line)
     if not parsed_any and proc.returncode != 0:
         # lint failed without a parseable report line: crash, bad project path, missing asset dir
-        err = proc.stderr.decode("utf-8", "replace").splitlines()
-        return RENPY_LABEL, 1, [f"renpy lint exited {proc.returncode}"] + err[-MAX_REPORTED:]
+        lines = err.decode("utf-8", "replace").splitlines()
+        return RENPY_LABEL, 1, [f"renpy lint exited {proc.returncode}"] + lines[-MAX_REPORTED:]
     return RENPY_LABEL, 1 if hits else 0, hits
 
 
-def run_steps(ws, steps, deadline):
+def run_steps(ws, steps, deadline, beat=None):
     """The first failing step, or a pass for the last one. None when nothing was verified."""
     for label, argv in steps:
-        found = execute(ws, label, argv, deadline)
+        found = execute(ws, label, argv, deadline, beat)
         if label == PYTEST_LABEL and found[1] == NO_TESTS_CODE:
             return None  # no tests here, so this repo has no verifier rather than a failure
         if found[1] != 0:
@@ -236,11 +251,11 @@ def verifier_steps(ws):
     return []
 
 
-def verify(ws, files, steps, deadline):
+def verify(ws, files, steps, deadline, beat=None):
     """Run the verifier this workspace selected. None when the repo has none."""
     if steps and steps[0][1] is None:
-        return renpy_lint(ws, files, deadline)
-    return run_steps(ws, steps, deadline)
+        return renpy_lint(ws, files, deadline, beat)
+    return run_steps(ws, steps, deadline, beat)
 
 
 def verifier_hint(steps):
@@ -340,12 +355,24 @@ def claim_lock(ws):
             os.makedirs(LOCKS, exist_ok=True)
             fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
         except FileExistsError:
+            held = hookpaths.read_json_file(path) or {}
             if lock_left(ws) > 0:
                 return ""
+            # rename rather than remove, so of several stops meeting one abandoned lock only the
+            # one whose rename landed carries on
+            dead = f"{path}.{os.getpid()}.dead"
             try:
-                os.remove(path)  # older than any hook can run, so its gate is gone
+                os.replace(path, dead)
             except OSError:
                 return ""
+            stolen = hookpaths.read_json_file(dead) or {}
+            if stolen.get("token") != held.get("token"):
+                os.replace(dead, path)  # another stop claimed it between the read and the rename
+                return ""
+            try:
+                os.remove(dead)
+            except OSError:
+                pass
             continue
         except OSError:
             return ""
@@ -355,19 +382,30 @@ def claim_lock(ws):
     return ""
 
 
-def hold_lock(ws, deadline):
+def hold_lock(ws, deadline, done=None):
     """Claim the verifier lock, waiting out a live one. '' when it is still held.
 
-    The wait is bounded by the lock's own age-out and has to leave budget to verify with.
+    The wait is bounded by the lock's own age-out and has to leave budget to verify with. It
+    also ends the moment done() says the running stop has already proved this tree, which is
+    the only reason to wait for it at all.
     """
     while True:
         token = claim_lock(ws)
         if token:
             return token
+        if done and done():
+            return ""
         left = lock_left(ws)
         if left <= 0 or remaining(deadline) - left < LOCK_FLOOR:
             return ""
         time.sleep(min(LOCK_POLL, left))
+
+
+def touch_lock(ws, token):
+    """Say this stop is still verifying, so a long run does not lose its own lock."""
+    rec = hookpaths.read_json_file(lock_file(ws)) or {}
+    if rec.get("token") == token:
+        hookpaths.write_json_file(lock_file(ws), dict(rec, at=time.time()))
 
 
 def drop_lock(ws, token):
@@ -380,7 +418,8 @@ def drop_lock(ws, token):
         pass
 
 
-def verifier_gap(ws, fp, names, deadline):
+def verifier_gap(ws, fp, names, deadline, skipped):
+    """The verifier's verdict for this workspace. Workspaces it could not run land in skipped."""
     if cached_pass(ws, fp):
         return None  # this exact tree already passed, so running it again proves nothing
     steps = verifier_steps(ws)
@@ -390,23 +429,26 @@ def verifier_gap(ws, fp, names, deadline):
         log(ws, "trust", "untrusted workspace, verifier not run")
         return "untrusted", UNTRUSTED_REASON.format(ws=ws, cmds=verifier_hint(steps),
                                                     settings=hookpaths.CLI_SETTINGS)
-    token = hold_lock(ws, deadline)
+    token = hold_lock(ws, deadline, lambda: cached_pass(ws, fp))
     if not token:
+        if cached_pass(ws, fp):
+            return None  # the stop holding the lock passed this tree while this one waited
         # another stop is verifying this workspace and there is no budget to wait it out, so
         # this stop reports no verifier gap and the marker keeps the work on the books
         log(ws, "lock", "lock busy, verifier not run")
         hookpaths.write_pending(ws, [LOCK_BUSY_NOTE])
+        skipped.add(ws)
         return None
     try:
         if cached_pass(ws, fp):
             return None  # a concurrent stop just ran it, and its pass covers this tree
-        return run_verifier(ws, fp, names, steps, deadline)
+        return run_verifier(ws, fp, names, steps, deadline, token)
     finally:
         drop_lock(ws, token)
 
 
-def run_verifier(ws, fp, names, steps, deadline):
-    found = verify(ws, names, steps, deadline)
+def run_verifier(ws, fp, names, steps, deadline, token):
+    found = verify(ws, names, steps, deadline, lambda: touch_lock(ws, token))
     if found is None:
         return None  # nothing was verified here, so there is no pass to record either
     if found[1] != 0:
@@ -465,12 +507,12 @@ def leftover_gap(ws, cid, fp, ignore):
     return "leftovers", LEFTOVERS_REASON.format(paths=", ".join(sorted(junk)[:MAX_REPORTED]))
 
 
-def workspace_gap(ws, cid, fp, role, outside, deadline):
+def workspace_gap(ws, cid, fp, role, outside, deadline, skipped):
     """The first piece of missing proof for one changed workspace, or None."""
     names = fp.names if fp is not None else None
     only_docs = docs_only(names)
     if not only_docs:
-        found = verifier_gap(ws, fp, names, deadline)
+        found = verifier_gap(ws, fp, names, deadline, skipped)
         if found:
             return found
     docs = docs_findings(ws, names, deadline)
@@ -508,15 +550,15 @@ def worth_judging(cid, ws):
 
 
 def derived_spaces(calls, outside, cid):
-    """Repository roots the run wrote in, for a stop that carries no workspace of its own."""
+    """Repository roots the run worked in, for a stop that carries no workspace of its own."""
     wrote = repo_roots(os.path.dirname(path)
                        for path in transcript.written_paths(calls, outside))
-    if wrote:
-        return wrote
-    # a shell write names no file, so its working directory is the last pointer left. A
-    # read-only command must not pull an untouched repository into the judged set.
-    return [ws for ws in repo_roots(transcript.run_dirs(calls, outside))
-            if worth_judging(cid, ws)]
+    # a shell write names no file, so its working directory is the only pointer it leaves. A
+    # directory above a workspace an edit already named is that workspace's parent, not another.
+    ran = [ws for ws in repo_roots(transcript.run_dirs(calls, outside))
+           if not any(transcript.under(named, ws) for named in wrote)]
+    # a read-only command must not pull an untouched repository into the judged set
+    return [ws for ws in wrote + ran if worth_judging(cid, ws)]
 
 
 def workspaces(ev, calls, outside, cid):
@@ -632,11 +674,14 @@ def decide(ev, deadline):
         return ({"decision": "stop"}, "pending",
                 f"reason={reason!r} changed={len(dirty)}", spaces)
 
+    skipped = set()
     gap, culprit = first_gap(dirty, lambda ws: workspace_gap(
-        ws, cid, prints[ws], role, outside, deadline))
+        ws, cid, prints[ws], role, outside, deadline, skipped))
     if not gap:
-        for ws in dirty:  # every changed workspace came back with nothing missing
-            hookpaths.clear_pending(ws)
+        # nothing is missing here, except where the verifier could not run: that stays on the books
+        for ws in dirty:
+            if ws not in skipped:
+                hookpaths.clear_pending(ws)
         return {"decision": "stop"}, "stop", "verified", spaces
     return answer(gap, culprit, cid, prints[culprit], spaces, deadline,
                   f"{role or 'top-level'} {culprit}",

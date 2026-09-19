@@ -752,18 +752,31 @@ class TestChangeDetection(GateCase):
         path.write_text(json.dumps({"at": at, "pid": 1, "token": "other"}), encoding="utf-8")
         return path
 
+    def parallel_stops(self, count):
+        """Stops that really run at once: every one is fed its payload before any is waited on."""
+        payload = json.dumps(self.payload())
+        running = []
+        for _ in range(count):
+            proc = subprocess.Popen(
+                [sys.executable, str(HOOKS_DIR / "stop_gate.py")], env=self.env(),
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            proc.stdin.write(payload)
+            proc.stdin.close()
+            running.append(proc)
+        out = []
+        for proc in running:
+            out.append(proc.stdout.read())
+            proc.stdout.close()
+            proc.stderr.close()
+            proc.wait()
+        return out
+
     def test_three_stops_at_once_run_the_verifier_once(self):
         self.verifier(slow=True)
         self.turn()
         self.write("app.py", "x = 2\n")
-        payload = json.dumps(self.payload())
-        running = [subprocess.Popen(
-            [sys.executable, str(HOOKS_DIR / "stop_gate.py")], env=self.env(),
-            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            text=True) for _ in range(3)]
-        decisions = [json.loads(proc.communicate(payload)[0]).get("decision")
-                     for proc in running]
-        self.assertEqual(self.runs(), 1, f"one verifier run covers all three, got {decisions}")
+        out = self.parallel_stops(3)
+        self.assertEqual(self.runs(), 1, f"one verifier run covers all three, got {out}")
 
     def test_a_lock_older_than_its_age_out_is_taken_over(self):
         self.verifier()
@@ -775,6 +788,81 @@ class TestChangeDetection(GateCase):
         self.assertEqual(self.runs(), 1)
         self.assertLess(time.monotonic() - started, 30, "an abandoned lock is not waited on")
         self.assertFalse(lock.exists())
+        self.assertEqual(list(lock.parent.glob("*.dead")), [], "the takeover cleans up after itself")
+
+    def spanning_verifier(self, code):
+        """A verify script that records when it starts and stops, so overlap is visible."""
+        helper = self.write("stamp.py",
+                            "import sys, time\n"
+                            "def note(what):\n"
+                            "    with open(sys.argv[1], 'a', encoding='utf-8') as fh:\n"
+                            "        fh.write(f'{time.time()} {what}\\n')\n"
+                            "note('start')\n"
+                            "time.sleep(3)\n"
+                            "note('end')\n"
+                            f"raise SystemExit({code})\n")
+        spans = Path(self.tmp) / "spans.txt"
+        line = f'"{sys.executable}" "{helper}" "{spans}"'
+        name = ".agents/verify.cmd" if os.name == "nt" else ".agents/verify.sh"
+        self.write(name, f"@{line}\r\n" if os.name == "nt" else f"{line}\n")
+        self.commit(self.repo, "verifier")
+        return spans
+
+    def test_three_stops_serialise_a_failing_verifier(self):
+        """A failure records no pass, so all three run it: the lock only makes them take turns."""
+        spans = self.spanning_verifier(code=1)
+        self.turn()
+        self.write("app.py", "x = 2\n")
+        self.parallel_stops(3)
+        marks = sorted(tuple(line.split()) for line in
+                       spans.read_text(encoding="utf-8").splitlines() if line.strip())
+        self.assertGreaterEqual(len(marks), 4, f"more than one run expected, got {marks}")
+        kinds = [what for _stamp, what in marks]
+        self.assertEqual(kinds, ["start", "end"] * (len(kinds) // 2),
+                         f"two verifier runs overlapped: {marks}")
+
+    def test_a_marker_survives_a_stop_that_could_not_verify(self):
+        """The reviewed tree is not proved: the verifier never ran, so the marker stays."""
+        self.verifier()
+        self.turn()
+        self.write("app.py", "x = 2\n")
+        self.review()
+        lock = self.hold_lock(time.time() + hooks_module("stop_gate").GATE_BUDGET)
+        res = self.stop()
+        self.assertEqual(res.get("decision"), "stop", res)
+        self.assertEqual(self.runs(), 0)
+        self.assertEqual(len(self.markers()), 1)
+        self.assertTrue(lock.exists())
+
+    def test_a_long_verifier_keeps_its_own_lock_fresh(self):
+        stop_gate = hooks_module("stop_gate")
+        self.addCleanup(setattr, stop_gate, "LOCKS", stop_gate.LOCKS)
+        stop_gate.LOCKS = str(Path(self.tmp) / "locks")
+        token = stop_gate.claim_lock(self.repo)
+        path = Path(stop_gate.lock_file(self.repo))
+        rec = json.loads(path.read_text(encoding="utf-8"))
+        path.write_text(json.dumps(dict(rec, at=time.time() - 10 * stop_gate.LOCK_MAX_AGE)),
+                        encoding="utf-8")
+        self.assertEqual(stop_gate.lock_left(self.repo), 0)
+        _label, code, _out = stop_gate.execute(
+            self.repo, "slow", [sys.executable, "-c", "import time; time.sleep(3)"],
+            time.monotonic() + 60, beat=lambda: stop_gate.touch_lock(self.repo, token))
+        self.assertEqual(code, 0)
+        self.assertGreater(stop_gate.lock_left(self.repo), stop_gate.LOCK_MAX_AGE - 10)
+        before = path.read_text(encoding="utf-8")
+        stop_gate.touch_lock(self.repo, "another-stop")
+        self.assertEqual(path.read_text(encoding="utf-8"), before)
+
+    def test_an_edit_and_a_shell_write_in_two_repositories_are_both_judged(self):
+        other = self.new_repo()
+        self.write("app.py", "x = 2\n")
+        self.write("app.py", "y = 2\n", root=other)
+        path = write_transcript(Path(self.tmp) / "t.jsonl",
+                                [("edit", "app.py"), ("run", "echo y>app.py", 0, other)],
+                                self.repo)
+        self.hook("stop_gate.py", self.payload(workspacePaths=[], transcriptPath=path))
+        judged = self.log().strip().splitlines()[-1].split("\t")[2]
+        self.assertEqual(sorted(judged.split(",")), sorted([self.repo, other]))
 
     def test_a_live_lock_with_no_budget_to_wait_skips_the_verifier(self):
         """Stamped ahead of now, so waiting it out would not fit inside the gate budget."""
@@ -808,7 +896,7 @@ class TestChangeDetection(GateCase):
         steps = [(stop_gate.PYTEST_LABEL, [sys.executable, "-c", "raise SystemExit(5)"])]
         fp = gitstate.fingerprint(self.repo)
         self.assertIsNone(stop_gate.run_verifier(self.repo, fp, set(), steps,
-                                                 time.monotonic() + 60))
+                                                 time.monotonic() + 60, "token"))
         self.assertEqual(gitstate.verified(self.repo), {})
 
     def test_a_marker_in_a_repo_without_a_verifier_is_cleared_by_a_review(self):
@@ -1228,7 +1316,8 @@ class TestVerifierSelection(unittest.TestCase):
         self.ran = []
         real = stop_gate.execute
         self.addCleanup(setattr, stop_gate, "execute", real)
-        stop_gate.execute = lambda ws, label, argv, deadline: (self.ran.append(label) or (label, 0, []))
+        stop_gate.execute = lambda ws, label, argv, deadline, beat=None: (
+            self.ran.append(label) or (label, 0, []))
         self.tmp = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, self.tmp, True)
         real_which = shutil.which
@@ -1275,7 +1364,7 @@ class TestVerifierSelection(unittest.TestCase):
 
     def test_npm_stops_at_first_failure(self):
         self.write("package.json", json.dumps({"scripts": {"lint": "x", "test": "x"}}))
-        self.gate.execute = lambda ws, label, argv, deadline: (
+        self.gate.execute = lambda ws, label, argv, deadline, beat=None: (
             self.ran.append(label) or (label, 1, ["boom"])
         )
         label, rc, _ = self.verify()
@@ -1336,7 +1425,7 @@ class TestVerifierSelection(unittest.TestCase):
     def test_pytest_collecting_nothing_is_not_a_failure(self):
         """Exit 5 means the repo has no tests, so it has no verifier to fail."""
         self.write("pyproject.toml")
-        self.gate.execute = lambda ws, label, argv, deadline: (
+        self.gate.execute = lambda ws, label, argv, deadline, beat=None: (
             self.ran.append(label) or (label, self.gate.NO_TESTS_CODE, ["no tests ran"])
         )
         self.assertIsNone(self.verify())
