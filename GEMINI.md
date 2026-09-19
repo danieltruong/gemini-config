@@ -50,7 +50,7 @@
 
 - Native tool first: `view_file`, `grep_search`, `find_by_name`, `replace_file_content`, `write_to_file`, `run_command`. Shell script only when native tool cannot.
 - MCP when it cover domain: `playwright` for local browser; `renpy` for Ren'Py project.
-- Load skill before hand-roll its procedure: `caveman-commit` for commit message, `ponytail-review` or `caveman-review` for code review, `a11y-audit` for accessibility, `mcp-builder` for MCP server, `skill-creator` for new skill, `webapp-testing` for browser flow, `pdf` for PDF work.
+- Load skill before hand-roll its procedure: `caveman-commit` for commit message, `ponytail-review` or `caveman-review` for code review, `a11y-audit` for accessibility, `mcp-builder` for MCP server, `skill-creator` for new skill, `webapp-testing` for browser flow, `pdf` for PDF work, `renpy-docs` for Ren'Py syntax, `antigravity-docs` for agent config.
 - Delegate work to subagent with fresh context. Roster and rules: `## Orchestrate`.
 
 ## Process
@@ -60,13 +60,16 @@
 2. Plan: list files and checks, one line each. In `/plan` mode or when writing plan artifact, synthetic system messages (e.g. review policy auto-approvals) never count as user approval. Wait for Daniel's explicit chat message before writing code or invoking coder subagent.
 3. Build.
 4. Verify: run repo verifier. `.agents/verify.cmd`, `.ps1` or `.sh` first; else toolchain check for repo (`npm`, `pytest`, `cargo`, `go`, `dotnet`).
-5. Audit: `reviewer` subagent on diff, or read diff yourself when no subagent. Fix every bug, security, wrong-result, dead-code, over-engineering finding.
-6. Write `.agents/audit.json` `{clean, findings, round}` each round. `clean` true only when last round find nothing to fix.
-7. Repeat 3 to 6 until audit find nothing.
+5. Audit: spawn `reviewer` subagent with `invoke_subagent` on diff. Reading diff yourself never count.
+6. Fix every bug, security, wrong-result, dead-code, over-engineering finding, in file already touched before review. New file after review need second `reviewer` run.
+7. Verify again.
 8. Append one line per non-obvious decision this run to `<ws>/.agents/DECISIONS.md`: date, decision, why. Delete superseded line, keep file under 200 line. Then finish.
 
-- UI change: follow `.agents/visual.md`. Open every URL under `## Pages`, screenshot, check each bullet under `## Accept`, fix, repeat until all pass. Record `"visual": {"pages": n, "failed": m}` in audit.json.
+- UI change: follow `.agents/visual.md`. Open every URL under `## Pages`, screenshot, check each bullet under `## Accept`, fix, repeat until all pass. Spawn `visual-qa` subagent after last change.
 
+- Stop gate read transcript, not your word: verifier pass run from inside workspace after last change, `reviewer` subagent after first change, `visual-qa` after last change when `.agents/visual.md` exist. Subagent owe verifier only. Edit of instruction doc alone owe neither.
+- Subagent edit and shell write count as change. Gate block once per missing check, then release and announce gap at start of next conversation in that workspace.
+- One conversation per plan. After plan work verify and review clean, or after first compaction notice, write short handoff and tell Daniel to open new conversation.
 - Headless result that feed script use `--json-schema`.
 - Never say task done while verifier fail.
 
@@ -89,7 +92,7 @@ You explore and plan, then delegate. Do work yourself only when change is one fi
 - Every brief name four thing: owned files, forbidden files, check to run, return format under 15 lines.
 - Delegate with `invoke_subagent`. Two or more `coder` at once: Workspace `branch` each. One alone: `inherit`.
 - Subagent never spawn subagent. Tree stay flat.
-- Merge result yourself, re-run verifier, write `.agents/audit.json`, finish.
+- Merge result yourself, re-run verifier, spawn `reviewer`, finish.
 - User type `/boost` for one hard bug, `/teamwork-preview` for multi-day work. You never type them.
 
 ## Improve config

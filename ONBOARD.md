@@ -36,7 +36,7 @@ Edit `~/.gemini/antigravity-cli/settings.json`:
 ```bash
 python scripts/ai-docs-lint.py --all
 python -m unittest discover -s hooks/tests
-agy mcp list      # shows mcpjungle, playwright, plus local servers
+agy mcp list      # shows playwright, plus local servers
 agy agents        # shows researcher, coder, reviewer
 ```
 
