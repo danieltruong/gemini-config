@@ -27,6 +27,7 @@ import re
 import sqlite3
 import statistics
 import sys
+import tempfile
 import urllib.parse
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir, "hooks"))
@@ -696,13 +697,14 @@ def unchecked_stop(kind, detail):
     return kind in UNCHECKED_KINDS or "idle=False" in detail
 
 
-def stop_gate_log(since):
+def stop_gate_log(since, path=None):
     """(decision counts, stops, stops that skipped every check) since a cutoff."""
+    path = path or STOP_GATE_LOG
     counts = collections.Counter()
     stops = unchecked = 0
-    if not os.path.exists(STOP_GATE_LOG):
+    if not os.path.exists(path):
         return counts, stops, unchecked
-    with open(STOP_GATE_LOG, encoding="utf-8", errors="replace") as handle:
+    with open(path, encoding="utf-8", errors="replace") as handle:
         for line in handle:
             parsed = parse_stop_line(line)
             if not parsed:
@@ -1193,6 +1195,15 @@ def self_check():
     assert not unchecked_stop(*parse_stop_line(
         "2026-09-18T00:32:09 - stop reason='NO_TOOL_CALL' idle=True")[1:])
     assert not unchecked_stop("stop", "execution=0")
+
+    # a judge writing down what it reviewed is not a stop the gate decided anything about
+    with tempfile.NamedTemporaryFile("w", suffix=".log", delete=False,
+                                     encoding="utf-8") as handle:
+        handle.write("2026-09-18T00:33:41\tstop\tF:/p\tverified\n"
+                     "2026-09-18T00:33:42\treview\tF:/p\treviewer recorded 1/1\n")
+    counts, stops, unchecked = stop_gate_log(base - dt.timedelta(days=1), handle.name)
+    os.unlink(handle.name)
+    assert (stops, unchecked) == (1, 0) and counts["review reviewer"] == 1
 
     assert snapshot_delta({"stops": 10, "date": "2026-09-11"},
                           {"stops": 4, "date": "2026-09-18"}) == ["stops: 10 -> 4 (-6)"]
