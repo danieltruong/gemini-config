@@ -9,7 +9,8 @@ usage: agy-audit.sh [--days N]
   --days N   how far back to look (default: 7)
   --help     show this help
 
-Reads ~/.gemini/tmp/stop_gate.log, ~/.gemini/tmp/denials and the agy cli.log.
+Reads ~/.gemini/tmp/denials and the agy cli.log.
+Stop-gate decisions belong to agy-audit.py, the only reader of stop_gate.log.
 Always exits 0; it reports, it does not judge.
 EOF
 }
@@ -48,43 +49,6 @@ def counted(rows, limit=None):
 
 
 print(f"agy audit - last {days} days (since {cutoff:%Y-%m-%d})")
-
-kinds, verifiers, seen, verified = collections.Counter(), collections.Counter(), set(), set()
-log = os.path.join(root, "tmp", "stop_gate.log")
-try:
-    lines = open(log, encoding="utf-8", errors="replace").read().splitlines()
-except OSError:
-    lines = []
-for line in lines:
-    parts = line.split(" ", 3)
-    if len(parts) < 3:
-        continue
-    stamp, project, kind = parts[0], parts[1], parts[2]
-    detail = parts[3] if len(parts) > 3 else ""
-    try:
-        when = datetime.datetime.strptime(stamp, "%Y-%m-%dT%H:%M:%S")
-    except ValueError:
-        continue
-    if when < cutoff:
-        continue
-    kinds[kind] += 1
-    for ws in project.split(","):
-        if ws and ws != "-":
-            seen.add(ws)
-            if kind == "verifier":
-                verified.add(ws)
-    if kind == "verifier":
-        verifiers[detail] += 1
-
-head("stop gate decisions")
-counted(kinds.most_common())
-
-head("verifiers that failed a stop")
-counted(verifiers.most_common())
-
-head("workspaces the gate never ran a verifier in")
-missing = sorted(seen - verified)
-print("\n".join(f"  {w}" for w in missing) if missing else "  none")
 
 head("denied tool calls still counted against a session")
 denials = collections.Counter()

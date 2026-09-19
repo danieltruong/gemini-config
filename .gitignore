@@ -10,3 +10,4 @@ mcp_config.secrets.json
 tmp/
 backups/
 mcp_config.local.json
+.claude/
