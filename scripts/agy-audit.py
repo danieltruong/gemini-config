@@ -31,8 +31,8 @@ import urllib.parse
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir, "hooks"))
 # one transcript parser for the hooks and this script
-from transcript import (EDIT_TOOLS, RUN_TOOLS, VERIFIERS, executed_text,  # noqa: E402
-                        read_transcript, result_failed)
+from transcript import (EDIT_TOOLS, RUN_TOOLS, executed_text,  # noqa: E402
+                        read_transcript, result_failed, verifier_of)
 
 DEFAULT_ROOT = os.path.join(os.path.expanduser("~"), ".gemini", "antigravity-cli")
 STOP_GATE_LOG = os.path.join(os.path.expanduser("~"), ".gemini", "tmp", "stop_gate.log")
@@ -60,8 +60,7 @@ BIG_MODEL = re.compile(r"(?i)(pro|opus|sonnet|thinking|-high\b)")
 # the goalposts, so every such edit is listed by conversation and step.
 GATE_FILE = re.compile(
     r"(?i)(?:(?:^|[\\/])(?:test_[^\\/]*\.py|[^\\/]*_test\.py|audit_project\.py"
-    r"|verify\.cmd|verify\.ps1)$"
-    r"|[\\/]\.agents[\\/]audit\.json$"
+    r"|verify\.cmd|verify\.ps1|verify\.sh)$"
     r"|(?:^|[\\/])hooks[\\/])")
 GIT_DIFF = re.compile(r"(?i)\bgit\b[^\n|;&]*\bdiff\b")
 COMPACTION_STEP = "CHECKPOINT"
@@ -79,8 +78,12 @@ CORRECTION_WORDS = re.compile(
 # real ones on this data root). Only these are trusted: steps.error_details,
 # transcript status ERROR, db step status 7, and what transcript.result_failed reads.
 DB_STATUS_ERROR = 7
-STOP_GATE_KINDS = ("stop", "skip", "release", "pending", "no-verifier", "no-reviewer",
-                   "verifier", "docs", "audit", "leftovers", "allow", "deny", "block")
+# every kind stop_gate.py logs; anything else in the log is not a gate decision
+STOP_GATE_KINDS = ("stop", "skip", "release", "pending", "no-transcript", "no-verifier",
+                   "no-reviewer", "no-visual", "verifier", "docs", "leftovers", "trust",
+                   "unresolved")
+# detail of a legacy line always opens with one of these, so the word before it is the kind
+LEGACY_DETAIL = re.compile(r"(\S+)\s+((?:execution|reason)=.*)$")
 PRINTABLE_RUN = re.compile(rb"[\x20-\x7e]{10,}")
 TOOL_HEADER = re.compile(
     r"^Created At: (\S+)\nCompleted At: (\S+)\n?", re.MULTILINE)
@@ -509,8 +512,8 @@ def audit_conversation(root, cid, summary, since):
                            f"{args.get('ToolName') or '?'}")
                 rec["mcp_calls"][mcp_key] += 1
             ran = executed_text(name, args) if name in RUN_TOOLS else ""
-            verifier_label = next(
-                (label for label, pattern in VERIFIERS if pattern.search(ran)), "")
+            # labels None: the audit has no workspace verifier choice, any known one counts
+            verifier_label = verifier_of(name, args, None)
             pending.append({"name": name, "mcp": mcp_key, "verifier": verifier_label,
                             "git_diff": bool(ran and GIT_DIFF.search(ran))})
             signature = retry_signature(name, args)
@@ -608,16 +611,16 @@ def parse_stop_line(line):
         when = parse_time(fields[0])
         return (when, fields[1], fields[3]) if when else None
     # gate format before 2026-09-18: "<stamp> <workspace> <kind> <detail>", and a
-    # workspace path can hold spaces ("Birth Battle"), so the kind is found by keyword
+    # workspace path can hold spaces ("Birth Battle"), so the kind is the word before
+    # the detail, which always started with execution= or reason=
     stamp, _, rest = line.strip().partition(" ")
     when = parse_time(stamp)
     if not when:
         return None
-    words = rest.split()
-    kind = next((w for w in words if w in STOP_GATE_KINDS), "")
-    if not kind:
+    match = LEGACY_DETAIL.search(rest)
+    if not match or match.group(1) not in STOP_GATE_KINDS:
         return when, "", rest
-    return when, kind, " ".join(words[words.index(kind) + 1:])
+    return when, match.group(1), match.group(2)
 
 
 def unchecked_stop(kind, detail):
@@ -1060,10 +1063,12 @@ def self_check():
 
     assert executed_text("run_command", {"CommandLine": "pytest -q"}) == "pytest -q"
     assert executed_text("view_file", {"AbsolutePath": "test_x.py"}) == ""
-    assert any(p.search(executed_text("run_command", {"CommandLine": "pytest -q"}))
-               for _l, p in VERIFIERS)
-    # reading a test file must not count as running a verifier
+    assert verifier_of("run_command", {"CommandLine": "pytest -q"}, None) == "python -m pytest"
+    # reading a test file, printing the command or collecting tests is not a verifier run
     assert executed_text("view_file", {"AbsolutePath": "tests/test_x.py"}) == ""
+    assert verifier_of("view_file", {"AbsolutePath": "tests/test_x.py"}, None) == ""
+    assert verifier_of("run_command", {"CommandLine": "echo pytest"}, None) == ""
+    assert verifier_of("run_command", {"CommandLine": "pytest --collect-only"}, None) == ""
 
     assert [s["TypeName"] for s in subagent_specs(
         {"Subagents": [{"TypeName": "reviewer", "Model": "pro"}]})] == ["reviewer"]
@@ -1071,7 +1076,7 @@ def self_check():
 
     for path in ("F:/proj/tests/test_gameplay.py", "hooks/stop_gate.py",
                  "C:\\r\\hooks\\tests\\test_hooks.py", "x/audit_project.py",
-                 "F:/p/.agents/audit.json", "F:/p/.agents/verify.cmd",
+                 "F:/p/.agents/verify.cmd", "F:/p/.agents/verify.sh",
                  "F:/p/.agents/verify.ps1", "pkg/parser_test.py"):
         assert GATE_FILE.search(path), path
     for path in ("game/bb/bb_birth_loop.rpy", "docs/testing.md", "latest.json",
@@ -1097,13 +1102,15 @@ def self_check():
     assert unchecked_stop(*parse_stop_line(
         "2026-09-18T00:32:09\tskip\t-\treason='ERROR' idle=True")[1:])
 
-    # older lines hold the workspace before the kind, so only keyword parsing finds it
+    # older lines hold the workspace before the kind, and a path can hold spaces, so the
+    # kind is the word in front of the execution=/reason= detail
     when, kind, detail = parse_stop_line(
         "2026-09-18T00:33:41 F:/Factory/renpy/Birth Battle stop execution=0")
     assert (kind, detail) == ("stop", "execution=0") and when.day == 18
+    # an old line with no such detail cannot be attributed to a kind
     assert parse_stop_line(
         "2026-09-18T00:33:41 F:/Factory/renpy/Birth Battle verifier .agents/verify.cmd"
-    )[1:] == ("verifier", ".agents/verify.cmd")
+    )[1] == ""
     assert parse_stop_line("not a log line") is None
     skipped_stop = parse_stop_line("2026-09-18T00:32:09 - stop reason='NO_TOOL_CALL' idle=False")
     assert unchecked_stop(*skipped_stop[1:])

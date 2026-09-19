@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Reads an Antigravity transcript: what a conversation edited, verified and reviewed.
+"""Reads an Antigravity transcript: what a conversation changed, verified and reviewed.
 
 One parser for the hooks and for scripts/agy-audit.py.
 """
@@ -8,34 +8,42 @@ import json
 import os
 import re
 
-# what a run-style call executed, matched against the things that decide whether work passed
-VERIFIERS = (
-    ("verify.cmd", re.compile(r"(?i)verify\.cmd")),
-    ("verify.ps1", re.compile(r"(?i)verify\.ps1")),
-    ("verify.sh", re.compile(r"(?i)verify\.sh")),
-    ("audit_project.py", re.compile(r"(?i)audit_project\.py")),
-    ("renpy lint", re.compile(r"(?i)renpy(\.exe)?[^\n]{0,40}lint|renpy_run_lint")),
-    ("pytest", re.compile(r"(?i)\bpytest\b")),
-    ("npm test", re.compile(r"(?i)\bnpm\s+(?:run\s+)?(?:lint|test)\b")),
-    ("cargo test", re.compile(r"(?i)\bcargo\s+test\b")),
-    ("go test", re.compile(r"(?i)\bgo\s+(test|vet)\b")),
-    ("dotnet test", re.compile(r"(?i)\bdotnet\s+test\b")),
-    ("simulate_birth.py", re.compile(r"(?i)simulate_birth\.py")),
-    ("test_*.py", re.compile(r"(?i)\btest_[a-z0-9_]+\.py")),
-)
 EDIT_TOOLS = {"replace_file_content", "write_to_file", "multi_replace_file_content",
               "sed_file", "edit_file", "create_file"}
 # only these actually execute something, so only these can be a verifier run
 RUN_TOOLS = {"run_command", "call_mcp_tool"}
-# the agent's own answers to the gate, not work the gate should judge
-SCRATCH_FILES = {".agents/audit.json", ".agents/DECISIONS.md"}
-PATH_KEYS = ("TargetFile", "AbsolutePath")
-RESULT_TYPE = "GENERIC"
 SPAWN_TOOL = "invoke_subagent"
-REVIEWER = re.compile(r"(?i)review")
+# delegation that judges work instead of changing it
+JUDGE_TYPES = {"reviewer", "visual-qa"}
+# the agent's own answer to the gate, not work the gate should judge
+SCRATCH_FILES = {".agents/DECISIONS.md"}
+PATH_KEYS = ("TargetFile", "AbsolutePath")
+# every tool result is a step of this type; the other types are messages and checkpoints
+RESULT_TYPE = "GENERIC"
 FULL_TRANSCRIPT = "transcript_full.jsonl"
 GENERATED_DIR = ".system_generated"
 SUBAGENT_RECORDS = os.path.join("*", GENERATED_DIR, "subagents")
+
+# the label stop_gate.verifier_steps picked for a workspace -> what it looks like once run
+VERIFIER_COMMANDS = (
+    (".agents/verify", re.compile(r"(?i)verify\.(?:cmd|ps1|sh)\b")),
+    ("renpy lint", re.compile(r"(?i)renpy(?:\.exe)?[^\n]{0,60}\blint\b|renpy_run_lint")),
+    ("npm", re.compile(r"(?i)\bnpm\s+(?:run\s+)?(?:lint|test)\b")),
+    ("python -m pytest", re.compile(r"(?i)\bpytest\b")),
+    ("cargo test", re.compile(r"(?i)\bcargo\s+test\b")),
+    ("go ", re.compile(r"(?i)\bgo\s+(?:vet|test)\b")),
+    ("dotnet test", re.compile(r"(?i)\bdotnet\s+test\b")),
+)
+# a command that only prints or searches for the verifier has not run it
+QUOTING = re.compile(r"(?i)^\s*(?:echo|printf|cat|type|less|more|head|tail|grep|rg|findstr"
+                     r"|git\s+(?:log|grep|show|diff))\b")
+INSPECT_ONLY = re.compile(r"(?i)--collect-only|--co\b|--help\b|--version\b|--dry-run\b|\s-h\b")
+# commands that write files without going through an edit tool
+REDIRECT = re.compile(r"(?:^|\s)\d?>>?\s*(?!&)(?!/dev/null\b)(?!nul\b)[^\s&]")
+WRITE_COMMAND = re.compile(
+    r"(?i)\|\s*tee\b|\bsed\s+-i\b|\bgit\s+(?:apply|checkout|restore|stash\s+pop)\b"
+    r"|\bpython\d?(?:\.exe)?\s+-c\b[^\n]*open\([^\n]*['\"][wax]"
+    r"|\bSet-Content\b|\bAdd-Content\b|\bOut-File\b|\bCopy-Item\b|\bMove-Item\b")
 
 EXIT_CODE = re.compile(r'"exit_code"\s*:\s*(-?\d+)')
 # run_command reports its status as prose at the head of the result, not as JSON;
@@ -50,6 +58,18 @@ def norm(path):
     return os.path.normcase(path).replace("\\", "/")
 
 
+def under(path, root):
+    """Is path inside root? Both are compared as absolute, case-folded paths."""
+    if not path or not root:
+        return False
+    try:
+        target = norm(os.path.abspath(path)).rstrip("/") + "/"
+        parent = norm(os.path.abspath(root)).rstrip("/") + "/"
+    except (OSError, ValueError):
+        return False
+    return target.startswith(parent)
+
+
 def read_transcript(path):
     """Parse one transcript JSONL. Returns (steps, bad_line_count)."""
     steps, bad = [], 0
@@ -61,8 +81,11 @@ def read_transcript(path):
                 steps.append(json.loads(line))
             except ValueError:
                 bad += 1
-    steps.sort(key=lambda s: s.get("step_index", 0))
-    return steps, bad
+    # agy appends a tool result before the step that called the tool, so file order is
+    # not conversation order; step_index is, even though it has holes
+    ordered = sorted(enumerate(steps), key=lambda pair: (pair[1].get("step_index", pair[0]),
+                                                        pair[0]))
+    return [step for _position, step in ordered], bad
 
 
 def full_path(path):
@@ -72,11 +95,11 @@ def full_path(path):
 
 
 def load(path):
-    """Steps of a transcript, or None when there is none to read, so git can decide instead."""
+    """Steps of a transcript, or None when it cannot be read or holds nothing usable."""
     if not path:
         return None
     try:
-        steps, _bad = read_transcript(full_path(os.path.expanduser(path)))
+        steps, _bad = read_transcript(full_path(path))
     except OSError:
         return None
     return steps or None
@@ -91,25 +114,18 @@ def brain_root(path):
     return os.path.dirname(os.path.dirname(generated))
 
 
-def subagent_type(cid, root):
-    """Type name when this conversation is some parent's subagent, else None.
+def is_subagent(cid, root):
+    """Was this conversation spawned by another one?
 
-    The record's state field stays ALIVE after the subagent finishes, so only its existence counts.
+    The record's state field stays ALIVE after the subagent finishes, so only existence counts.
     """
     if not cid or not root:
-        return None
-    for path in glob.glob(os.path.join(root, SUBAGENT_RECORDS, f"{cid}.json")):
-        try:
-            with open(path, encoding="utf-8") as handle:
-                data = json.load(handle)
-        except (OSError, ValueError):
-            continue
-        return str((data.get("subagentDescriptor") or {}).get("typeName") or "") or "subagent"
-    return None
+        return False
+    return bool(glob.glob(os.path.join(root, SUBAGENT_RECORDS, f"{cid}.json")))
 
 
 def unwrap(value):
-    """Transcript tool args are JSON-encoded strings: '"C:\\\\a\\\\b.rpy"' -> 'C:\\a\\b.rpy'."""
+    """Tool args arrive plain or JSON-encoded: '"C:\\\\a\\\\b.rpy"' -> 'C:\\a\\b.rpy'."""
     if isinstance(value, str):
         try:
             value = json.loads(value)
@@ -149,10 +165,39 @@ def executed_text(name, args):
     return ""
 
 
-def verifier_label(name, args):
-    """Which verifier a tool call ran, or '' when it ran none."""
-    ran = executed_text(name, args) if name in RUN_TOOLS else ""
-    return next((label for label, pattern in VERIFIERS if pattern.search(ran)), "") if ran else ""
+def calls(steps):
+    """(step index, tool name, args, result step or None) for every call in the transcript.
+
+    agy leaves gaps in step_index, so calls pair with results by position: the k-th call
+    of a step takes the k-th result step that follows it, before the next step that calls
+    anything. Injected messages and checkpoints sit in between, and a call whose result
+    never arrived gets None rather than the next call's answer.
+    """
+    out = []
+    steps = steps or []
+    callers = [i for i, step in enumerate(steps) if step.get("tool_calls")]
+    for n, i in enumerate(callers):
+        end = callers[n + 1] if n + 1 < len(callers) else len(steps)
+        answers = [steps[j] for j in range(i + 1, end)
+                   if steps[j].get("type") == RESULT_TYPE]
+        for k, call in enumerate(steps[i].get("tool_calls") or []):
+            out.append((steps[i].get("step_index", i), call.get("name") or "",
+                        call.get("args") or {}, answers[k] if k < len(answers) else None))
+    return out
+
+
+def result_ok(name, result):
+    """True only when the result says the call succeeded; unknown counts as not succeeded."""
+    if not isinstance(result, dict) or result.get("status") == "ERROR":
+        return False
+    body = strip_header(result.get("content"))
+    if result_failed(body):
+        return False
+    if name == "run_command":
+        # a backgrounded or truncated run never reports its code, so it proves nothing
+        exited = COMMAND_EXIT.match(body)
+        return bool(exited) and int(exited.group(1)) == 0
+    return True
 
 
 def targets(args):
@@ -165,54 +210,103 @@ def targets(args):
     return out
 
 
-def edits(steps, workspace, outside=()):
-    """{workspace-relative path: last step index that wrote it}, artifact writes left out."""
+def edits(calls_made, workspace, outside=()):
+    """{workspace-relative path: (first step index, last step index)} for one workspace."""
     root = norm(os.path.abspath(workspace)).rstrip("/") + "/"
-    blocked = tuple(norm(os.path.abspath(p)).rstrip("/") + "/" for p in outside if p)
     out = {}
-    for step in steps or ():
-        index = step.get("step_index", 0)
-        for call in step.get("tool_calls") or []:
-            if (call.get("name") or "") not in EDIT_TOOLS:
+    for index, name, args, _result in calls_made or ():
+        if name not in EDIT_TOOLS:
+            continue
+        for path in targets(args):
+            if not norm(path).startswith(root) or any(under(path, p) for p in outside if p):
                 continue
-            for path in targets(call.get("args") or {}):
-                low = norm(path)
-                if not low.startswith(root) or any(low.startswith(b) for b in blocked):
-                    continue
-                rel = path[len(root):]
-                if rel not in SCRATCH_FILES:
-                    out[rel] = index
+            rel = path[len(root):]
+            if rel in SCRATCH_FILES:
+                continue
+            first, last = out.get(rel, (index, index))
+            out[rel] = (min(first, index), max(last, index))
     return out
 
 
-def verifier_runs(steps):
-    """[(step index, whether it passed)] for every verifier this conversation ran.
+def spec_list(args):
+    """The subagent specs an invoke_subagent call carried."""
+    specs = args.get("Subagents")
+    return [s for s in specs if isinstance(s, dict)] if isinstance(specs, list) else []
 
-    Each tool call is answered by the next result step, so the calls queue in order.
+
+def opaque_changes(calls_made, spaces=()):
+    """Step indexes of changes the transcript cannot attribute to a file.
+
+    Delegated work and shell writes change the tree without an edit tool, so the gate
+    can see that something changed but not what.
     """
-    out, pending = [], []
-    for step in steps or ():
-        if step.get("type") == RESULT_TYPE and pending:
-            index, label = pending.pop(0)
-            if label:
-                body = strip_header(step.get("content"))
-                out.append((index, not result_failed(body) and step.get("status") != "ERROR"))
-        for call in step.get("tool_calls") or []:
-            pending.append((step.get("step_index", 0),
-                            verifier_label(call.get("name") or "", call.get("args") or {})))
+    out = []
+    for index, name, args, _result in calls_made or ():
+        if name == SPAWN_TOOL:
+            if any(str(spec.get("TypeName") or "").strip() not in JUDGE_TYPES
+                   for spec in spec_list(args)):
+                out.append(index)
+        elif name == "run_command":
+            text = str(args.get("CommandLine") or "")
+            cwd = unwrap(args.get("Cwd"))
+            if (REDIRECT.search(text) or WRITE_COMMAND.search(text)) and (
+                    not spaces or any(under(cwd, ws) for ws in spaces)):
+                out.append(index)
     return out
 
 
-def reviewer_spawns(steps):
-    """Step indexes where this conversation spawned a reviewer subagent."""
+def verifier_patterns(labels):
+    """(label, pattern) for the verifiers a workspace picked; labels None means any known one."""
+    if labels is None:
+        return VERIFIER_COMMANDS
     out = []
-    for step in steps or ():
-        for call in step.get("tool_calls") or []:
-            if (call.get("name") or "") != SPAWN_TOOL:
-                continue
-            specs = (call.get("args") or {}).get("Subagents")
-            for spec in specs if isinstance(specs, list) else ():
-                if isinstance(spec, dict) and REVIEWER.search(
-                        f"{spec.get('TypeName') or ''} {spec.get('Role') or ''}"):
-                    out.append(step.get("step_index", 0))
+    for label in labels:
+        found = next((p for prefix, p in VERIFIER_COMMANDS if label.startswith(prefix)), None)
+        if found:
+            out.append((label, found))
+    return out
+
+
+def ran_in(name, args, workspace):
+    """Did this call run against the given workspace?"""
+    if not workspace:
+        return True
+    if name == "run_command":
+        return under(unwrap(args.get("Cwd")), workspace)
+    # an MCP verifier names the project it checks in one of its arguments
+    return any(under(unwrap(value), workspace) for value in args.values()
+               if isinstance(value, str))
+
+
+def verifier_of(name, args, labels, workspace=""):
+    """The verifier label this call ran, or '' when it ran none for this workspace."""
+    if name not in RUN_TOOLS:
+        return ""
+    text = executed_text(name, args)
+    if not text or QUOTING.match(text) or INSPECT_ONLY.search(text):
+        return ""
+    label = next((lab for lab, pattern in verifier_patterns(labels) if pattern.search(text)), "")
+    return label if label and ran_in(name, args, workspace) else ""
+
+
+def verifier_runs(calls_made, labels, workspace=""):
+    """[(step index, whether it passed)] for every run of this workspace's own verifier."""
+    out = []
+    for index, name, args, result in calls_made or ():
+        if verifier_of(name, args, labels, workspace):
+            out.append((index, result_ok(name, result)))
+    return out
+
+
+def spawns(calls_made, type_name):
+    """Step indexes where a subagent of exactly this type was spawned, briefed and answered."""
+    out = []
+    for index, name, args, result in calls_made or ():
+        if name != SPAWN_TOOL or not result_ok(name, result):
+            continue
+        for spec in spec_list(args):
+            if (str(spec.get("TypeName") or "").strip() == type_name
+                    and str(spec.get("Prompt") or "").strip()):
+                out.append(index)
+                break
     return out

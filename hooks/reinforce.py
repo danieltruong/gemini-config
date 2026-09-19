@@ -4,7 +4,6 @@ import json
 import sys
 
 import hookpaths
-import transcript
 
 
 BANNER = (
@@ -15,29 +14,26 @@ BANNER = (
 )
 
 PENDING_NOTE = (
-    "Verification and review are still pending in {ws}: the run before this one ended in an "
-    "error after editing at step {step}. Run the verifier and a reviewer before you finish."
+    "Work in {ws} is still unverified from an earlier run:\n{notes}\n"
+    "Deal with it before you finish."
 )
 
 
 def pending_note(ev):
-    """One line about edits a crashed run left unverified, said once per workspace."""
-    steps, note = None, ""
+    """One line per workspace whose last run left a gap, said once per conversation.
+
+    Only the stop gate clears a marker, because only it can read the evidence.
+    """
+    cid = ev.get("conversationId") or ""
+    notes = []
     for ws in ev.get("workspacePaths") or []:
         marker = hookpaths.read_pending(ws)
-        if not marker:
+        if not marker or cid in (marker.get("said") or []):
             continue
-        if steps is None:
-            steps = transcript.load(ev.get("transcriptPath")) or []
-        if any(ok for _index, ok in transcript.verifier_runs(steps)):
-            hookpaths.clear_pending(ws)
-            continue
-        if marker.get("said"):
-            continue
-        marker["said"] = True
-        hookpaths.write_pending(ws, marker)
-        note = PENDING_NOTE.format(ws=ws, step=marker.get("step"))
-    return note
+        hookpaths.mark_said(ws, marker, cid)
+        lines = "\n".join(f"- {n}" for n in marker.get("notes") or [])
+        notes.append(PENDING_NOTE.format(ws=ws, notes=lines))
+    return "\n".join(notes)
 
 
 def main():

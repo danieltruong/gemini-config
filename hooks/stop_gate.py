@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Stop hook: blocks finishing until the transcript proves the changed code was verified."""
+import collections
 import glob
 import json
 import os
@@ -17,14 +18,15 @@ LINT_TIMEOUT = 120
 # one budget for the whole gate: every lint, verifier and docs run across every workspace
 GATE_BUDGET = 800
 MIN_STEP = 5
-# one forced continue per conversation, counted by agy's 0-based executionNum
-MAX_EXECUTIONS = 1
+# forced continues per conversation, counted separately for each kind of gap
+MAX_RETRIES = 1
+EVIDENCE_RETRY = "evidence"
+CHECK_RETRY = "checks"
 MAX_REPORTED = 40
 VISUAL_REL = ".agents/visual.md"
 # agy 1.2.6 sends "NO_TOOL_CALL" here; "model_stop" is only in the docs. Every other
 # reason (ERROR, USER_CANCELED, MAX_*) means the agent did not choose to finish.
 MODEL_FINISHED = {"model_stop", "NO_TOOL_CALL"}
-ERRORED = {"error", "ERROR"}
 VERIFY_SCRIPTS = ("verify.cmd", "verify.ps1", "verify.sh")
 PYTEST_MARKERS = ("pyproject.toml", "pytest.ini", "setup.cfg")
 RENPY_LABEL = "renpy lint"
@@ -43,38 +45,31 @@ IS_WINDOWS = os.name == "nt"
 SDK_EXE = "renpy.exe" if IS_WINDOWS else "renpy.sh"
 
 VERIFIER_REASON = (
-    "Blocked: no passing verifier run after your last edit (step {step}). "
+    "Blocked: no passing verifier run after your last change (step {step}). "
     "Run {cmds}, fix what it reports, then finish."
 )
 
 REVIEWER_REASON = (
-    "Blocked: no reviewer spawned after your last edit (step {step}). "
-    "invoke_subagent with TypeName reviewer on `git diff HEAD` in {ws}, "
-    "fix its findings, then finish."
+    "Blocked: {why}. invoke_subagent with TypeName reviewer and a real Prompt on "
+    "`git diff HEAD` in {ws}, fix its findings, then finish."
 )
 
-VISUAL_REASON = (
-    "Also {rel}: open_browser_url then capture_browser_screenshot every URL under "
-    "## Pages, fix anything that fails a bullet under ## Accept."
+VISUAL_QA_REASON = (
+    "Blocked: no visual-qa subagent after your last change (step {step}). "
+    "invoke_subagent with TypeName visual-qa and a real Prompt on the URLs in {rel} "
+    "in {ws}, fix what fails ## Accept, then finish."
+)
+
+NO_TRANSCRIPT_REASON = (
+    "Blocked: the gate could not read this conversation's transcript ({path}), so nothing "
+    "proves the work was checked. Run the verifier and a reviewer, then finish."
 )
 
 HUMAN_NOTE = "Stop allowed after one forced retry, still unmet: {summary}"
 
-
-def windows_path(p):
-    """agy started from Git Bash sends MSYS paths, which Windows Python cannot open."""
-    if not IS_WINDOWS or not p.startswith("/"):
-        return p
-    cygpath = shutil.which("cygpath")
-    if cygpath:
-        try:
-            proc = subprocess.run([cygpath, "-w", p], capture_output=True, text=True, timeout=10)
-            if proc.returncode == 0 and proc.stdout.strip():
-                return proc.stdout.strip().replace("\\", "/")
-        except Exception:
-            pass
-    m = re.match(r"^/([a-zA-Z])(/.*)?$", p)
-    return f"{m.group(1).upper()}:{m.group(2) or '/'}" if m else p
+# what the transcript says this conversation changed: the step span, the files each
+# workspace saw, and the steps whose changes cannot be tied to a file
+Changes = collections.namedtuple("Changes", "first last files opaque spaces unknown")
 
 
 def remaining(deadline):
@@ -134,11 +129,13 @@ def changed_files(project):
         return None
 
 
-def session_files(steps, project):
-    """What this session wrote under project. None means unknown, so nothing gets filtered out."""
-    touched = set(transcript.edits(steps, project)) if steps else None
-    files = changed_files(project) if touched is None else touched
-    return files if files is None else files - transcript.SCRATCH_FILES
+def session_files(ch, ws):
+    """What this session changed under ws. None means unknown, so nothing gets filtered out."""
+    files = set(ch.files.get(ws) or ())
+    if not files and (ch.unknown or ch.opaque):
+        # delegated work and shell writes name no files, so git is the only witness
+        return changed_files(ws)
+    return files
 
 
 def read_json(path):
@@ -257,17 +254,16 @@ def verifier_steps(ws):
     return []
 
 
-def verify(ws, files, deadline):
-    """Run the first verifier that fits this workspace. None when the repo has none."""
-    steps = verifier_steps(ws)
+def verify(ws, files, steps, deadline):
+    """Run the verifier this workspace selected. None when the repo has none."""
     if steps and steps[0][1] is None:
         return renpy_lint(ws, files, deadline)
     return run_steps(ws, steps, deadline)
 
 
-def verifier_hint(ws):
-    """The command the agent is expected to have run here, or '' when the repo has no verifier."""
-    return " then ".join(f"`{label}`" for label, _argv in verifier_steps(ws))
+def verifier_hint(steps):
+    """The command the agent is expected to have run, or '' when the repo has no verifier."""
+    return " then ".join(f"`{label}`" for label, _argv in steps)
 
 
 def docs_findings(ws, files, deadline):
@@ -314,14 +310,14 @@ def leftovers(ws, files):
     return found
 
 
-def survey(spaces, steps, deadline):
+def survey(ch, verifiers, deadline):
     """(verifier failures, doc findings, leftovers) from the checks that run commands."""
     failures, docs, junk = [], [], []
-    for ws in spaces:
-        files = session_files(steps, ws)
+    for ws in ch.spaces:
+        files = session_files(ch, ws)
         if files is not None and not files:
             continue
-        found = verify(ws, files, deadline)
+        found = verify(ws, files, verifiers[ws], deadline)
         if found and found[1] != 0:
             failures.append((found[0], found[2]))
         docs += docs_findings(ws, files, deadline)
@@ -333,7 +329,7 @@ def workspaces(raw_paths):
     """(usable Windows-form paths, paths dropped because they do not resolve)."""
     good, dropped = [], []
     for raw in raw_paths:
-        ws = windows_path(raw)
+        ws = hookpaths.real_path(raw)
         if os.path.isdir(ws):
             good.append(ws)
         else:
@@ -341,40 +337,81 @@ def workspaces(raw_paths):
     return good, dropped
 
 
-def edited(steps, spaces, outside):
-    """{workspace-relative path: last step index that wrote it} across every workspace."""
-    outside = [p for p in outside if p]
-    out = {}
-    for ws in spaces:
-        out.update(transcript.edits(steps, ws, outside))
-    return out
+def changes(spaces, calls, outside, unknown):
+    """Everything this conversation changed, whether or not an edit tool named the file."""
+    files = {ws: transcript.edits(calls, ws, outside) for ws in spaces}
+    opaque = transcript.opaque_changes(calls, spaces)
+    marks = [i for ws in spaces for pair in files[ws].values() for i in pair] + opaque
+    return Changes(min(marks, default=None), max(marks, default=None), files, opaque,
+                   spaces, unknown)
 
 
-def evidence_gap(spaces, files, steps, role):
-    """What the transcript still fails to prove: (log kind, message), or None when it proves it."""
-    if not files:
+def docs_only(ch):
+    """Did this conversation change nothing but instruction docs? ai-docs-lint covers those."""
+    if ch.opaque:
+        return False
+    return all(hookpaths.is_instruction_doc(rel) for ws in ch.spaces for rel in ch.files[ws])
+
+
+def stale_review(ch, reviews):
+    """Why the review no longer covers the tree, or '' when it does."""
+    if not reviews:
+        return f"no reviewer spawned after your first change (step {ch.first})"
+    newest = max(reviews)
+    late = [i for i in ch.opaque if i > newest]
+    if late:
+        return (f"a delegated or shell change at step {max(late)} came after the review at step "
+                f"{newest}, so what was reviewed is not what is in the tree")
+    fresh = sorted(rel for ws in ch.spaces for rel, (first, _last) in ch.files[ws].items()
+                   if first > newest)
+    if fresh:
+        return f"{fresh[0]} was first changed after the review at step {newest}"
+    return ""
+
+
+def verifier_gap(ch, calls, verifiers):
+    """The verifier evidence still missing: (log kind, message), or None."""
+    if any(index > ch.last and ok
+           for ws in ch.spaces
+           for index, ok in transcript.verifier_runs(
+               calls, [label for label, _argv in verifiers[ws]], ws)):
         return None
-    last_edit = max(files.values())
-    if not any(index > last_edit and ok for index, ok in transcript.verifier_runs(steps)):
-        cmds = [f"{hint} in {ws}" for ws, hint in ((w, verifier_hint(w)) for w in spaces) if hint]
-        if cmds:
-            return "no-verifier", VERIFIER_REASON.format(step=last_edit, cmds="; ".join(cmds))
-    # a subagent answers to the run that spawned it, so only a top-level run owes a reviewer
-    code = any(not hookpaths.is_instruction_doc(rel) for rel in files)
-    if role is None and code and not any(i > last_edit for i in transcript.reviewer_spawns(steps)):
-        reason = REVIEWER_REASON.format(step=last_edit, ws=spaces[0] if spaces else ".")
-        if any(os.path.isfile(os.path.join(ws, VISUAL_REL)) for ws in spaces):
-            reason += " " + VISUAL_REASON.format(rel=VISUAL_REL)
-        return "no-reviewer", reason
+    cmds = [f"{verifier_hint(verifiers[ws])} in {ws}" for ws in ch.spaces if verifiers[ws]]
+    if not cmds:
+        return None
+    return "no-verifier", VERIFIER_REASON.format(step=ch.last, cmds="; ".join(cmds))
+
+
+def review_gap(ch, calls):
+    """The review a top-level run still owes: (log kind, message), or None."""
+    ws = ch.spaces[0] if ch.spaces else "."
+    # a review must cover every change, so it counts from the first one, and later work
+    # may only touch files that review already saw
+    why = stale_review(ch, [i for i in transcript.spawns(calls, "reviewer") if i > ch.first])
+    if why:
+        return "no-reviewer", REVIEWER_REASON.format(why=why, ws=ws)
+    specs = [w for w in ch.spaces if os.path.isfile(os.path.join(w, VISUAL_REL))]
+    if specs and not any(i > ch.last for i in transcript.spawns(calls, "visual-qa")):
+        return "no-visual", VISUAL_QA_REASON.format(step=ch.last, rel=VISUAL_REL, ws=specs[0])
     return None
 
 
-def mark_pending(spaces, files, cid):
-    """Remember unverified edits a crashed run left, for the next invocation to announce."""
-    step = max(files.values())
-    for ws in spaces:
-        hookpaths.write_pending(ws, {"workspace": ws, "step": step, "conversation": cid,
-                                     "when": time.strftime("%Y-%m-%dT%H:%M:%S")})
+def gap_of(ch, calls, verifiers, subagent):
+    """The first piece of missing evidence, or None when the transcript proves the work."""
+    if ch.last is None or docs_only(ch):
+        return None
+    # a subagent answers to the run that spawned it, so only a top-level run owes a review
+    return verifier_gap(ch, calls, verifiers) or (None if subagent else review_gap(ch, calls))
+
+
+def changed_spaces(ch):
+    """Workspaces this conversation actually changed."""
+    return [ws for ws in ch.spaces if ch.files[ws] or ch.opaque or ch.unknown]
+
+
+def mark_pending(ch, note):
+    for ws in changed_spaces(ch):
+        hookpaths.write_pending(ws, [note])
 
 
 def decide(ev, deadline):
@@ -382,34 +419,44 @@ def decide(ev, deadline):
     spaces, dropped = workspaces(ev.get("workspacePaths") or [])
     if dropped:
         log(",".join(dropped), "unresolved", "workspace path dropped")
-    brain = transcript.brain_root(ev.get("transcriptPath"))
-    steps = transcript.load(ev.get("transcriptPath"))
-    role = transcript.subagent_type(ev.get("conversationId"), brain)
-    files = edited(steps, spaces, (ev.get("artifactDirectoryPath"), brain))
-    gap = evidence_gap(spaces, files, steps, role)
-    reason = ev.get("terminationReason")
-    execution_num = ev.get("executionNum", 0)
+    tpath = hookpaths.real_path(ev.get("transcriptPath") or "")
+    artifact = hookpaths.real_path(ev.get("artifactDirectoryPath") or "")
+    brain = transcript.brain_root(tpath)
+    cid = ev.get("conversationId") or ""
+    steps = transcript.load(tpath)
+    subagent = transcript.is_subagent(cid, brain)
+    verifiers = {ws: verifier_steps(ws) for ws in spaces}
+    calls = transcript.calls(steps)
+    ch = changes(spaces, calls, (artifact, brain), steps is None)
+    finished = ev.get("terminationReason") in MODEL_FINISHED
 
-    if reason not in MODEL_FINISHED:
-        if gap and reason in ERRORED:
-            mark_pending(spaces, files, ev.get("conversationId") or "")
-            return {"decision": "stop"}, "pending", f"{gap[0]} step {max(files.values())}", spaces
-        return ({"decision": "stop"}, "skip",
-                f"reason={reason!r} idle={ev.get('fullyIdle')!r}", spaces)
+    if tpath and steps is None:
+        # a transcript the gate cannot read is missing evidence, not evidence of nothing to do
+        gap = ("no-transcript", NO_TRANSCRIPT_REASON.format(path=tpath))
+    else:
+        gap = gap_of(ch, calls, verifiers, subagent)
 
     if gap:
         kind, message = gap
-        detail = f"{'subagent ' + role if role else 'top-level'} step {max(files.values())}"
-        if execution_num < MAX_EXECUTIONS:
+        detail = f"{'subagent' if subagent else 'top-level'} step {ch.last}"
+        if finished and hookpaths.take_retry(cid, EVIDENCE_RETRY, MAX_RETRIES):
             return {"decision": "continue", "reason": message}, kind, detail, spaces
+        mark_pending(ch, message)
+        if not finished:
+            return ({"decision": "stop"}, "pending",
+                    f"{kind} reason={ev.get('terminationReason')!r}", spaces)
         return ({"decision": "stop", "reason": HUMAN_NOTE.format(summary=message)},
                 "release", f"{kind} {detail}", spaces)
+
+    if not finished:
+        return ({"decision": "stop"}, "skip",
+                f"reason={ev.get('terminationReason')!r} idle={ev.get('fullyIdle')!r}", spaces)
 
     # only the checks below run commands of their own, so they wait for the background tasks
     if ev.get("fullyIdle") is False:
         return {"decision": "stop"}, "stop", "background tasks still running", spaces
 
-    failures, docs, junk = survey(spaces, steps, deadline)
+    failures, docs, junk = survey(ch, verifiers, deadline)
     budget = f"{int(max(0, remaining(deadline)))}s of the {GATE_BUDGET}s gate budget left."
     if failures:
         message = "\n".join(
@@ -427,10 +474,13 @@ def decide(ev, deadline):
                    + "\nRemove them, then finish.")
         kind, detail = "leftovers", f"{len(junk)} paths"
     else:
-        return {"decision": "stop"}, "stop", f"execution={execution_num}", spaces
+        for ws in spaces:
+            hookpaths.clear_pending(ws)
+        return {"decision": "stop"}, "stop", "verified", spaces
 
-    if execution_num < MAX_EXECUTIONS:
+    if hookpaths.take_retry(cid, CHECK_RETRY, MAX_RETRIES):
         return {"decision": "continue", "reason": message + "\n" + budget}, kind, detail, spaces
+    mark_pending(ch, f"{kind}: {detail}")
     return ({"decision": "stop", "reason": HUMAN_NOTE.format(summary=f"{kind}: {detail}")},
             "release", f"{kind} {detail}", spaces)
 
@@ -445,7 +495,7 @@ def main():
 
     log(",".join(spaces) or "-", kind, detail)
     if kind == "release":
-        # the stop goes through, so the terminal is the only thing the human still reads
+        # the stop goes through: the terminal and the pending marker both carry the news
         print(result.get("reason", ""), file=sys.stderr)
     json.dump(result, sys.stdout)
 
