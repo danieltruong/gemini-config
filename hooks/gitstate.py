@@ -208,9 +208,10 @@ def note_seen(cid, ws, fp, fallback=False):
     """Record what this workspace looked like when the conversation first reached a hook.
 
     fallback marks a baseline taken at a Stop, where the turn's work has already happened,
-    so the record cannot say what the tree looked like before it.
+    so the record cannot say what the tree looked like before it. With no conversation id the
+    record is keyed on the workspace alone, so the next event still has a floor to compare with.
     """
-    if not cid or fp is None:
+    if fp is None:
         return
     path = record_path(SEEN, ws, cid)
     old = read_record(path)

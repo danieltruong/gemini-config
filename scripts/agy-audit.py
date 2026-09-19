@@ -137,11 +137,11 @@ DB_STATUS_ERROR = 7
 STOP_GATE_KINDS = ("stop", "skip", "release", "pending", "review", "verifier", "docs",
                    "leftovers", "no-review", "no-visual", "untrusted", "no-workspace",
                    "no-transcript", "no-verifier", "no-reviewer", "trust", "unresolved",
-                   "audit")
+                   "lock", "audit")
 # a gate decision that returned before any check ran, whatever kind it logged
 UNCHECKED_KINDS = {"skip", "pending", "unresolved", "no-workspace", "no-transcript"}
-# lines the gate logs beside a decision: a judge's record, a dropped path, a trust note
-BOOKKEEPING_KINDS = {"review", "unresolved", "trust"}
+# lines the gate logs beside a decision: a judge's record, a dropped path, a trust or lock note
+BOOKKEEPING_KINDS = {"review", "unresolved", "trust", "lock"}
 # detail of a legacy line usually opens with one of these, so the word before it is the kind
 LEGACY_DETAIL = re.compile(r"(\S+)\s+((?:execution|reason)=.*)$")
 PRINTABLE_RUN = re.compile(rb"[\x20-\x7e]{10,}")

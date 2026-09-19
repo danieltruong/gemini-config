@@ -37,10 +37,15 @@ PYTEST_LABEL = "python -m pytest -q -x"
 # pytest exits 5 when it collected nothing: that repo has no tests, it has no failure
 NO_TESTS_CODE = 5
 RENPY_LABEL = "renpy lint"
-# one stop runs a workspace's verifier at a time; a lock this old outlived its hook timeout
+# one stop runs a workspace's verifier at a time
 LOCKS = os.path.join(hookpaths.TMP, "locks")
-LOCK_MAX_AGE = 900
+# a lock has to age out well inside one gate budget, or a lock left by a gate agy killed would
+# stall every later stop for its whole budget
+LOCK_MAX_AGE = 120
 LOCK_POLL = 2
+# waiting out another stop is only worth it when enough budget is left to then verify
+LOCK_FLOOR = 60
+LOCK_BUSY_NOTE = "not verified: another stop was running the verifier here"
 # marker files in the workspace root -> the steps that verify it, first match wins
 MARKER_VERIFIERS = (
     (("Cargo.toml",), (("cargo test -q", ["cargo", "test", "-q"]),)),
@@ -280,11 +285,14 @@ def is_junk(rel):
     return PYCACHE in parts or bool(hookpaths.BACKUP_SUFFIX.search(parts[-1]))
 
 
-def touched(ws, cid, fp, worked, edited):
+def touched(ws, cid, fp, worked, edited, blind):
     """Is there work in this workspace the gate has to account for?
 
     Not the same question as "is it verified": a subagent's passing verifier run does not
     excuse the review the parent still owes for the same tree.
+
+    blind means the gate had no record of this workspace before this stop and cannot read the
+    transcript either, so it has nothing to date the dirt with and fails closed on it.
     """
     if fp is None:
         # not a git repository, so an edit tool naming a file here is the only signal left
@@ -293,6 +301,8 @@ def touched(ws, cid, fp, worked, edited):
         return False
     if gitstate.baseline(cid, ws):
         return gitstate.moved(cid, ws, fp)
+    if blind:
+        return bool(work_names(fp.names))
     # only a fallback record: it is still a floor for anything that happened after it, and a
     # work tool call in the transcript is the other half of the answer
     return gitstate.moved(cid, ws, fp) or worked
@@ -309,25 +319,61 @@ def lock_file(ws):
     return os.path.join(LOCKS, hookpaths.ws_key(ws) + ".json")
 
 
-def locked(ws):
-    """Is another stop running this workspace's verifier right now?"""
+def lock_left(ws):
+    """Seconds a foreign lock can still live, or 0 when it is abandoned or unreadable."""
     rec = hookpaths.read_json_file(lock_file(ws)) or {}
     try:
-        age = time.time() - float(rec.get("at") or 0)
+        return max(0.0, LOCK_MAX_AGE - (time.time() - float(rec.get("at") or 0)))
     except (TypeError, ValueError):
-        return False
-    return bool(rec) and age < LOCK_MAX_AGE and rec.get("pid") != os.getpid()
+        return 0.0  # a lock file nobody can read cannot be waited on
+
+
+def claim_lock(ws):
+    """The token this process wrote, or '' when another stop holds a live lock.
+
+    O_EXCL is the claim itself: two stops racing here cannot both create the file.
+    """
+    path = lock_file(ws)
+    token = f"{os.getpid()}:{time.time_ns()}"
+    for _attempt in (1, 2):
+        try:
+            os.makedirs(LOCKS, exist_ok=True)
+            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            if lock_left(ws) > 0:
+                return ""
+            try:
+                os.remove(path)  # older than any hook can run, so its gate is gone
+            except OSError:
+                return ""
+            continue
+        except OSError:
+            return ""
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump({"at": time.time(), "pid": os.getpid(), "token": token}, fh)
+        return token
+    return ""
 
 
 def hold_lock(ws, deadline):
-    """Wait out another stop's verifier run, then claim the workspace. False when out of budget."""
-    while locked(ws) and remaining(deadline) > MIN_STEP:
-        time.sleep(LOCK_POLL)
-    hookpaths.write_json_file(lock_file(ws), {"at": time.time(), "pid": os.getpid()})
-    return True
+    """Claim the verifier lock, waiting out a live one. '' when it is still held.
+
+    The wait is bounded by the lock's own age-out and has to leave budget to verify with.
+    """
+    while True:
+        token = claim_lock(ws)
+        if token:
+            return token
+        left = lock_left(ws)
+        if left <= 0 or remaining(deadline) - left < LOCK_FLOOR:
+            return ""
+        time.sleep(min(LOCK_POLL, left))
 
 
-def drop_lock(ws):
+def drop_lock(ws, token):
+    """Release the lock, but only the one this process wrote."""
+    if not token or (hookpaths.read_json_file(lock_file(ws)) or {}).get("token") != token:
+        return
     try:
         os.remove(lock_file(ws))
     except OSError:
@@ -344,18 +390,26 @@ def verifier_gap(ws, fp, names, deadline):
         log(ws, "trust", "untrusted workspace, verifier not run")
         return "untrusted", UNTRUSTED_REASON.format(ws=ws, cmds=verifier_hint(steps),
                                                     settings=hookpaths.CLI_SETTINGS)
-    hold_lock(ws, deadline)
+    token = hold_lock(ws, deadline)
+    if not token:
+        # another stop is verifying this workspace and there is no budget to wait it out, so
+        # this stop reports no verifier gap and the marker keeps the work on the books
+        log(ws, "lock", "lock busy, verifier not run")
+        hookpaths.write_pending(ws, [LOCK_BUSY_NOTE])
+        return None
     try:
         if cached_pass(ws, fp):
             return None  # a concurrent stop just ran it, and its pass covers this tree
         return run_verifier(ws, fp, names, steps, deadline)
     finally:
-        drop_lock(ws)
+        drop_lock(ws, token)
 
 
 def run_verifier(ws, fp, names, steps, deadline):
     found = verify(ws, names, steps, deadline)
-    if found and found[1] != 0:
+    if found is None:
+        return None  # nothing was verified here, so there is no pass to record either
+    if found[1] != 0:
         return "verifier", VERIFIER_REASON.format(
             label=found[0], ws=ws, lines="\n".join(found[2][-MAX_REPORTED:]))
     after = gitstate.fingerprint(ws) if fp is not None else None
@@ -434,14 +488,10 @@ def workspace_gap(ws, cid, fp, role, outside, deadline):
     return review_gap(ws, fp, ignore)
 
 
-def derived_spaces(calls, outside):
-    """Repository roots the run wrote in, for a stop that carries no workspace of its own.
-
-    An edit tool names its file; a shell write names nothing, so its working directory counts.
-    """
+def repo_roots(dirs):
+    """The repository root of each directory, in order, without repeats."""
     roots, out = {}, []
-    dirs = [os.path.dirname(path) for path in transcript.written_paths(calls, outside)]
-    for parent in dirs + transcript.run_dirs(calls, outside):
+    for parent in dirs:
         if parent not in roots:  # many calls share a directory, and each lookup is a git call
             top = gitstate.toplevel(parent)
             roots[parent] = os.path.abspath(top) if top else ""
@@ -451,7 +501,25 @@ def derived_spaces(calls, outside):
     return out
 
 
-def workspaces(ev, calls, outside):
+def worth_judging(cid, ws):
+    """Is there anything in this derived workspace to judge? A read-only command leaves nothing."""
+    fp = gitstate.fingerprint(ws)
+    return fp is not None and (bool(work_names(fp.names)) or gitstate.moved(cid, ws, fp))
+
+
+def derived_spaces(calls, outside, cid):
+    """Repository roots the run wrote in, for a stop that carries no workspace of its own."""
+    wrote = repo_roots(os.path.dirname(path)
+                       for path in transcript.written_paths(calls, outside))
+    if wrote:
+        return wrote
+    # a shell write names no file, so its working directory is the last pointer left. A
+    # read-only command must not pull an untouched repository into the judged set.
+    return [ws for ws in repo_roots(transcript.run_dirs(calls, outside))
+            if worth_judging(cid, ws)]
+
+
+def workspaces(ev, calls, outside, cid):
     """(workspaces to judge, payload paths dropped because they do not resolve)."""
     good, dropped = [], []
     for raw in ev.get("workspacePaths") or []:
@@ -460,7 +528,7 @@ def workspaces(ev, calls, outside):
             good.append(ws)
         else:
             dropped.append(raw)
-    return (good or derived_spaces(calls, outside)), dropped
+    return (good or derived_spaces(calls, outside, cid)), dropped
 
 
 def clear_markers(cid, spaces, prints):
@@ -513,11 +581,12 @@ def decide(ev, deadline):
     steps = transcript.load(tpath)
     calls = transcript.calls(steps)
     outside = (artifact, brain)
-    spaces, dropped = workspaces(ev, calls, outside)
+    spaces, dropped = workspaces(ev, calls, outside, cid)
     if dropped:
         log(",".join(dropped), "unresolved", "workspace path dropped")
     prints = {ws: gitstate.fingerprint(ws) for ws in spaces}
     role = transcript.subagent_type(cid, brain)
+    known = {ws: bool(gitstate.seen(cid, ws)) for ws in spaces}  # read before the fallback lands
     # reinforce.py takes the baseline at PreInvocation. Reaching a Stop without one means the
     # turn's work has already happened, so the record is marked as the fallback it is.
     for ws in spaces:
@@ -547,7 +616,9 @@ def decide(ev, deadline):
     # have written counts as work in every workspace of this stop. No transcript is not a call.
     worked = transcript.did_work(calls)
     edited = {ws: transcript.edits(calls, ws, outside) for ws in spaces}
-    dirty = [ws for ws in spaces if touched(ws, cid, prints[ws], worked, edited[ws])]
+    dirty = [ws for ws in spaces
+             if touched(ws, cid, prints[ws], worked, edited[ws],
+                        steps is None and not known[ws])]
 
     if not dirty:
         clear_markers(cid, spaces, prints)
@@ -564,7 +635,8 @@ def decide(ev, deadline):
     gap, culprit = first_gap(dirty, lambda ws: workspace_gap(
         ws, cid, prints[ws], role, outside, deadline))
     if not gap:
-        clear_markers(cid, dirty, prints)
+        for ws in dirty:  # every changed workspace came back with nothing missing
+            hookpaths.clear_pending(ws)
         return {"decision": "stop"}, "stop", "verified", spaces
     return answer(gap, culprit, cid, prints[culprit], spaces, deadline,
                   f"{role or 'top-level'} {culprit}",

@@ -654,6 +654,40 @@ class TestChangeDetection(GateCase):
         payload.pop("conversationId")
         self.assertIn(self.NO_REVIEW, self.hook("stop_gate.py", payload)["reason"])
 
+    def blind_stop(self, **kw):
+        """A stop with no record of the workspace and a transcript that is not there."""
+        payload = self.payload(transcriptPath=str(Path(self.tmp) / "gone.jsonl"), **kw)
+        payload.pop("conversationId")
+        return self.hook("stop_gate.py", payload)
+
+    def test_no_record_and_no_readable_transcript_blocks_a_dirty_tree(self):
+        """Nothing to date the dirt with, so the dirt itself is the work."""
+        self.verifier()
+        self.write("app.py", "x = 2\n")
+        self.write("evil.py", "x = 3\n")
+        res = self.blind_stop()
+        self.assertEqual(res.get("decision"), "continue", res)
+        self.assertIn(self.NO_REVIEW, res["reason"])
+        self.assertEqual(self.runs(), 1)
+
+    def test_no_record_and_no_readable_transcript_releases_a_pristine_tree(self):
+        self.verifier()
+        res = self.blind_stop()
+        self.assertEqual(res.get("decision"), "stop", res)
+        self.assertEqual(self.runs(), 0)
+        self.assertEqual(self.markers(), [])
+
+    def test_a_pre_invocation_without_any_id_writes_a_workspace_floor(self):
+        self.verifier()
+        self.hook("reinforce.py", {"invocationNum": 1, "workspacePaths": [self.repo]})
+        records = list((Path(self.tmp) / "seen").glob("*.json"))
+        key = hooks_module("hookpaths").ws_key(self.repo)
+        self.assertEqual([p.name for p in records], [key + ".json"])
+        # the next stop has that floor, so it compares against it instead of failing closed
+        self.assertEqual(self.blind_stop().get("decision"), "stop")
+        self.write("app.py", "x = 2\n")
+        self.assertEqual(self.blind_stop().get("decision"), "continue")
+
     def test_an_untracked_file_rewritten_after_the_baseline_is_work(self):
         self.verifier()
         self.write("notes.txt", "one\n")
@@ -708,17 +742,103 @@ class TestChangeDetection(GateCase):
         self.assertEqual(self.stop().get("decision"), "stop")
         self.assertEqual(self.markers(), [])
 
-    def test_two_stops_at_once_run_the_verifier_once(self):
+    def lock_path(self):
+        return (Path(self.tmp) / "locks"
+                / (hooks_module("hookpaths").ws_key(self.repo) + ".json"))
+
+    def hold_lock(self, at):
+        path = self.lock_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"at": at, "pid": 1, "token": "other"}), encoding="utf-8")
+        return path
+
+    def test_three_stops_at_once_run_the_verifier_once(self):
         self.verifier(slow=True)
         self.turn()
         self.write("app.py", "x = 2\n")
         payload = json.dumps(self.payload())
         running = [subprocess.Popen(
             [sys.executable, str(HOOKS_DIR / "stop_gate.py")], env=self.env(),
-            stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True) for _ in range(2)]
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True) for _ in range(3)]
         decisions = [json.loads(proc.communicate(payload)[0]).get("decision")
                      for proc in running]
-        self.assertEqual(self.runs(), 1, f"one verifier run covers both stops, got {decisions}")
+        self.assertEqual(self.runs(), 1, f"one verifier run covers all three, got {decisions}")
+
+    def test_a_lock_older_than_its_age_out_is_taken_over(self):
+        self.verifier()
+        self.turn()
+        self.write("app.py", "x = 2\n")
+        lock = self.hold_lock(time.time() - 10 * hooks_module("stop_gate").LOCK_MAX_AGE)
+        started = time.monotonic()
+        self.assertIn(self.NO_REVIEW, self.gap())
+        self.assertEqual(self.runs(), 1)
+        self.assertLess(time.monotonic() - started, 30, "an abandoned lock is not waited on")
+        self.assertFalse(lock.exists())
+
+    def test_a_live_lock_with_no_budget_to_wait_skips_the_verifier(self):
+        """Stamped ahead of now, so waiting it out would not fit inside the gate budget."""
+        self.verifier()
+        self.turn()
+        self.write("app.py", "x = 2\n")
+        lock = self.hold_lock(time.time() + hooks_module("stop_gate").GATE_BUDGET)
+        self.assertIn(self.NO_REVIEW, self.gap())
+        self.assertEqual(self.runs(), 0)
+        self.assertIn("lock busy", self.log())
+        self.assertEqual(len(self.markers()), 1)
+        self.assertTrue(lock.exists())
+
+    def test_a_lock_is_claimed_once_and_dropped_only_by_its_owner(self):
+        stop_gate = hooks_module("stop_gate")
+        self.addCleanup(setattr, stop_gate, "LOCKS", stop_gate.LOCKS)
+        stop_gate.LOCKS = str(Path(self.tmp) / "locks")
+        mine = stop_gate.claim_lock(self.repo)
+        self.assertTrue(mine)
+        self.assertEqual(stop_gate.claim_lock(self.repo), "", "a live lock cannot be claimed twice")
+        stop_gate.drop_lock(self.repo, "another-stop")
+        self.assertTrue(os.path.exists(stop_gate.lock_file(self.repo)))
+        stop_gate.drop_lock(self.repo, mine)
+        self.assertFalse(os.path.exists(stop_gate.lock_file(self.repo)))
+
+    def test_pytest_collecting_nothing_records_no_pass(self):
+        gitstate = hooks_module("gitstate")
+        stop_gate = hooks_module("stop_gate")
+        self.addCleanup(setattr, gitstate, "VERIFIED", gitstate.VERIFIED)
+        gitstate.VERIFIED = str(Path(self.tmp) / "verified")
+        steps = [(stop_gate.PYTEST_LABEL, [sys.executable, "-c", "raise SystemExit(5)"])]
+        fp = gitstate.fingerprint(self.repo)
+        self.assertIsNone(stop_gate.run_verifier(self.repo, fp, set(), steps,
+                                                 time.monotonic() + 60))
+        self.assertEqual(gitstate.verified(self.repo), {})
+
+    def test_a_marker_in_a_repo_without_a_verifier_is_cleared_by_a_review(self):
+        self.turn()
+        self.write("app.py", "x = 2\n")
+        self.assertEqual(self.stop().get("decision"), "continue")
+        self.assertEqual(self.stop().get("decision"), "stop")  # released, marker left behind
+        self.assertEqual(len(self.markers()), 1)
+        self.review()
+        self.assertEqual(self.stop().get("decision"), "stop")
+        self.assertEqual(self.markers(), [])
+
+    def test_a_read_only_command_in_another_repository_is_not_judged(self):
+        other = self.new_repo()
+        path = self.transcript(("run", "git log -1", 0, other), root=other)
+        res = self.hook("stop_gate.py", self.payload(workspacePaths=[], transcriptPath=path))
+        self.assertEqual(res.get("decision"), "stop", res)
+        self.assertIn("no workspace to judge", self.log())
+
+    def test_a_parent_repository_is_not_promoted_by_a_command_run_in_it(self):
+        child = Path(self.repo) / "child"
+        child.mkdir()
+        self.sh(str(child), "init", "-q")
+        self.write("app.py", "y = 1\n", root=str(child))
+        path = write_transcript(Path(self.tmp) / "t.jsonl",
+                                [("edit", "app.py"), ("run", "git status", 0, self.repo)],
+                                str(child))
+        self.hook("stop_gate.py", self.payload(workspacePaths=[], transcriptPath=path))
+        judged = self.log().strip().splitlines()[-1].split("\t")[2]
+        self.assertEqual(judged, str(child))
 
     def test_a_pre_invocation_without_a_conversation_id_still_writes_a_baseline(self):
         self.verifier()
