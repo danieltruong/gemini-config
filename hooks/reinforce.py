@@ -6,6 +6,7 @@ import sys
 
 import gitstate
 import hookpaths
+import transcript
 
 
 BANNER = (
@@ -61,7 +62,7 @@ def main():
 
     # every turn would re-pay for a banner the model already read; every tenth keeps it in view
     steps = [{"ephemeralMessage": BANNER}] if num == 1 or num % 10 == 0 else []
-    cid = ev.get("conversationId") or ""
+    cid = transcript.conversation_id(ev)
     spaces = [os.path.abspath(hookpaths.real_path(w)) for w in ev.get("workspacePaths") or []]
     note = ""
     try:

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Unit tests for Antigravity hooks."""
+import importlib
 import json
 import os
 import shutil
@@ -11,6 +12,15 @@ import unittest
 from pathlib import Path
 
 HOOKS_DIR = Path(__file__).resolve().parent.parent
+
+
+def hooks_module(name):
+    """Import a hook module for the tests that call into it directly."""
+    sys.path.insert(0, str(HOOKS_DIR))
+    try:
+        return importlib.import_module(name)
+    finally:
+        sys.path.remove(str(HOOKS_DIR))
 HEADER = ("Created At: 2026-09-18T00:00:00-07:00\n"
           "Completed At: 2026-09-18T00:00:01-07:00\n\n")
 RESULT = HEADER + "The command exited with code {code}.\n"
@@ -399,16 +409,25 @@ class GateCase(unittest.TestCase):
     def markers(self):
         return list((Path(self.tmp) / "pending").glob("*.json"))
 
-    def verifier(self, code=0, root=None):
-        """A real verify script, committed so the script itself is not a pending change."""
+    def verifier(self, code=0, root=None, writes=""):
+        """A real verify script, committed so the script itself is not a pending change.
+
+        writes names a file in the workspace the run rewrites every time, the way a coverage
+        report or a generated file does.
+        """
         root = Path(root or self.repo)
         counter = str(Path(self.tmp) / "ran.txt")
         if os.name == "nt":
-            self.write(".agents/verify.cmd", f'@echo ran>>"{counter}"\r\n@exit /b {code}\r\n',
-                       root=root)
+            body = f'@echo ran>>"{counter}"\r\n'
+            if writes:
+                body += f'@echo output>"{writes}"\r\n'
+            self.write(".agents/verify.cmd", body + f"@exit /b {code}\r\n", root=root)
             label = ".agents/verify.cmd"
         else:
-            self.write(".agents/verify.sh", f'echo ran >> "{counter}"\nexit {code}\n', root=root)
+            body = f'echo ran >> "{counter}"\n'
+            if writes:
+                body += f'echo output > "{writes}"\n'
+            self.write(".agents/verify.sh", body + f"exit {code}\n", root=root)
             label = ".agents/verify.sh"
         self.commit(str(root), "verifier")
         return label
@@ -418,8 +437,21 @@ class GateCase(unittest.TestCase):
         path = Path(self.tmp) / "ran.txt"
         return len(path.read_text(encoding="utf-8").splitlines()) if path.exists() else 0
 
-    def subagent(self, kind, cid=None, spaces=None, before=None):
-        """A subagent of this type: its brain record, its PreInvocation, its own Stop."""
+    def store_review(self, ws, kind="reviewer"):
+        """A reviewed record for a workspace, written by the gate's own record code."""
+        code = ("import sys, time, gitstate, hookpaths;"
+                "hookpaths.write_json_file("
+                "gitstate.record_path(gitstate.REVIEWED, sys.argv[1], sys.argv[2]),"
+                "{'at': time.time(), 'workspace': sys.argv[1], 'tracked': 'x', 'untracked': []})")
+        proc = subprocess.run([sys.executable, "-c", code, ws, kind], cwd=str(HOOKS_DIR),
+                              env=self.env(), capture_output=True, text=True)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+
+    def subagent(self, kind, cid=None, spaces=None, before=None, turn=True):
+        """A subagent of this type: its brain record, its PreInvocation, its own Stop.
+
+        turn=False is a subagent whose PreInvocation never fired, so it has no baseline.
+        """
         cid = cid or f"{kind}-cid"
         logs = Path(self.tmp) / "brain" / cid / ".system_generated" / "logs"
         logs.mkdir(parents=True, exist_ok=True)
@@ -430,7 +462,8 @@ class GateCase(unittest.TestCase):
         (records / f"{cid}.json").write_text(json.dumps(
             {"conversationId": cid, "subagentDescriptor": {"typeName": kind},
              "state": "SUBAGENT_STATE_ALIVE"}), encoding="utf-8")
-        self.turn(cid=cid, spaces=spaces)
+        if turn:
+            self.turn(cid=cid, spaces=spaces)
         if before:
             before()
         return self.hook("stop_gate.py", self.payload(
@@ -542,6 +575,140 @@ class TestChangeDetection(GateCase):
         self.write("extra.py", "y = 1\n")
         self.assertIn("extra.py is new since the reviewer run", self.gap())
 
+    def test_dirt_from_before_the_conversation_is_not_this_conversations_work(self):
+        """263 changed paths were waiting in one workspace: a question there costs one fingerprint."""
+        self.verifier()
+        self.write("app.py", "x = 2\n")
+        self.write("half-done.py", "y = 1\n")
+        self.turn()
+        path = self.transcript(("run", "git status --short", 0))
+        res = self.stop(transcriptPath=path)
+        self.assertEqual(res.get("decision"), "stop", res)
+        self.assertEqual(self.runs(), 0, "an unmoved fingerprint owes no verifier run")
+        self.assertIn("unchanged", self.log())
+
+    def test_committing_the_work_is_still_work(self):
+        self.verifier()
+        self.turn()
+        self.write("app.py", "x = 2\n")
+        self.commit()
+        self.assertIn(self.NO_REVIEW, self.gap())
+
+    def test_stashing_the_work_is_still_work(self):
+        self.verifier()
+        self.turn()
+        self.write("app.py", "x = 2\n")
+        self.sh(self.repo, "stash", "-q")
+        self.assertIn(self.NO_REVIEW, self.gap())
+
+    def test_a_stop_without_a_baseline_reads_an_edit_call_as_work(self):
+        """No PreInvocation fired, so the gate cannot date the dirt and fails closed."""
+        self.verifier()
+        self.write("app.py", "x = 2\n")
+        path = self.transcript(("edit", "app.py"))
+        payload = self.payload(transcriptPath=path)
+        payload.pop("conversationId")
+        self.assertIn(self.NO_REVIEW, self.hook("stop_gate.py", payload)["reason"])
+
+    def test_a_stop_without_a_baseline_and_without_a_tool_call_is_released(self):
+        self.verifier()
+        self.write("app.py", "x = 2\n")
+        path = self.transcript(("spawn", "researcher", "find the API docs"))
+        payload = self.payload(transcriptPath=path)
+        payload.pop("conversationId")
+        res = self.hook("stop_gate.py", payload)
+        self.assertEqual(res.get("decision"), "stop", res)
+        self.assertEqual(self.runs(), 0)
+
+    def test_a_pre_invocation_without_a_conversation_id_still_writes_a_baseline(self):
+        self.verifier()
+        logs = Path(self.tmp) / "brain" / "cid-from-path" / ".system_generated" / "logs"
+        logs.mkdir(parents=True, exist_ok=True)
+        tpath = write_transcript(logs / "transcript.jsonl", [("run", "git log -1", 0)], self.repo)
+        self.hook("reinforce.py", {"invocationNum": 1, "transcriptPath": tpath,
+                                  "workspacePaths": [self.repo]})
+        records = list((Path(self.tmp) / "seen").glob("*.json"))
+        self.assertEqual(len(records), 1)
+        self.assertFalse(json.loads(records[0].read_text(encoding="utf-8"))["fallback"])
+        # that baseline is what lets the stop see an untouched tree instead of failing closed
+        payload = self.payload(transcriptPath=tpath)
+        payload.pop("conversationId")
+        res = self.hook("stop_gate.py", payload)
+        self.assertEqual(res.get("decision"), "stop", res)
+        self.assertEqual(self.runs(), 0)
+
+    def test_a_reviewer_without_a_baseline_records_nothing(self):
+        self.verifier()
+        self.turn()
+        self.write("app.py", "x = 2\n")
+        res = self.subagent("reviewer", turn=False,
+                            before=lambda: self.write("app.py", "x = 3\n"))
+        self.assertEqual(res.get("decision"), "stop", res)
+        self.assertIn("reviewer recorded 0/1", self.log())
+        self.assertIn(self.NO_REVIEW, self.gap())
+
+    def test_a_file_the_reviewer_created_is_new_since_the_review(self):
+        self.verifier()
+        self.turn()
+        self.write("app.py", "x = 2\n")
+        self.review(before=lambda: self.write("new_feature.py", "def f():\n    return 1\n"))
+        self.assertIn("new_feature.py is new since the reviewer run", self.gap())
+
+    def test_a_judge_that_leaves_a_backup_file_is_told(self):
+        self.verifier()
+        self.turn()
+        self.write("app.py", "x = 2\n")
+        res = self.subagent("reviewer", before=lambda: self.write("notes.bak", "old\n"))
+        self.assertEqual(res.get("decision"), "continue", res)
+        self.assertIn("delete leftovers: notes.bak", res["reason"])
+
+    def test_output_the_verifier_writes_every_run_is_not_a_change(self):
+        self.verifier(writes="coverage.txt")
+        self.turn()
+        self.write("app.py", "x = 2\n")
+        self.review()
+        self.assertEqual(self.stop().get("decision"), "stop")
+        self.assertEqual(self.runs(), 1)
+        res = self.stop()
+        self.assertEqual(res.get("decision"), "stop", res)
+        self.assertEqual(self.runs(), 1, "verifier output must not read as a changed tree")
+
+    def test_a_verifier_that_rewrites_a_tracked_file_is_not_excused(self):
+        self.verifier(writes="app.py")
+        self.turn()
+        self.write("lib.py", "y = 1\n")
+        self.review()
+        self.assertEqual(self.stop().get("decision"), "stop", "the tree it reviewed passed")
+        self.assertIn("tracked files changed after the reviewer run", self.gap())
+
+    def test_forced_continues_stop_at_the_ceiling(self):
+        self.verifier(code=1)
+        self.turn()
+        decisions = []
+        for n in range(2, 7):
+            self.write("app.py", f"x = {n}\n")  # a moved fingerprint earns a fresh allowance
+            res = self.stop()
+            decisions.append(res.get("decision"))
+        self.assertEqual(decisions, ["continue", "continue", "continue", "stop", "stop"])
+        self.assertIn("already been sent back 3 times", res["reason"])
+        self.assertEqual(len(self.markers()), 1)
+
+    def test_a_stop_without_a_conversation_id_still_blocks_once(self):
+        self.verifier()
+        self.write("app.py", "x = 2\n")
+        payload = self.payload(conversationId="")
+        self.assertEqual(self.hook("stop_gate.py", payload).get("decision"), "continue")
+        self.assertEqual(self.hook("stop_gate.py", payload).get("decision"), "stop")
+
+    def test_a_stored_review_gives_no_credit_without_git(self):
+        plain = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, plain, True)
+        self.trusted = [plain]
+        self.store_review(plain)
+        path = self.transcript(("edit", "app.py"), root=plain)
+        reason = self.gap(workspacePaths=[plain], transcriptPath=path)
+        self.assertIn("cannot be proved without git", reason)
+
     def test_a_reviewer_that_edits_a_tracked_file_is_not_a_review(self):
         self.verifier()
         self.turn()
@@ -561,8 +728,7 @@ class TestChangeDetection(GateCase):
     def test_a_subagent_owes_the_verifier_but_no_review(self):
         label = self.verifier(code=1)
         self.turn()
-        self.write("app.py", "x = 2\n")
-        res = self.subagent("coder")
+        res = self.subagent("coder", before=lambda: self.write("app.py", "x = 2\n"))
         self.assertEqual(res.get("decision"), "continue", res)
         self.assertIn(f"Verifier failed ({label})", res["reason"])
 
@@ -595,9 +761,10 @@ class TestChangeDetection(GateCase):
         self.verifier()
         self.turn(cid="garbagecid")
         self.write("app.py", "x = 2\n")
-        retries = Path(self.tmp) / "retries"
-        retries.mkdir(parents=True, exist_ok=True)
-        (retries / "garbagecid.json").write_text("{not json", encoding="utf-8")
+        path = Path(self.tmp) / "retries" / os.path.basename(
+            hooks_module("hookpaths").retry_path("garbagecid"))
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("{not json", encoding="utf-8")
         res = self.stop(conversationId="garbagecid")
         self.assertEqual(res.get("decision"), "stop", res)
         self.assertIn("release", self.log())
@@ -635,8 +802,10 @@ class TestChangeDetection(GateCase):
         res = self.stop()
         self.assertEqual(res.get("decision"), "stop", res)
         self.assertEqual(self.runs(), 0)
+        self.assertIn("not checked, workspace is not trusted", res["reason"].lower())
         self.assertIn("not in trustedWorkspaces", res["reason"])
         self.assertIn(label, res["reason"])
+        self.assertNotIn("forced retry", res["reason"], "nothing was retried, so say so")
 
     def test_the_same_fingerprint_is_not_verified_twice(self):
         self.verifier()
@@ -664,8 +833,8 @@ class TestChangeDetection(GateCase):
         self.assertEqual(res.get("decision"), "stop", res)
         self.assertIn("verified", self.log())
 
-    def test_a_file_the_reviewer_created_is_not_a_change(self):
-        """The reviewer's own scratch file is part of what it recorded, so it is not new work."""
+    def test_a_file_the_reviewer_created_in_its_artifact_directory_is_not_a_change(self):
+        """A judge's own scratch lives in its artifact directory, which nobody has to account for."""
         self.verifier()
         self.turn()
         self.write("app.py", "x = 2\n")
@@ -1119,16 +1288,47 @@ class TestFingerprint(unittest.TestCase):
         path.write_bytes(b"\0" * (self.mod.SIZE_CAP + 1))
         self.assertTrue(self.mod.file_hash(str(path)).startswith("stat:"))
 
+    def test_a_big_file_rewritten_with_its_mtime_restored_moves_it(self):
+        """Size and mtime can both be put back by hand, so the file's two ends are read too."""
+        path = Path(self.repo) / "big.bin"
+        path.write_bytes(b"a" * 3_000_000)
+        before = self.digest()
+        stat = os.stat(path)
+        path.write_bytes(b"b" + b"a" * 2_999_999)
+        os.utime(path, ns=(stat.st_atime_ns, stat.st_mtime_ns))
+        self.assertEqual(os.stat(path).st_size, stat.st_size)
+        self.assertEqual(os.stat(path).st_mtime_ns, stat.st_mtime_ns)
+        self.assertNotEqual(before, self.digest())
+
+    def test_a_file_inside_a_nested_untracked_repository_moves_it(self):
+        nested = Path(self.repo) / "vendor"
+        nested.mkdir()
+        subprocess.run(["git", "init", "-q"], cwd=nested, capture_output=True, check=True)
+        self.write("vendor/lib.py", "y = 1\n")
+        before = self.digest()
+        self.write("vendor/lib.py", "y = 2\n")
+        self.assertNotEqual(before, self.digest())
+
+    def test_a_workspace_inside_a_bigger_repository_ignores_the_rest_of_it(self):
+        self.write("sub/app.py", "x = 1\n")
+        self.commit()
+        sub = os.path.join(self.repo, "sub")
+        before = self.mod.digest(self.mod.fingerprint(sub))
+        self.write("app.py", "x = 99\n")
+        self.write("other.py", "y = 1\n")
+        self.assertEqual(before, self.mod.digest(self.mod.fingerprint(sub)))
+        self.write("sub/app.py", "x = 2\n")
+        self.assertNotEqual(before, self.mod.digest(self.mod.fingerprint(sub)))
+
     def test_a_directory_that_is_not_a_repository_has_no_fingerprint(self):
         plain = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, plain, True)
         self.assertIsNone(self.mod.fingerprint(plain))
-        self.assertIsNone(self.mod.changed_names(plain))
 
-    def test_changed_names_lists_both_kinds_of_change(self):
+    def test_a_fingerprint_names_both_kinds_of_change(self):
         self.write("app.py", "x = 2\n")
         self.write("extra.py", "y = 1\n")
-        self.assertEqual(self.mod.changed_names(self.repo), {"app.py", "extra.py"})
+        self.assertEqual(self.mod.fingerprint(self.repo).names, {"app.py", "extra.py"})
 
     def test_toplevel_finds_the_repository_root(self):
         self.write("pkg/mod.py", "z = 1\n")
@@ -1215,8 +1415,14 @@ class TestGateInternals(unittest.TestCase):
 
     def test_a_garbage_ledger_counts_as_spent(self):
         self.assertTrue(self.retry("verifier:aaa"))
-        Path(self.tmp, "retries", "conv.json").write_text("{broken", encoding="utf-8")
+        Path(self.paths.retry_path("conv")).write_text("{broken", encoding="utf-8")
         self.assertFalse(self.retry("no-review:aaa"))
+
+    def test_the_conversation_ceiling_outranks_a_fresh_fingerprint(self):
+        for kind in ("verifier:a", "verifier:b", "verifier:c"):
+            self.assertTrue(self.retry(kind), kind)
+        self.assertFalse(self.retry("verifier:d"), "the total is capped per conversation")
+        self.assertEqual(self.paths.forced_count("conv"), self.paths.MAX_FORCED)
 
     def test_a_conversation_without_an_id_gets_no_retry(self):
         self.assertFalse(self.retry("verifier:aaa", cid=""))

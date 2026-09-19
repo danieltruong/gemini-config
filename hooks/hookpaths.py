@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Paths and helpers shared by the Antigravity hooks."""
+import hashlib
 import json
 import os
 import re
@@ -15,6 +16,10 @@ DOCS_LINT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "scri
 PENDING = os.path.join(TMP, "pending")
 # forced continues already spent, one file per conversation
 RETRIES = os.path.join(TMP, "retries")
+# forced continues one conversation may spend in total, however many gaps it hits
+MAX_FORCED = 3
+# ledger key for that total; every gap kind carries a ":" so neither can shadow the other
+TOTAL_KEY = "total"
 MARKER_MAX_AGE = 86400
 SLUG = re.compile(r"[^A-Za-z0-9]+")
 IS_WINDOWS = os.name == "nt"
@@ -117,7 +122,10 @@ def stale(data):
 
 
 def slug_of(value):
-    return SLUG.sub("-", os.path.normcase(value)).strip("-")[-120:] or "none"
+    """A readable file name for a path or id, with a hash so two long values cannot collide."""
+    value = os.path.normcase(value)
+    tag = hashlib.sha256(value.encode("utf-8", "surrogateescape")).hexdigest()[:8]
+    return f"{SLUG.sub('-', value).strip('-')[-110:] or 'none'}-{tag}"
 
 
 def ws_key(workspace):
@@ -165,29 +173,50 @@ def clear_pending(workspace):
         pass
 
 
-def take_retry(conversation, kind, limit=1):
-    """Spend one forced continue for this (conversation, gap kind, fingerprint). False when spent.
+def retry_path(ledger):
+    return os.path.join(RETRIES, slug_of(ledger) + ".json")
+
+
+def retry_ledger(ledger):
+    """Forced continues already spent under this key. None when the file is unusable."""
+    path = retry_path(ledger)
+    data = read_json_file(path)
+    if data is None and os.path.exists(path):
+        return None
+    return {} if not isinstance(data, dict) or stale(data) else data
+
+
+def forced_count(ledger):
+    """How many forced continues this ledger has spent in total."""
+    data = retry_ledger(ledger) or {}
+    try:
+        return int(data.get(TOTAL_KEY) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def take_retry(ledger, kind, limit=1, ceiling=MAX_FORCED):
+    """Spend one forced continue for this (ledger, gap kind, fingerprint). False when spent.
 
     An unreadable file counts as spent: a conversation that corrupts its own retry state must
     not win an extra continue, and must not crash the gate into releasing the stop either.
     """
-    if not conversation:
+    if not ledger:
         return False
-    path = os.path.join(RETRIES, slug_of(conversation) + ".json")
-    data = read_json_file(path)
-    if data is None and os.path.exists(path):
+    data = retry_ledger(ledger)
+    if data is None:
         return False
-    if not isinstance(data, dict) or stale(data):
-        data = {}
     try:
         used = int(data.get(kind) or 0)
+        total = int(data.get(TOTAL_KEY) or 0)
     except (TypeError, ValueError):
         return False
-    if used >= limit:
+    if used >= limit or total >= ceiling:
         return False
     data[kind] = used + 1
+    data[TOTAL_KEY] = total + 1
     data["at"] = time.time()
-    write_json_file(path, data)
+    write_json_file(retry_path(ledger), data)
     return True
 
 

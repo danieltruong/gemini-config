@@ -682,11 +682,12 @@ def parse_stop_line(line):
     if match and match.group(1) in STOP_GATE_KINDS:
         return when, match.group(1), match.group(2)
     # a legacy line whose detail is not execution=/reason=, such as "verifier .agents/verify.cmd":
-    # the kind is the last known kind word, because the path in front of it can hold spaces
+    # the kind is the first kind word that is not part of a path, because the workspace comes
+    # first and the detail behind it can hold a kind word of its own
     words = rest.split(" ")
-    for i in range(len(words) - 1, -1, -1):
-        if words[i] in STOP_GATE_KINDS:
-            return when, words[i], " ".join(words[i + 1:])
+    for i, word in enumerate(words):
+        if word in STOP_GATE_KINDS and not any(c in word for c in "/\\:"):
+            return when, word, " ".join(words[i + 1:])
     return when, "", rest
 
 
@@ -714,6 +715,8 @@ def stop_gate_log(since):
                 continue
             first = detail.split(" ")[0] if detail else ""
             counts[f"{kind} {first}" if first else kind] += 1
+            if kind == "review":
+                continue  # a judge writing down what it saw is bookkeeping, not a stop decision
             # every gate line is one stop decision, so an unchecked one counts wherever it landed
             stops += 1
             unchecked += unchecked_stop(kind, detail)
@@ -1180,6 +1183,9 @@ def self_check():
     )[1:] == ("verifier", ".agents/verify.cmd")
     assert parse_stop_line("2026-09-18T00:33:41 F:/p leftovers 3 paths")[1:] == \
         ("leftovers", "3 paths")
+    # a release line carries the gap kind inside its detail, so the kind is the one by position
+    assert parse_stop_line("2026-09-18T00:33:41 F:/p release no-review top-level")[1:] == \
+        ("release", "no-review top-level")
     assert parse_stop_line("2026-09-18T00:33:41 F:/p nothing here")[1] == ""
     assert parse_stop_line("not a log line") is None
     skipped_stop = parse_stop_line("2026-09-18T00:32:09 - stop reason='NO_TOOL_CALL' idle=False")

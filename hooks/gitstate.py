@@ -5,6 +5,7 @@ A fingerprint is taken from git, not from the transcript: HEAD, the working tree
 against it, and the untracked files git does not ignore. Whatever changed the tree, and
 however the command line spelled it, the fingerprint moves.
 """
+import collections
 import hashlib
 import os
 import subprocess
@@ -13,11 +14,16 @@ import time
 import hookpaths
 
 GIT_TIMEOUT = 30
-# a file this big is fingerprinted by size and mtime, so a stop never reads a whole asset
+# a file this big is read at its two ends only, so a stop never hashes a whole asset
 SIZE_CAP = 2_000_000
+EDGE_BYTES = 65_536
 VERIFIED = os.path.join(hookpaths.TMP, "verified")
 REVIEWED = os.path.join(hookpaths.TMP, "reviewed")
 SEEN = os.path.join(hookpaths.TMP, "seen")
+# every git call is scoped to the workspace, so a workspace inside a bigger repo ignores
+# whatever changed elsewhere in that repo
+HERE = ("--", ".")
+Fingerprint = collections.namedtuple("Fingerprint", "tracked untracked names")
 
 
 def git(ws, *args):
@@ -56,11 +62,15 @@ def file_hash(path):
         stat = os.stat(path)
     except OSError:
         return "gone"
-    if stat.st_size > SIZE_CAP:
-        return f"stat:{stat.st_size}:{int(stat.st_mtime)}"
     try:
         with open(path, "rb") as fh:
-            return hashlib.sha256(fh.read()).hexdigest()
+            if stat.st_size <= SIZE_CAP:
+                return hashlib.sha256(fh.read()).hexdigest()
+            # size and mtime alone can be restored by hand, so the two ends are read too
+            digest = hashlib.sha256(fh.read(EDGE_BYTES))
+            fh.seek(max(0, stat.st_size - EDGE_BYTES))
+            digest.update(fh.read(EDGE_BYTES))
+            return f"stat:{stat.st_size}:{stat.st_mtime_ns}:{digest.hexdigest()}"
     except OSError:
         return "unreadable"
 
@@ -70,58 +80,78 @@ def tracked_hash(ws):
     if not is_repo(ws):
         return None
     head = (text(ws, "rev-parse", "HEAD") or "no-head").strip()
+    # the stash is repo-wide, and stashing work away leaves a clean tree that otherwise
+    # looks exactly like the one the conversation started from
+    stash = (text(ws, "rev-parse", "--verify", "-q", "refs/stash") or "no-stash").strip()
     # --binary so a changed image or archive moves the hash like any other file
-    diff = git(ws, "diff", "--binary", "HEAD")
+    diff = git(ws, "diff", "--binary", "HEAD", *HERE)
     if diff is None:
-        diff = git(ws, "diff", "--binary", "--cached") or b""
-    digest = hashlib.sha256(head.encode())
+        diff = git(ws, "diff", "--binary", "--cached", *HERE) or b""
+    digest = hashlib.sha256(f"{head}\0{stash}".encode())
     digest.update(b"\0")
     digest.update(diff)
     return digest.hexdigest()
 
 
+def dir_hashes(ws, rel):
+    """Every file under an untracked directory git refused to look inside, such as a nested repo."""
+    out = {}
+    for base, dirs, files in os.walk(os.path.join(ws, rel)):
+        dirs[:] = [d for d in dirs if d != ".git"]
+        for name in files:
+            full = os.path.join(base, name)
+            out[os.path.relpath(full, ws).replace("\\", "/")] = file_hash(full)
+    return out
+
+
 def untracked_hashes(ws):
     """{workspace-relative path: content hash} for files git neither tracks nor ignores."""
-    return {rel: file_hash(os.path.join(ws, rel))
-            for rel in lines(ws, "ls-files", "--others", "--exclude-standard")}
+    out = {}
+    for rel in lines(ws, "ls-files", "--others", "--exclude-standard", *HERE):
+        # git reports a directory it will not descend into with a trailing slash
+        if rel.endswith("/"):
+            out.update(dir_hashes(ws, rel.rstrip("/")))
+        else:
+            out[rel] = file_hash(os.path.join(ws, rel))
+    return out
 
 
 def fingerprint(ws):
-    """(tracked hash, {untracked path: hash}), or None when ws is not a git repository."""
+    """Tracked hash, untracked hashes and changed names. None when ws is not a git repository."""
     part = tracked_hash(ws)
-    return None if part is None else (part, untracked_hashes(ws))
+    if part is None:
+        return None
+    others = untracked_hashes(ws)
+    changed = set(lines(ws, "diff", "--name-only", "--relative", "HEAD", *HERE))
+    return Fingerprint(part, others, changed | set(others))
 
 
 def digest(fp):
     """One string standing for a whole fingerprint."""
     if fp is None:
         return ""
-    part, others = fp
-    out = hashlib.sha256(part.encode())
-    for rel in sorted(others):
-        out.update(f"\0{rel}\0{others[rel]}".encode())
+    out = hashlib.sha256(fp.tracked.encode())
+    for rel in sorted(fp.untracked):
+        out.update(f"\0{rel}\0{fp.untracked[rel]}".encode())
     return out.hexdigest()
 
 
-def clean(ws):
-    """Does git report nothing to commit and nothing untracked?"""
-    return not lines(ws, "status", "--porcelain")
+def without(fp, paths):
+    """The same fingerprint with some untracked paths left out, such as verifier output."""
+    if fp is None or not paths:
+        return fp
+    drop = set(paths)
+    return Fingerprint(fp.tracked,
+                       {k: v for k, v in fp.untracked.items() if k not in drop},
+                       set(fp.names) - drop)
 
 
-def changed_names(ws):
-    """Workspace-relative paths git reports as changed or untracked. None outside a repo."""
-    if not is_repo(ws):
-        return None
-    names = set(lines(ws, "diff", "--name-only", "--relative", "HEAD"))
-    return names | set(lines(ws, "ls-files", "--others", "--exclude-standard"))
-
-
-def record_path(kind, ws, extra=""):
-    """One state file per workspace, or per (extra, workspace) when the record needs a scope."""
+def record_path(directory, ws, scope=""):
+    """One state file per workspace, or per (scope, workspace) when the record needs one."""
     name = hookpaths.ws_key(ws)
-    if extra:
-        name = f"{hookpaths.slug_of(extra)}-{name}"
-    return os.path.join(kind, name + ".json")
+    if scope:
+        name = f"{hookpaths.slug_of(scope)}-{name}"
+    return os.path.join(directory, name + ".json")
 
 
 def read_record(path):
@@ -138,26 +168,43 @@ def read_record(path):
     return data
 
 
-def verified_digest(ws):
-    """The fingerprint the gate last ran a passing verifier on, or ''."""
-    rec = read_record(record_path(VERIFIED, ws)) or {}
-    return str(rec.get("digest") or "")
+def verified(ws):
+    """The last passing verifier run here: the fingerprint it passed on, and what it wrote."""
+    return read_record(record_path(VERIFIED, ws)) or {}
 
 
-def save_verified(ws, fp):
+def artifacts(ws):
+    """Untracked paths the verifier itself creates, so its own output is not a fresh change."""
+    return set(verified(ws).get("artifacts") or [])
+
+
+def save_verified(ws, fp, made):
+    """Record a pass. The digest leaves out the files that run wrote, which it writes again."""
     hookpaths.write_json_file(record_path(VERIFIED, ws),
-                              {"at": time.time(), "workspace": ws, "digest": digest(fp)})
+                              {"at": time.time(), "workspace": ws,
+                               "digest": digest(without(fp, made)),
+                               "artifacts": sorted(made)})
 
 
-def note_seen(cid, ws, fp):
-    """Record what this workspace looked like when the conversation first reached a hook."""
+def note_seen(cid, ws, fp, fallback=False):
+    """Record what this workspace looked like when the conversation first reached a hook.
+
+    fallback marks a baseline taken at a Stop, where the turn's work has already happened,
+    so the record cannot say what the tree looked like before it.
+    """
     if not cid or fp is None:
         return
     path = record_path(SEEN, ws, cid)
     if read_record(path):
         return
-    hookpaths.write_json_file(path, {"at": time.time(), "workspace": ws,
-                                     "tracked": fp[0], "untracked": sorted(fp[1])})
+    hookpaths.write_json_file(path, {"at": time.time(), "workspace": ws, "fallback": fallback,
+                                     "tracked": fp.tracked, "untracked": sorted(fp.untracked)})
+
+
+def baseline(cid, ws):
+    """The conversation's own starting fingerprint, or None when only a fallback exists."""
+    start = seen(cid, ws)
+    return None if not start or start.get("fallback") else start
 
 
 def seen(cid, ws):
@@ -165,33 +212,37 @@ def seen(cid, ws):
 
 
 def moved(cid, ws, fp):
-    """Has the workspace changed since this conversation first saw it?"""
-    start = seen(cid, ws)
+    """Has the workspace changed since this conversation's own baseline was taken?"""
+    start = baseline(cid, ws)
     if not start or fp is None:
         return False
-    return start.get("tracked") != fp[0] or sorted(start.get("untracked") or []) != sorted(fp[1])
+    return (start.get("tracked") != fp.tracked
+            or sorted(start.get("untracked") or []) != sorted(fp.untracked))
 
 
 def new_untracked(cid, ws, fp):
-    """Untracked, unignored paths this conversation added since its first seen event."""
-    start = seen(cid, ws)
+    """Untracked, unignored paths this conversation added since its baseline."""
+    start = baseline(cid, ws)
     if not start or fp is None:
         return []
-    return sorted(set(fp[1]) - set(start.get("untracked") or []))
+    return sorted(set(fp.untracked) - set(start.get("untracked") or []))
 
 
 def save_review(cid, ws, kind, fp):
-    """Record that a judging subagent saw this tree. False when it changed tracked content.
+    """Record that a judging subagent saw this tree. False when it cannot stand for one.
 
-    The reviewer's start fingerprint comes from its own first seen event, so a reviewer that
-    edited a tracked file proves nothing about what is in the tree now.
+    The judge's own baseline says what it started from: a judge that changed tracked content,
+    or that never got a real baseline, proves nothing about what is in the tree now. Only the
+    untracked files present at both ends count as reviewed, so a file the judge created is
+    still new work for its parent.
     """
-    start = seen(cid, ws)
-    if fp is None or not start or start.get("tracked") != fp[0]:
+    start = baseline(cid, ws)
+    if fp is None or not start or start.get("tracked") != fp.tracked:
         return False
-    hookpaths.write_json_file(record_path(REVIEWED, ws, kind),
-                              {"at": time.time(), "workspace": ws, "by": cid,
-                               "tracked": fp[0], "untracked": sorted(fp[1])})
+    hookpaths.write_json_file(
+        record_path(REVIEWED, ws, kind),
+        {"at": time.time(), "workspace": ws, "by": cid, "tracked": fp.tracked,
+         "untracked": sorted(set(start.get("untracked") or []) & set(fp.untracked))})
     return True
 
 

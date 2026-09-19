@@ -90,28 +90,36 @@ The `stop-gate` hook blocks an agent from finishing while the repo's own checks 
 6. `*.sln` or `*.csproj`, run as `dotnet test`
 7. `pyproject.toml`, `pytest.ini`, or `setup.cfg`, run as `python -m pytest -q -x`
 
-The gate runs nothing at all in a workspace that is not listed in `trustedWorkspaces` in `~/.gemini/antigravity-cli/settings.json`. Such a workspace gets one message naming the verifier to run by hand and the list to add itself to, and then the stop goes through. Give a repo its own `.agents/verify.sh` to control exactly what runs. One 700 second budget covers every verifier, lint and docs run in the whole Stop pass, which leaves room under the 900 second hook timeout.
+The gate runs nothing at all in a workspace that is not listed in `trustedWorkspaces` in `~/.gemini/antigravity-cli/settings.json`. Such a workspace gets one message that says the work was not checked because the workspace is not trusted, names the verifier to run by hand and names the list to add itself to. The stop then goes through, and nothing is retried. Give a repo its own `.agents/verify.sh` to control exactly what runs. One 700 second budget covers every verifier, lint and docs run in the whole Stop pass, which leaves room under the 900 second hook timeout.
 
 ## What counts as changed
 
 The gate does not read the transcript to work out what happened. It fingerprints each workspace with git:
 
-- `git rev-parse HEAD` and `git diff --binary HEAD`, hashed together as the tracked part
-- every path from `git ls-files --others --exclude-standard`, each with a hash of its content; a file over 2 MB is hashed by its size and mtime instead
+- `git rev-parse HEAD`, the stash ref, and `git diff --binary HEAD`, hashed together as the tracked part
+- every path from `git ls-files --others --exclude-standard`, each with a hash of its content; an untracked directory git will not look inside, such as a nested repository, is walked and its files hashed; a file over 2 MB is hashed by its size, its mtime in nanoseconds and its first and last 64 KB
 
-A workspace has work in it when that fingerprint differs from the one the conversation started with, or when `git status --porcelain` is not empty. It does not matter what moved it: an edit tool, `echo x>app.py`, `cp`, `rm`, `patch`, `git reset --hard`, a `Set-Content` from PowerShell, or a subagent. Adding the new file to `.gitignore` does not hide it either, because `.gitignore` is itself tracked. A tree that matches its own HEAD with nothing untracked owes nothing.
+Every git call is scoped to the workspace with `-- .`, so a workspace that is a subdirectory of a bigger repository ignores whatever changed elsewhere in that repository.
 
-The first fingerprint of a conversation is taken by the `PreInvocation` hook, before the turn runs. That baseline is what "new since this run started" means for leftovers and for reviews.
+A workspace has work in it when that fingerprint differs from the one this conversation started with. It does not matter what moved it: an edit tool, `echo x>app.py`, `cp`, `rm`, `patch`, `git commit`, `git stash`, `git reset --hard`, a `Set-Content` from PowerShell, or a subagent. Adding the new file to `.gitignore` does not hide it either, because `.gitignore` is itself tracked.
+
+A dirty tree is not by itself work. A repository left with 263 changed paths from last week, in a conversation that only answers a question, moves nothing and costs one fingerprint: no verifier run, no review demanded.
+
+The baseline is taken at the first event of a conversation, by the `PreInvocation` hook, before the turn runs. It is what "new since this run started" means for leftovers and for reviews. A conversation that reaches a Stop without one, because `PreInvocation` never fired or carried no workspace, gets its baseline there instead, marked as the fallback it is: the work has already happened, so that record cannot date anything. With only a fallback the gate fails closed on one cheap signal, the conversation's transcript holding an edit call or a run-command call, and reads that as work in every workspace of the stop. The command text is never matched, and no such call means no work.
 
 A workspace that is not a git repository has no fingerprint, so there the edit-tool targets in the transcript are the only change signal, and a transcript that cannot be read counts as a change rather than as proof of nothing.
 
 ## What counts as checked
 
-**The verifier**: the gate runs it itself and records the fingerprint it passed on. Nothing in the transcript is evidence: a `pytest || true` that reports exit 0, an `ls .agents/verify.sh`, a pass in another workspace and a backgrounded run all leave the gate to run the real thing. A fingerprint already recorded as passing is not re-run, so an unchanged tree costs no time. This happens on every stop the model chose, including one where `fullyIdle` is false. A stop the model did not choose (cancelled, errored, out of steps) runs nothing and only leaves a marker.
+**The verifier**: the gate runs it itself and records the fingerprint it passed on. Nothing in the transcript is evidence: a `pytest || true` that reports exit 0, an `ls .agents/verify.sh`, a pass in another workspace and a backgrounded run all leave the gate to run the real thing. A fingerprint already recorded as passing is not re-run, so an unchanged tree costs no time.
 
-**The review**: subagent Stop events reach this hook too, and the gate identifies the conversation from its parent's record under `brain/<parent>/.system_generated/subagents/<cid>.json`. When a subagent whose `typeName` is exactly `reviewer` (or `visual-qa`, where the workspace has `.agents/visual.md`) stops, the gate records the workspace fingerprint it saw. The record is only written when the tracked part is the same at the start and at the end of that subagent's run, so a `reviewer` that edits code reviews nothing. Any other type never counts, however its prompt is worded.
+The gate fingerprints the workspace again after the run. Untracked files that appeared meanwhile are that run's own output: they are stored with the record, and left out of the cache lookup, the review comparison and the leftover sweep. A `coverage.txt` written on every run therefore costs nothing after the first. A tracked file the verifier rewrote is not excused, because it moves the tracked hash that the review record is matched against. This happens on every stop the model chose, including one where `fullyIdle` is false. A stop the model did not choose (cancelled, errored, out of steps) runs nothing and only leaves a marker.
 
-The parent may stop when the tracked part still equals the reviewed one and no untracked file has appeared that the reviewer did not see itself. A file the reviewer created while it worked, a scratch diff or an artifact, is part of what it recorded, so it costs nothing.
+**The review**: subagent Stop events reach this hook too, and the gate identifies the conversation from its parent's record under `brain/<parent>/.system_generated/subagents/<cid>.json`. When a subagent whose `typeName` is exactly `reviewer` (or `visual-qa`, where the workspace has `.agents/visual.md`) stops, the gate records the workspace fingerprint it saw. The record is only written when the tracked part is the same at the start and at the end of that subagent's run, so a `reviewer` that edits code reviews nothing, and only when that judge had a real baseline of its own. Any other type never counts, however its prompt is worded. A workspace with no fingerprint at all, because it is not a git repository, gets no credit from a stored record either.
+
+The parent may stop when the tracked part still equals the reviewed one and no untracked file has appeared that the reviewer did not see itself. The reviewed set is the untracked files present both when the judge started and when it stopped, so a file it created in its own artifact directory costs nothing, and one it created anywhere else in the tree is new work its parent still has to account for.
+
+A judge owes no verifier run and no review, but its own Stop still runs the leftover sweep.
 
 The gate never reads the reviewer's answer. A reviewer that looks at the diff and says nothing useful still satisfies this check; the gate proves that a reviewer saw this exact tree, not that it did a good job.
 
@@ -121,9 +129,9 @@ The gate also refuses to finish while an untracked `.bak`, `.orig`, `.old`, `.tm
 
 When `workspacePaths` arrives empty, which is most stops, the gate derives the workspaces from the paths the edit tools named, through `git rev-parse --show-toplevel`. When `conversationId` is missing it comes from the `brain/<cid>/` directory of the transcript path; retries are never pooled under a shared key.
 
-The gate forces one retry per conversation, per kind of gap, per fingerprint: fixing something moves the fingerprint and earns a fresh try. After that it lets the stop through, prints one line to the terminal and writes a marker in `~/.gemini/tmp/pending/` naming what is still owed. The next invocation in that workspace reads it out once per conversation; only a stop over a verified fingerprint clears it, and every state file older than a day is dropped unread. An unreadable state file counts as a retry already spent.
+The gate forces one retry per conversation, per kind of gap, per fingerprint: fixing something moves the fingerprint and earns a fresh try. Three forced retries is the most any one conversation gets in total; after that the stop goes through with a line saying the gate has stopped asking. A release prints one line to the terminal and writes a marker in `~/.gemini/tmp/pending/` naming what is still owed. The next invocation in that workspace reads it out once per conversation; only a stop over a verified fingerprint clears it, and every state file older than a day is dropped unread. An unreadable state file counts as a retry already spent. A stop that carries no conversation id anywhere keeps its ledger under the workspace instead, so it still blocks once.
 
-Known gap until the write gate lands: nothing stops an agent from editing `.agents/verify.*`, the files under `hooks/`, the gate's own state under `~/.gemini/tmp/`, or a subagent record under `~/.gemini/`, so a determined agent can still forge what this gate reads.
+Known gap until the write gate lands: nothing stops an agent from editing `.agents/verify.*`, the files under `hooks/`, the gate's own state under `~/.gemini/tmp/`, or a subagent record under `~/.gemini/`, so a determined agent can still forge what this gate reads. Accepted with it: in a trusted workspace the gate runs code the repository controls, on every stop the model chose, including one where `fullyIdle` is false.
 
 ## Discipline
 

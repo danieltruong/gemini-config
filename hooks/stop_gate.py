@@ -26,7 +26,7 @@ DOCS_TIMEOUT = 30
 # answers before agy kills it and loses the decision.
 GATE_BUDGET = 700
 MIN_STEP = 5
-# forced continues per conversation, counted per gap kind and per fingerprint
+# forced continues per gap kind and per fingerprint; hookpaths caps the total per conversation
 MAX_RETRIES = 1
 MAX_REPORTED = 40
 VISUAL_REL = ".agents/visual.md"
@@ -55,9 +55,9 @@ VERIFIER_REASON = (
 )
 
 UNTRUSTED_REASON = (
-    "Blocked once: {ws} changed but is not in trustedWorkspaces in {settings}, so the gate "
-    "will not run anything there. Run {cmds} yourself and fix what it reports, or add the "
-    "workspace to that list so the gate can check it."
+    "Not checked, workspace is not trusted: {ws} changed, and it is not in trustedWorkspaces "
+    "in {settings}, so the gate ran nothing there. Run {cmds} yourself and fix what it "
+    "reports, or add the workspace to that list so the gate can check it."
 )
 
 REVIEW_REASON = (
@@ -78,6 +78,9 @@ LEFTOVERS_REASON = "delete leftovers: {paths}\nRemove them, then finish."
 UNFINISHED_NOTE = "changed but not verified: this run ended as {reason}"
 
 HUMAN_NOTE = "Stop allowed after one forced retry, still unmet: {summary}"
+
+CEILING_NOTE = ("Stop allowed: this conversation has already been sent back {n} times, "
+                "so the gate stops asking. Still unmet: {summary}")
 
 
 def remaining(deadline):
@@ -262,7 +265,7 @@ def is_junk(rel):
     return PYCACHE in parts or bool(hookpaths.BACKUP_SUFFIX.search(parts[-1]))
 
 
-def touched(ws, cid, fp, edited, names):
+def touched(ws, cid, fp, worked, edited):
     """Is there work in this workspace the gate has to account for?
 
     Not the same question as "is it verified": a subagent's passing verifier run does not
@@ -272,14 +275,24 @@ def touched(ws, cid, fp, edited, names):
         # not a git repository, so an edit tool naming a file here is the only signal left;
         # None means the transcript could not be read, which is not proof of nothing
         return edited is None or bool(edited)
-    if names and not work_names(names):
+    if fp.names and not work_names(fp.names):
         return False
-    # a tree that matches its own HEAD, with nothing untracked and nothing moved, owes nothing
-    return gitstate.moved(cid, ws, fp) or not gitstate.clean(ws)
+    if not gitstate.baseline(cid, ws):
+        # no baseline of this conversation's own, so dirt here may well predate it: the
+        # question becomes whether the run called anything that could have written at all
+        return worked
+    return gitstate.moved(cid, ws, fp)
+
+
+def cached_pass(ws, fp):
+    """Has the gate already run a passing verifier on this exact tree?"""
+    rec = gitstate.verified(ws)
+    return bool(rec.get("digest")) and fp is not None and rec["digest"] == gitstate.digest(
+        gitstate.without(fp, rec.get("artifacts") or []))
 
 
 def verifier_gap(ws, fp, names, deadline):
-    if fp is not None and gitstate.verified_digest(ws) == gitstate.digest(fp):
+    if cached_pass(ws, fp):
         return None  # this exact tree already passed, so running it again proves nothing
     steps = verifier_steps(ws)
     if not steps:
@@ -292,38 +305,61 @@ def verifier_gap(ws, fp, names, deadline):
     if found and found[1] != 0:
         return "verifier", VERIFIER_REASON.format(
             label=found[0], ws=ws, lines="\n".join(found[2][-MAX_REPORTED:]))
-    if fp is not None:
-        # after the run, so output the verifier itself leaves does not look like a new change
-        gitstate.save_verified(ws, gitstate.fingerprint(ws))
+    after = gitstate.fingerprint(ws) if fp is not None else None
+    if after is not None:
+        # untracked files the run itself left are its output, not a change anyone has to
+        # account for; a tracked file it rewrote is not excused, and moves the tracked hash
+        made = (gitstate.artifacts(ws) | (set(after.untracked) - set(fp.untracked)))
+        gitstate.save_verified(ws, after, made & set(after.untracked))
     return None
 
 
-def review_why(ws, fp, kind):
+def review_why(ws, fp, kind, ignore):
     """Why this kind of review does not cover the tree in front of us, or ''."""
-    rec = gitstate.review(ws, kind)
     if fp is None:
-        return "" if rec else f"no {kind} has seen this workspace"
+        # no fingerprint to tie a record to, so nothing here can be shown to have been reviewed
+        return f"{kind} cover cannot be proved without git in this workspace"
+    rec = gitstate.review(ws, kind)
     if not rec:
         return f"no {kind} has seen the current state"
-    if rec.get("tracked") != fp[0]:
+    if rec.get("tracked") != fp.tracked:
         return f"tracked files changed after the {kind} run, so it did not see this tree"
-    fresh = sorted(set(fp[1]) - set(rec.get("untracked") or []))
+    fresh = sorted(set(fp.untracked) - set(rec.get("untracked") or []) - ignore)
     return f"{fresh[0]} is new since the {kind} run" if fresh else ""
 
 
-def review_gap(ws, fp):
-    why = review_why(ws, fp, "reviewer")
+def review_gap(ws, fp, ignore):
+    why = review_why(ws, fp, "reviewer", ignore)
     if why:
         return "no-review", REVIEW_REASON.format(why=why, ws=ws, kind="reviewer")
     if os.path.isfile(os.path.join(ws, VISUAL_REL)):
-        why = review_why(ws, fp, "visual-qa")
+        why = review_why(ws, fp, "visual-qa", ignore)
         if why:
             return "no-visual", VISUAL_REASON.format(why=why, ws=ws, rel=VISUAL_REL)
     return None
 
 
-def workspace_gap(ws, cid, fp, names, role, deadline):
+def run_output(ws, fp, outside):
+    """Untracked paths nobody has to account for: verifier output, and the run's own scratch."""
+    if fp is None:
+        return set()
+    ignore = {rel for rel in fp.untracked
+              if any(transcript.under(os.path.join(ws, rel), root) for root in outside if root)}
+    return ignore | gitstate.artifacts(ws)
+
+
+def leftover_gap(ws, cid, fp, ignore):
+    """Backup files and caches this conversation left behind."""
+    junk = [rel for rel in gitstate.new_untracked(cid, ws, fp)
+            if is_junk(rel) and rel not in ignore]
+    if not junk:
+        return None
+    return "leftovers", LEFTOVERS_REASON.format(paths=", ".join(sorted(junk)[:MAX_REPORTED]))
+
+
+def workspace_gap(ws, cid, fp, role, outside, deadline):
     """The first piece of missing proof for one changed workspace, or None."""
+    names = fp.names if fp is not None else None
     only_docs = docs_only(names)
     if not only_docs:
         found = verifier_gap(ws, fp, names, deadline)
@@ -332,21 +368,25 @@ def workspace_gap(ws, cid, fp, names, role, deadline):
     docs = docs_findings(ws, names, deadline)
     if docs:
         return "docs", DOCS_REASON.format(lines="\n".join(docs[:MAX_REPORTED]))
-    junk = [rel for rel in gitstate.new_untracked(cid, ws, fp) if is_junk(rel)]
-    if junk:
-        return "leftovers", LEFTOVERS_REASON.format(paths=", ".join(sorted(junk)[:MAX_REPORTED]))
+    ignore = run_output(ws, fp, outside)  # read after the verifier ran, so its output is in
+    found = leftover_gap(ws, cid, fp, ignore)
+    if found:
+        return found
     # a subagent answers to the run that spawned it, and a docs change is its own check
     if role or only_docs:
         return None
-    return review_gap(ws, fp)
+    return review_gap(ws, fp, ignore)
 
 
 def derived_spaces(calls, outside):
     """Repository roots holding the files an edit tool named, for stops that carry no workspace."""
-    out = []
+    roots, out = {}, []
     for path in transcript.written_paths(calls, outside):
-        top = gitstate.toplevel(os.path.dirname(path))
-        top = os.path.abspath(top) if top else ""
+        parent = os.path.dirname(path)
+        if parent not in roots:  # many edits share a directory, and each lookup is a git call
+            top = gitstate.toplevel(parent)
+            roots[parent] = os.path.abspath(top) if top else ""
+        top = roots[parent]
         if top and os.path.isdir(top) and top not in out:
             out.append(top)
     return out
@@ -367,9 +407,40 @@ def workspaces(ev, calls, outside):
 def clear_verified(spaces):
     """Drop a pending marker only where the tree in front of us is one the gate proved."""
     for ws in spaces:
-        record = gitstate.verified_digest(ws)
-        if record and record == gitstate.digest(gitstate.fingerprint(ws)):
+        if cached_pass(ws, gitstate.fingerprint(ws)):
             hookpaths.clear_pending(ws)
+
+
+def first_gap(spaces, find):
+    """(gap, workspace it belongs to) for the first workspace that has one."""
+    for ws in spaces:
+        gap = find(ws)
+        if gap:
+            return gap, ws
+    return None, (spaces[0] if spaces else "")
+
+
+def release_reason(kind, ledger, message):
+    """What the terminal is told when the gate lets an unmet stop through."""
+    if kind == "untrusted":
+        return message  # nothing ran and nothing was forced, so retry wording would be a lie
+    if hookpaths.forced_count(ledger) >= hookpaths.MAX_FORCED:
+        return CEILING_NOTE.format(n=hookpaths.MAX_FORCED, summary=message)
+    return HUMAN_NOTE.format(summary=message)
+
+
+def answer(gap, culprit, cid, fp, spaces, deadline, detail):
+    """Force one more turn for this gap, or release the stop and leave a marker."""
+    kind, message = gap
+    budget = f"{int(max(0, remaining(deadline)))}s of the {GATE_BUDGET}s gate budget left."
+    # without a conversation id the workspace is the ledger, so the gate still blocks once
+    ledger = cid or f"workspace {hookpaths.ws_key(culprit)}"
+    allowance = f"{kind}:{gitstate.digest(fp) or 'nogit'}"
+    if kind != "untrusted" and hookpaths.take_retry(ledger, allowance, MAX_RETRIES):
+        return {"decision": "continue", "reason": message + "\n" + budget}, kind, detail, spaces
+    hookpaths.write_pending(culprit, [message])
+    return ({"decision": "stop", "reason": release_reason(kind, ledger, message)},
+            "release", f"{kind} {detail}", spaces)
 
 
 def decide(ev, deadline):
@@ -377,7 +448,7 @@ def decide(ev, deadline):
     tpath = hookpaths.real_path(ev.get("transcriptPath") or "")
     artifact = hookpaths.real_path(ev.get("artifactDirectoryPath") or "")
     brain = transcript.brain_root(tpath)
-    cid = ev.get("conversationId") or transcript.conversation_of(tpath)
+    cid = transcript.conversation_id(ev)
     steps = transcript.load(tpath)
     calls = transcript.calls(steps)
     outside = (artifact, brain)
@@ -386,23 +457,31 @@ def decide(ev, deadline):
         log(",".join(dropped), "unresolved", "workspace path dropped")
     prints = {ws: gitstate.fingerprint(ws) for ws in spaces}
     role = transcript.subagent_type(cid, brain)
-    # reinforce.py records this at PreInvocation; a first Stop is the fallback
+    # reinforce.py takes the baseline at PreInvocation. Reaching a Stop without one means the
+    # turn's work has already happened, so the record is marked as the fallback it is.
     for ws in spaces:
-        gitstate.note_seen(cid, ws, prints[ws])
+        gitstate.note_seen(cid, ws, prints[ws], fallback=True)
 
     if role in transcript.JUDGE_TYPES:
-        # a judging subagent owes nothing: it records what it saw and gets out of the way
+        # a judge owes no verifier run and no review: it records what it saw, but it still
+        # has to clean up after itself
         kept = [ws for ws in spaces if gitstate.save_review(cid, ws, role, prints[ws])]
-        return ({"decision": "stop"}, "review",
-                f"{role} recorded {len(kept)}/{len(spaces)}", spaces)
+        detail = f"{role} recorded {len(kept)}/{len(spaces)}"
+        gap, culprit = first_gap(spaces, lambda ws: leftover_gap(
+            ws, cid, prints[ws], run_output(ws, prints[ws], outside)))
+        if not gap:
+            return {"decision": "stop"}, "review", detail, spaces
+        return answer(gap, culprit, cid, prints[culprit], spaces, deadline, detail)
 
     if not spaces:
         return {"decision": "stop"}, "no-workspace", "no workspace to judge", spaces
 
-    names = {ws: gitstate.changed_names(ws) for ws in spaces}
+    # with no baseline of its own the gate cannot tell this run's work from older dirt, so any
+    # call that could have written counts as work in every workspace of this stop
+    worked = steps is None or transcript.did_work(calls)
     edited = {ws: (None if steps is None else transcript.edits(calls, ws, outside))
               for ws in spaces}
-    dirty = [ws for ws in spaces if touched(ws, cid, prints[ws], edited[ws], names[ws])]
+    dirty = [ws for ws in spaces if touched(ws, cid, prints[ws], worked, edited[ws])]
     finished = ev.get("terminationReason") in MODEL_FINISHED
 
     if not dirty:
@@ -418,26 +497,13 @@ def decide(ev, deadline):
         return ({"decision": "stop"}, "pending",
                 f"reason={reason!r} changed={len(dirty)}", spaces)
 
-    gap, culprit = None, dirty[0]
-    for ws in dirty:
-        gap = workspace_gap(ws, cid, prints[ws], names[ws], role, deadline)
-        if gap:
-            culprit = ws
-            break
-
+    gap, culprit = first_gap(dirty, lambda ws: workspace_gap(
+        ws, cid, prints[ws], role, outside, deadline))
     if not gap:
         clear_verified(dirty)
         return {"decision": "stop"}, "stop", "verified", spaces
-
-    kind, message = gap
-    detail = f"{role or 'top-level'} {culprit}"
-    budget = f"{int(max(0, remaining(deadline)))}s of the {GATE_BUDGET}s gate budget left."
-    allowance = f"{kind}:{gitstate.digest(prints[culprit]) or 'nogit'}"
-    if kind != "untrusted" and hookpaths.take_retry(cid, allowance, MAX_RETRIES):
-        return {"decision": "continue", "reason": message + "\n" + budget}, kind, detail, spaces
-    hookpaths.write_pending(culprit, [message])
-    return ({"decision": "stop", "reason": HUMAN_NOTE.format(summary=message)},
-            "release", f"{kind} {detail}", spaces)
+    return answer(gap, culprit, cid, prints[culprit], spaces, deadline,
+                  f"{role or 'top-level'} {culprit}")
 
 
 def main():

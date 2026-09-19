@@ -14,14 +14,16 @@ import hookpaths
 
 EDIT_TOOLS = {"replace_file_content", "write_to_file", "multi_replace_file_content",
               "sed_file", "edit_file", "create_file"}
-SPAWN_TOOL = "invoke_subagent"
+RUN_TOOL = "run_command"
+# a call that could have changed a tree, whatever it was actually spelled to do
+WORK_TOOLS = EDIT_TOOLS | {RUN_TOOL}
+# a subagent record with no readable type still marks a subagent, which owes no review
+UNKNOWN_TYPE = "subagent"
 # delegation that judges work instead of changing it
 JUDGE_TYPES = ("reviewer", "visual-qa")
 # the agent's own answer to the gate, not work the gate should judge
 SCRATCH_FILES = {".agents/DECISIONS.md"}
 PATH_KEYS = ("TargetFile", "AbsolutePath")
-# every tool result is a step of this type; the other types are messages and checkpoints
-RESULT_TYPE = "GENERIC"
 FULL_TRANSCRIPT = "transcript_full.jsonl"
 GENERATED_DIR = ".system_generated"
 SUBAGENT_RECORDS = os.path.join("*", GENERATED_DIR, "subagents")
@@ -100,18 +102,27 @@ def conversation_of(path):
     return os.path.basename(os.path.dirname(generated))
 
 
+def conversation_id(event):
+    """The conversation this hook payload belongs to, the same way in every hook.
+
+    agy omits conversationId from most Stop payloads, and a shared fallback key would let
+    one conversation spend another one's retry, so the transcript's own directory answers.
+    """
+    return (event.get("conversationId")
+            or conversation_of(hookpaths.real_path(event.get("transcriptPath") or "")))
+
+
 def subagent_type(cid, root):
     """The typeName the parent recorded for this conversation, or '' when it is top-level.
 
     The record's state field stays ALIVE after the subagent finishes, so only existence counts.
-    A record without a readable type still marks a subagent, which owes no review.
     """
     if not cid or not root:
         return ""
     for path in glob.glob(os.path.join(root, SUBAGENT_RECORDS, f"{cid}.json")):
         data = hookpaths.read_json_file(path) or {}
         name = str((data.get("subagentDescriptor") or {}).get("typeName") or "").strip()
-        return name or SPAWN_TOOL
+        return name or UNKNOWN_TYPE
     return ""
 
 
@@ -132,6 +143,15 @@ def calls(steps):
         for call in step.get("tool_calls") or []:
             out.append((step.get("step_index", i), call.get("name") or "", call.get("args") or {}))
     return out
+
+
+def did_work(calls_made):
+    """Did this conversation call anything that could have written to a tree?
+
+    The cheap signal for a stop with no baseline of its own. The command text is never read:
+    matching it is what the old transcript-reading gate did, and it was gamed.
+    """
+    return any(name in WORK_TOOLS for _index, name, _args in calls_made or ())
 
 
 def targets(args):
