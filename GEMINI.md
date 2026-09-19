@@ -49,7 +49,7 @@
 ## Tools
 
 - Native tool first: `view_file`, `grep_search`, `find_by_name`, `replace_file_content`, `write_to_file`, `run_command`. Shell script only when native tool cannot.
-- MCP when it cover domain: `mcpjungle` for GitHub, Jira, Confluence, context7 docs; `playwright` for local browser; `renpy` for Ren'Py project.
+- MCP when it cover domain: `playwright` for local browser; `renpy` for Ren'Py project.
 - Load skill before hand-roll its procedure: `caveman-commit` for commit message, `ponytail-review` or `caveman-review` for code review, `a11y-audit` for accessibility, `mcp-builder` for MCP server, `skill-creator` for new skill, `webapp-testing` for browser flow, `pdf` for PDF work.
 - Delegate work to subagent with fresh context. Roster and rules: `## Orchestrate`.
 
@@ -113,7 +113,7 @@ End of run, when run hit tool quirk, wrong or missing rule, missing permission, 
 
 ## Models
 
-Use `gemini-3.8-flash-high` for all Gemini work. No step down to lower Flash tier or effort. Escalate to `claude-opus-4-6-thinking` only for long autonomous task that already loop or stall once on Flash. Subagent: `reviewer` run on pro, `researcher` and `linter` run on flash, rest inherit.
+Use `gemini-3.8-flash-high` for all Gemini work. No step down to lower Flash tier or effort. Subagent: `reviewer` run on pro, `researcher` and `linter` run on flash, rest inherit.
 
 ## Git
 
