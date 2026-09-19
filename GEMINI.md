@@ -67,8 +67,10 @@
 
 - UI change: follow `.agents/visual.md`. Open every URL under `## Pages`, screenshot, check each bullet under `## Accept`, fix, repeat until all pass. Spawn `visual-qa` subagent after last change.
 
-- Stop gate read transcript, not your word: verifier pass run from inside workspace after last change, `reviewer` subagent after first change, `visual-qa` after last change when `.agents/visual.md` exist. Subagent owe verifier only. Edit of instruction doc alone owe neither.
-- Subagent edit and shell write count as change. Gate block once per missing check, then release and announce gap at start of next conversation in that workspace.
+- Stop gate watches the git tree, not typed commands: work means the tree moved since the conversation started. It runs the workspace verifier itself, but run it yourself first anyway — a red verifier still forces a continue, and each conversation gets at most 3 before it releases with a marker. Editing only instruction docs owes neither verifier nor review.
+- Review counts only when a `reviewer` subagent (UI work: also `visual-qa`) finishes clean on the current tree and changed no tracked file. Any edit after that makes it stale, so review last, once the verifier is green. A reviewer must not edit or create files in the workspace.
+- Put scratch file (diff dump, note, log) in the conversation's artifact directory or a git-ignored path, never the repo root: an untracked file in the workspace counts as both a change and a leftover.
+- An untrusted workspace or a folder with no git is reported as not checked, not blocked.
 - One conversation per plan. After plan work verify and review clean, or after first compaction notice, write short handoff and tell Daniel to open new conversation.
 - Headless result that feed script use `--json-schema`.
 - Never say task done while verifier fail.
