@@ -11,6 +11,34 @@ import unittest
 from pathlib import Path
 
 HOOKS_DIR = Path(__file__).resolve().parent.parent
+RESULT = ("Created At: 2026-09-18T00:00:00-07:00\n"
+          "Completed At: 2026-09-18T00:00:01-07:00\n\nThe command exited with code {code}.\n")
+
+
+def write_transcript(path, events, root):
+    """Write a transcript of ("edit", rel), ("verifier", passed) and ("reviewer",) events.
+
+    Every tool call is answered by a result step, the way agy records one.
+    """
+    steps = []
+    for event in events:
+        if event[0] == "edit":
+            call = {"name": "write_to_file",
+                    "args": {"TargetFile": os.path.join(root, event[1].replace("/", os.sep))}}
+            code = 0
+        elif event[0] == "verifier":
+            call = {"name": "run_command", "args": {"CommandLine": "python -m pytest -q"}}
+            code = 0 if event[1] else 1
+        else:
+            call = {"name": "invoke_subagent",
+                    "args": {"Subagents": [{"TypeName": "reviewer", "Role": "Code Reviewer"}]}}
+            code = 0
+        steps.append({"step_index": len(steps), "type": "PLANNER_RESPONSE", "tool_calls": [call]})
+        steps.append({"step_index": len(steps), "type": "GENERIC",
+                      "content": RESULT.format(code=code)})
+    Path(path).write_text("\n".join(json.dumps(s) for s in steps) + "\n", encoding="utf-8")
+    return str(path)
+
 
 class TestHooks(unittest.TestCase):
     def test_reinforce_hook(self):
@@ -314,30 +342,35 @@ class TestStopGate(unittest.TestCase):
 
     def payload(self, **kw):
         base = {
-            "executionNum": 1, "terminationReason": "model_stop", "fullyIdle": True,
+            "executionNum": 0, "terminationReason": "model_stop", "fullyIdle": True,
             "workspacePaths": ["/proj"],
         }
         base.update(kw)
         return base
 
-    def write_audit(self, **fields):
-        """A fresh audit report, which is what lets a code-touching session reach stop."""
-        data = {"clean": True, "findings": 0, "round": 1}
-        data.update(fields)
-        agents = Path(self.tmp) / ".agents"
-        agents.mkdir(exist_ok=True)
-        path = agents / "audit.json"
-        path.write_text(json.dumps(data), encoding="utf-8")
-        return path
+    def transcript_of(self, *events, root=None, path=None):
+        """Transcript path for ("edit", rel), ("verifier", passed) and ("reviewer",) events."""
+        return write_transcript(path or Path(self.tmp) / "t.jsonl", events, root or self.tmp)
+
+    def transcript_writing(self, *rels):
+        """A transcript in which this session wrote each given workspace-relative path."""
+        return self.transcript_of(*[("edit", rel) for rel in rels])
+
+    def verified(self, *rels, root=None):
+        """The same, then a passing verifier run and a reviewer subagent, so evidence is complete."""
+        return self.transcript_of(*[("edit", rel) for rel in rels],
+                                  ("verifier", True), ("reviewer",), root=root)
+
+    def pytest_marker(self):
+        """Gives the workspace a verifier, so the gate can name the command the agent owes."""
+        (Path(self.tmp) / "pyproject.toml").write_text("[project]\nname = 'x'\n", encoding="utf-8")
 
     def test_non_renpy_workspace_stops(self):
-        self.write_audit()
         res = self.run_hook(self.payload(workspacePaths=[self.tmp]))
         self.assertEqual(res.get("decision"), "stop")
 
     def leftover(self, name, directory=False):
-        """A stray file or directory in the workspace, with a clean audit already filed."""
-        self.write_audit()
+        """A stray file or directory the session left in the workspace."""
         path = Path(self.tmp) / name
         path.mkdir() if directory else path.write_text("stale\n", encoding="utf-8")
         return self.run_hook(self.payload(workspacePaths=[self.tmp]))
@@ -356,7 +389,6 @@ class TestStopGate(unittest.TestCase):
 
     def test_unignored_pycache_is_a_leftover(self):
         """Not empty, so only the __pycache__ rule can catch it."""
-        self.write_audit()
         cache = Path(self.tmp) / "__pycache__"
         cache.mkdir()
         (cache / "app.cpython-313.pyc").write_bytes(b"\x00")
@@ -380,9 +412,19 @@ class TestStopGate(unittest.TestCase):
         res = self.run_hook(self.payload(terminationReason="max_steps_exceeded"))
         self.assertEqual(res.get("decision"), "stop")
 
-    def test_not_fully_idle_stops(self):
+    def test_not_fully_idle_stops_when_nothing_was_edited(self):
         res = self.run_hook(self.payload(fullyIdle=False))
         self.assertEqual(res.get("decision"), "stop")
+
+    def test_not_fully_idle_still_blocks_unverified_edits(self):
+        """The transcript check runs no commands, so background tasks cannot excuse it."""
+        self.pytest_marker()
+        res = self.run_hook(self.payload(
+            fullyIdle=False, workspacePaths=[self.tmp],
+            transcriptPath=self.transcript_writing("app.py"),
+        ))
+        self.assertEqual(res.get("decision"), "continue")
+        self.assertIn("no passing verifier run after your last edit (step 0)", res["reason"])
 
     def test_git_filtered_errors_continue(self):
         res = self.run_hook(self.payload(), stub=self.stub(["game/changed.rpy"]))
@@ -402,26 +444,13 @@ class TestStopGate(unittest.TestCase):
 
     def test_transcript_filter_overrides_git(self):
         """git calls changed.rpy dirty, but this session only wrote untouched.rpy."""
-        path = Path(self.tmp) / "t.jsonl"
-        path.write_text(json.dumps({
-            "tool_calls": [{"name": "write_to_file",
-                            "args": {"TargetFile": json.dumps(os.path.abspath("/proj") + "\\game\\untouched.rpy")}}]
-        }) + "\n", encoding="utf-8")
+        path = self.verified("game/untouched.rpy", root=os.path.abspath("/proj"))
         res = self.run_hook(
-            self.payload(transcriptPath=str(path)), stub=self.stub(["game/changed.rpy"])
+            self.payload(transcriptPath=path), stub=self.stub(["game/changed.rpy"])
         )
         self.assertEqual(res.get("decision"), "continue")
         self.assertIn("game/untouched.rpy:9", res["reason"])
         self.assertNotIn("game/changed.rpy", res["reason"])
-
-    def transcript_writing(self, *relpaths):
-        """A transcript in which this session wrote each given project-relative path."""
-        path = Path(self.tmp) / "t.jsonl"
-        path.write_text("\n".join(json.dumps({
-            "tool_calls": [{"name": "write_to_file", "args": {
-                "TargetFile": json.dumps(os.path.join(self.tmp, rel.replace("/", os.sep)))}}]
-        }) for rel in relpaths) + "\n", encoding="utf-8")
-        return str(path)
 
     def test_bad_instruction_doc_gates_at_stop(self):
         """PostToolUse never fires in 1.1.27, so the Stop hook has to catch this."""
@@ -436,6 +465,7 @@ class TestStopGate(unittest.TestCase):
         self.assertIn("dead-path: ~/.gemini/nope-does-not-exist", res["reason"])
 
     def test_clean_instruction_doc_stops(self):
+        """An instruction doc is not code, so it owes no reviewer."""
         (Path(self.tmp) / "GEMINI.md").write_text("# Rules\n\n- Keep it short.\n", encoding="utf-8")
         res = self.run_hook(self.payload(
             workspacePaths=[self.tmp], transcriptPath=self.transcript_writing("GEMINI.md")
@@ -444,21 +474,21 @@ class TestStopGate(unittest.TestCase):
 
     def test_non_instruction_file_is_not_docs_linted(self):
         (Path(self.tmp) / "notes.md").write_text("`~/.gemini/nope-does-not-exist`\n", encoding="utf-8")
-        self.write_audit()
         res = self.run_hook(self.payload(
-            workspacePaths=[self.tmp], transcriptPath=self.transcript_writing("notes.md")
+            workspacePaths=[self.tmp], transcriptPath=self.verified("notes.md")
         ))
         self.assertEqual(res.get("decision"), "stop")
 
-    def test_docs_findings_respect_execution_cap(self):
+    def test_docs_findings_release_after_the_cap(self):
         (Path(self.tmp) / "GEMINI.md").write_text(
             "# Rules\n\n- See `~/.gemini/nope-does-not-exist` for details.\n", encoding="utf-8"
         )
         res = self.run_hook(self.payload(
-            executionNum=4, workspacePaths=[self.tmp],
+            executionNum=1, workspacePaths=[self.tmp],
             transcriptPath=self.transcript_writing("GEMINI.md"),
         ))
         self.assertEqual(res.get("decision"), "stop")
+        self.assertIn("still unmet: docs", res.get("reason", ""))
 
     def test_real_verify_script_failure_continues(self):
         """End to end through subprocess: a .agents verifier that exits 1."""
@@ -471,7 +501,7 @@ class TestStopGate(unittest.TestCase):
             (agents / "verify.sh").write_text("echo FAIL\nexit 1\n", encoding="utf-8")
             label = ".agents/verify.sh"
         res = self.run_hook(self.payload(
-            workspacePaths=[self.tmp], transcriptPath=self.transcript_writing("src/app.py")
+            workspacePaths=[self.tmp], transcriptPath=self.verified("src/app.py")
         ))
         self.assertEqual(res.get("decision"), "continue")
         self.assertIn(f"Verifier failed ({label}):", res["reason"])
@@ -482,89 +512,113 @@ class TestStopGate(unittest.TestCase):
         """A stop after this session wrote one source file into the workspace."""
         (Path(self.tmp) / "app.py").write_text("x = 1\n", encoding="utf-8")
         kw.setdefault("workspacePaths", [self.tmp])
-        kw.setdefault("transcriptPath", self.transcript_writing("app.py"))
+        if "transcriptPath" not in kw:  # setdefault would rewrite a transcript the caller built
+            kw["transcriptPath"] = self.transcript_writing("app.py")
         return self.payload(**kw)
 
-    def test_missing_audit_report_continues(self):
-        res = self.run_hook(self.code_payload(executionNum=0))
+    def test_hand_written_audit_report_is_not_evidence(self):
+        """The old gate read .agents/audit.json, which the agent could simply write."""
+        self.pytest_marker()
+        agents = Path(self.tmp) / ".agents"
+        agents.mkdir(exist_ok=True)
+        (agents / "audit.json").write_text(json.dumps({"clean": True, "round": 1}),
+                                           encoding="utf-8")
+        res = self.run_hook(self.code_payload())
         self.assertEqual(res.get("decision"), "continue")
-        self.assertIn("Audit round 1:", res["reason"])
-        self.assertIn("re-run the verifier", res["reason"])
-        self.assertIn(
-            "Delegate: reviewer for findings, linter for lint fixes, tester for missing tests, "
-            "visual-qa for .agents/visual.md.",
-            res["reason"],
-        )
+        self.assertIn("no passing verifier run", res["reason"])
 
-    def test_stale_audit_report_continues(self):
-        """A report older than the newest file this session wrote judged different code."""
-        payload = self.code_payload()
-        self.write_audit(round=2)
-        later = time.time() + 60
-        os.utime(Path(self.tmp) / "app.py", (later, later))
-        res = self.run_hook(payload)
+    def test_verifier_before_the_last_edit_does_not_count(self):
+        self.pytest_marker()
+        path = self.transcript_of(("edit", "app.py"), ("verifier", True), ("edit", "app.py"))
+        res = self.run_hook(self.code_payload(transcriptPath=path))
         self.assertEqual(res.get("decision"), "continue")
-        self.assertIn("Audit round 3:", res["reason"])
+        self.assertIn("no passing verifier run after your last edit (step 4)", res["reason"])
 
-    def test_unclean_audit_report_continues(self):
-        payload = self.code_payload()
-        self.write_audit(clean=False, findings=2, round=1)
-        res = self.run_hook(payload)
+    def test_failed_verifier_does_not_count(self):
+        self.pytest_marker()
+        path = self.transcript_of(("edit", "app.py"), ("verifier", False), ("reviewer",))
+        res = self.run_hook(self.code_payload(transcriptPath=path))
         self.assertEqual(res.get("decision"), "continue")
-        self.assertIn("Audit round 2:", res["reason"])
+        self.assertIn("`python -m pytest -q -x`", res["reason"])
 
-    def test_fresh_clean_audit_stops_and_report_is_deleted(self):
-        payload = self.code_payload()
-        report = self.write_audit()
-        res = self.run_hook(payload)
+    def test_verified_and_reviewed_work_stops(self):
+        res = self.run_hook(self.code_payload(transcriptPath=self.verified("app.py")))
         self.assertEqual(res.get("decision"), "stop")
-        self.assertFalse(report.exists())
 
-    def test_audit_cap_counts_rounds_not_executions(self):
-        """Verifier retries burn executionNum, so the cap has to read the report's round."""
-        payload = self.code_payload(executionNum=9)
-        self.write_audit(clean=False, round=4)
-        res = self.run_hook(payload)
+    def test_missing_reviewer_blocks(self):
+        path = self.transcript_of(("edit", "app.py"), ("verifier", True))
+        res = self.run_hook(self.code_payload(transcriptPath=path))
         self.assertEqual(res.get("decision"), "continue")
-        self.assertIn("Audit round 5:", res["reason"])
+        self.assertIn("no reviewer spawned after your last edit (step 0)", res["reason"])
+        self.assertIn("TypeName reviewer", res["reason"])
 
-        self.write_audit(clean=False, round=5)
-        res = self.run_hook(payload)
+    def test_second_stop_is_released_with_a_message_for_the_human(self):
+        path = self.transcript_of(("edit", "app.py"), ("verifier", True))
+        res = self.run_hook(self.code_payload(executionNum=1, transcriptPath=path))
         self.assertEqual(res.get("decision"), "stop")
-        self.assertIn("audit cap", (Path(self.tmp) / "stop_gate.log").read_text(encoding="utf-8"))
+        self.assertIn("Stop allowed after one forced retry", res["reason"])
+        self.assertIn("no reviewer spawned", res["reason"])
+        self.assertIn("release", (Path(self.tmp) / "stop_gate.log").read_text(encoding="utf-8"))
 
-    def test_visual_spec_adds_visual_audit(self):
+    def subagent_transcript(self, cid, type_name="coder"):
+        """A brain tree in which cid is another conversation's subagent."""
+        logs = Path(self.tmp) / "brain" / cid / ".system_generated" / "logs"
+        logs.mkdir(parents=True, exist_ok=True)
+        records = Path(self.tmp) / "brain" / "parent-cid" / ".system_generated" / "subagents"
+        records.mkdir(parents=True, exist_ok=True)
+        (records / f"{cid}.json").write_text(json.dumps({
+            "conversationId": cid, "subagentDescriptor": {"typeName": type_name},
+            "state": "SUBAGENT_STATE_ALIVE", "spawnStepIndex": 12}), encoding="utf-8")
+        return logs / "transcript.jsonl"
+
+    def test_subagent_with_a_green_verifier_needs_no_reviewer(self):
+        cid = "sub-cid"
+        path = self.transcript_of(("edit", "app.py"), ("verifier", True),
+                                  path=self.subagent_transcript(cid))
+        res = self.run_hook(self.code_payload(conversationId=cid, transcriptPath=path))
+        self.assertEqual(res.get("decision"), "stop")
+
+    def test_subagent_still_owes_the_verifier(self):
+        cid = "sub-cid"
+        self.pytest_marker()
+        path = self.transcript_of(("edit", "app.py"), path=self.subagent_transcript(cid))
+        res = self.run_hook(self.code_payload(conversationId=cid, transcriptPath=path))
+        self.assertEqual(res.get("decision"), "continue")
+        self.assertIn("no passing verifier run", res["reason"])
+
+    def test_subagent_that_edited_nothing_stops(self):
+        cid = "sub-cid"
+        self.pytest_marker()
+        path = self.transcript_of(("verifier", False),
+                                  path=self.subagent_transcript(cid, "reviewer"))
+        res = self.run_hook(self.payload(
+            conversationId=cid, workspacePaths=[self.tmp], transcriptPath=path))
+        self.assertEqual(res.get("decision"), "stop")
+
+    def test_visual_spec_is_named_in_the_reviewer_block(self):
         (Path(self.tmp) / ".agents").mkdir(exist_ok=True)
         (Path(self.tmp) / ".agents" / "visual.md").write_text(
             "## Pages\n\nhttp://localhost:5173/\n\n## Accept\n\n- Nav is visible\n", encoding="utf-8"
         )
-        payload = self.code_payload()
-        self.write_audit(visual={"pages": 1, "failed": 1})
-        res = self.run_hook(payload)
+        path = self.transcript_of(("edit", "app.py"), ("verifier", True))
+        res = self.run_hook(self.code_payload(transcriptPath=path))
         self.assertEqual(res.get("decision"), "continue")
         self.assertIn("capture_browser_screenshot", res["reason"])
 
-    def test_writing_the_audit_report_is_not_a_code_change(self):
+    def test_scratch_files_are_not_edits(self):
         """Otherwise answering the gate would itself keep the gate open."""
-        self.write_audit(clean=False)
         res = self.run_hook(self.payload(
             workspacePaths=[self.tmp],
-            transcriptPath=self.transcript_writing(".agents/audit.json"),
+            transcriptPath=self.transcript_writing(".agents/audit.json",
+                                                   ".agents/DECISIONS.md"),
         ))
         self.assertEqual(res.get("decision"), "stop")
 
     def test_no_visual_spec_means_no_visual_text(self):
-        res = self.run_hook(self.code_payload())
+        path = self.transcript_of(("edit", "app.py"), ("verifier", True))
+        res = self.run_hook(self.code_payload(transcriptPath=path))
         self.assertEqual(res.get("decision"), "continue")
         self.assertNotIn("capture_browser_screenshot", res["reason"])
-
-    def test_audit_skipped_when_only_docs_touched(self):
-        (Path(self.tmp) / "GEMINI.md").write_text("# Rules\n\n- Keep it short.\n", encoding="utf-8")
-        res = self.run_hook(self.payload(
-            executionNum=0, workspacePaths=[self.tmp],
-            transcriptPath=self.transcript_writing("GEMINI.md"),
-        ))
-        self.assertEqual(res.get("decision"), "stop")
 
     def test_untouched_workspace_is_skipped(self):
         """A session that wrote nothing here must not trigger the verifier."""
@@ -578,15 +632,15 @@ class TestStopGate(unittest.TestCase):
         ))
         self.assertEqual(res.get("decision"), "stop")
 
-    def test_execution_num_4_drops_the_verifier(self):
-        res = self.run_hook(self.payload(executionNum=4), stub=self.stub(["game/changed.rpy"]))
-        self.assertNotIn("Verifier failed", res.get("reason", ""))
+    def test_execution_cap_releases_the_failing_verifier(self):
+        res = self.run_hook(self.payload(executionNum=1), stub=self.stub(["game/changed.rpy"]))
+        self.assertEqual(res.get("decision"), "stop")
+        self.assertIn("still unmet: verifier", res.get("reason", ""))
 
     def test_msys_workspace_path_is_normalized(self):
         """agy started from Git Bash sends /c/Users/...; Windows Python cannot open that."""
         drive, rest = os.path.splitdrive(os.path.abspath(self.tmp))
         msys = "/" + drive[0].lower() + rest.replace("\\", "/")
-        self.write_audit()
         res = self.run_hook(self.payload(workspacePaths=[msys]))
         self.assertEqual(res.get("decision"), "stop")
         logged = (Path(self.tmp) / "stop_gate.log").read_text(encoding="utf-8")
@@ -598,37 +652,12 @@ class TestStopGate(unittest.TestCase):
         self.assertEqual(res.get("decision"), "stop")
         self.assertIn("unresolved", (Path(self.tmp) / "stop_gate.log").read_text(encoding="utf-8"))
 
-    def test_transcript_paths_match_case_insensitively(self):
-        """agy reports C:\\Users\\... while the transcript may say c:\\users\\..."""
-        (Path(self.tmp) / "app.py").write_text("x = 1\n", encoding="utf-8")
-        transcript = Path(self.tmp) / "t.jsonl"
-        transcript.write_text(json.dumps({"tool_calls": [{"name": "write_to_file", "args": {
-            "TargetFile": json.dumps(str(Path(self.tmp) / "app.py").swapcase())}}]}) + "\n",
-            encoding="utf-8")
-        self.write_audit()
-        res = self.run_hook(self.payload(
-            workspacePaths=[self.tmp], transcriptPath=str(transcript)
-        ))
-        expected = "stop" if os.name == "nt" else "continue"
-        self.assertEqual(res.get("decision"), expected)
-
-    def test_decisions_file_does_not_stale_the_audit(self):
-        """GEMINI.md writes DECISIONS.md after audit.json, so it must not count as an edit."""
-        payload = self.code_payload()
-        self.write_audit()
-        decisions = Path(self.tmp) / ".agents" / "DECISIONS.md"
-        later = time.time() + 60
-        decisions.write_text("- 2026-09-07 chose X because Y\n", encoding="utf-8")
-        os.utime(decisions, (later, later))
-        transcript = self.transcript_writing("app.py", ".agents/DECISIONS.md")
-        res = self.run_hook(self.payload(workspacePaths=[self.tmp], transcriptPath=transcript))
-        self.assertEqual(res.get("decision"), "stop")
-
     def test_untrusted_workspace_skips_the_verify_script(self):
         agents = Path(self.tmp) / ".agents"
         agents.mkdir(exist_ok=True)
         (agents / "verify.sh").write_text("exit 1\n", encoding="utf-8")
-        res = self.run_hook(self.code_payload(), trusted=False)
+        res = self.run_hook(self.code_payload(transcriptPath=self.verified("app.py")),
+                            trusted=False)
         self.assertNotIn("Verifier failed", res.get("reason", ""))
         self.assertIn("untrusted workspace, verifier skipped",
                       (Path(self.tmp) / "stop_gate.log").read_text(encoding="utf-8"))
@@ -636,16 +665,6 @@ class TestStopGate(unittest.TestCase):
     def test_continue_reason_reports_the_remaining_budget(self):
         res = self.run_hook(self.payload(), stub=self.stub(["game/changed.rpy"]))
         self.assertIn(f"s of the {800}s gate budget left.", res["reason"])
-
-    def test_exception_keeps_the_audit_report(self):
-        report = self.write_audit()
-        env = dict(os.environ, GEMINI_HOOK_TMP=self.tmp)
-        proc = subprocess.run(
-            [sys.executable, str(self.SCRIPT)], input="not json",
-            text=True, capture_output=True, env=env,
-        )
-        self.assertEqual(json.loads(proc.stdout).get("decision"), "stop")
-        self.assertTrue(report.exists())
 
     def test_bad_input_stops(self):
         env = dict(os.environ, GEMINI_HOOK_TMP=self.tmp)
@@ -771,7 +790,7 @@ class TestVerifierSelection(unittest.TestCase):
         self.assertEqual(self.ran, [])
 
 
-class TestTouchedFiles(unittest.TestCase):
+class TestTranscript(unittest.TestCase):
     """Transcript parsing, driven by a line captured from a real agy run."""
 
     FIXTURE = Path(__file__).resolve().parent / "fixtures" / "transcript_sample.jsonl"
@@ -780,17 +799,15 @@ class TestTouchedFiles(unittest.TestCase):
     def setUp(self):
         sys.path.insert(0, str(HOOKS_DIR))
         self.addCleanup(sys.path.remove, str(HOOKS_DIR))
-        import stop_gate
+        import transcript
 
-        self.gate = stop_gate
+        self.mod = transcript
         self.tmp = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, self.tmp, True)
         self.steps = [json.loads(ln) for ln in self.FIXTURE.read_text(encoding="utf-8").splitlines() if ln.strip()]
 
-    def transcript(self, steps):
-        path = Path(self.tmp) / "transcript.jsonl"
-        path.write_text("\n".join(json.dumps(s) for s in steps) + "\n", encoding="utf-8")
-        return str(path)
+    def written(self, steps, project=None):
+        return set(self.mod.edits(steps, project or self.PROJECT))
 
     def rename_tool(self, name):
         steps = json.loads(json.dumps(self.steps))
@@ -800,39 +817,133 @@ class TestTouchedFiles(unittest.TestCase):
         return steps
 
     def test_real_capture_yields_written_file(self):
-        got = self.gate.touched_files(self.transcript(self.steps), self.PROJECT)
-        self.assertEqual(got, {"note.rpy"})
+        self.assertEqual(self.written(self.steps), {"note.rpy"})
 
     def test_arg_values_are_doubly_json_encoded(self):
         raw = self.steps[1]["tool_calls"][0]["args"]["TargetFile"]
         self.assertEqual(raw, json.dumps("C:\\proj\\note.rpy"))
-        self.assertEqual(self.gate.unwrap(raw), "C:\\proj\\note.rpy")
+        self.assertEqual(self.mod.unwrap(raw), "C:\\proj\\note.rpy")
 
     def test_path_outside_project_ignored(self):
-        got = self.gate.touched_files(self.transcript(self.steps), "C:\\elsewhere")
-        self.assertEqual(got, set())
+        self.assertEqual(self.written(self.steps, "C:\\elsewhere"), set())
+
+    def test_artifact_writes_are_not_workspace_edits(self):
+        artifacts = os.path.join(self.PROJECT, "brain")
+        steps = json.loads(json.dumps(self.steps))
+        steps[1]["tool_calls"][0]["args"]["TargetFile"] = json.dumps(
+            os.path.join(artifacts, "note.rpy"))
+        self.assertEqual(self.mod.edits(steps, self.PROJECT, [artifacts]), {})
+
+    def test_paths_match_case_insensitively(self):
+        """agy reports C:\\Users\\... while the transcript may say c:\\users\\..."""
+        expected = {"note.rpy"} if os.name == "nt" else set()
+        self.assertEqual(self.written(self.steps, self.PROJECT.swapcase()), expected)
 
     def test_read_only_tool_ignored(self):
-        got = self.gate.touched_files(self.transcript(self.rename_tool("view_file")), self.PROJECT)
-        self.assertEqual(got, set())
+        self.assertEqual(self.written(self.rename_tool("view_file")), set())
 
     def test_every_write_tool_counted(self):
-        for name in self.gate.WRITE_TOOLS:
+        for name in self.mod.EDIT_TOOLS:
             with self.subTest(tool=name):
-                got = self.gate.touched_files(self.transcript(self.rename_tool(name)), self.PROJECT)
-                self.assertEqual(got, {"note.rpy"})
+                self.assertEqual(self.written(self.rename_tool(name)), {"note.rpy"})
 
     def test_session_with_no_writes_gates_nothing(self):
-        got = self.gate.touched_files(self.transcript(self.steps[:1]), self.PROJECT)
-        self.assertEqual(got, set())
+        self.assertEqual(self.written(self.steps[:1]), set())
 
     def test_missing_transcript_falls_back_to_git(self):
-        self.assertIsNone(self.gate.touched_files(str(Path(self.tmp) / "nope.jsonl"), self.PROJECT))
+        self.assertIsNone(self.mod.load(str(Path(self.tmp) / "nope.jsonl")))
 
     def test_unparseable_transcript_falls_back_to_git(self):
         path = Path(self.tmp) / "junk.jsonl"
         path.write_text("not json\nalso not json\n", encoding="utf-8")
-        self.assertIsNone(self.gate.touched_files(str(path), self.PROJECT))
+        self.assertIsNone(self.mod.load(str(path)))
+
+    def test_the_untruncated_transcript_wins(self):
+        logs = Path(self.tmp) / "logs"
+        logs.mkdir()
+        (logs / "transcript.jsonl").write_text("", encoding="utf-8")
+        write_transcript(logs / "transcript_full.jsonl", [("edit", "app.py")], self.tmp)
+        self.assertEqual(len(self.mod.load(str(logs / "transcript.jsonl"))), 2)
+
+    def test_verifier_run_reports_its_exit_code(self):
+        path = write_transcript(Path(self.tmp) / "t.jsonl",
+                                [("verifier", True), ("verifier", False)], self.tmp)
+        self.assertEqual(self.mod.verifier_runs(self.mod.load(path)), [(0, True), (2, False)])
+
+    def test_reviewer_spawn_is_found_by_type_name(self):
+        path = write_transcript(Path(self.tmp) / "t.jsonl", [("edit", "a.py"), ("reviewer",)],
+                                self.tmp)
+        self.assertEqual(self.mod.reviewer_spawns(self.mod.load(path)), [2])
+
+    def subagent_record(self, cid, type_name):
+        records = Path(self.tmp) / "parent" / ".system_generated" / "subagents"
+        records.mkdir(parents=True, exist_ok=True)
+        (records / f"{cid}.json").write_text(json.dumps(
+            {"subagentDescriptor": {"typeName": type_name}}), encoding="utf-8")
+
+    def test_subagent_is_recognised_by_its_parents_record(self):
+        self.subagent_record("child-cid", "reviewer")
+        self.assertEqual(self.mod.subagent_type("child-cid", self.tmp), "reviewer")
+
+    def test_conversation_without_a_record_is_top_level(self):
+        self.subagent_record("child-cid", "reviewer")
+        self.assertIsNone(self.mod.subagent_type("other-cid", self.tmp))
+
+    def test_brain_root_is_four_levels_above_the_transcript(self):
+        path = "/data/brain/cid/.system_generated/logs/transcript.jsonl"
+        self.assertEqual(self.mod.brain_root(path).replace("\\", "/"), "/data/brain")
+
+
+class TestPendingVerification(unittest.TestCase):
+    """A run that dies on an error leaves a marker the next invocation announces once."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.env = dict(os.environ, GEMINI_HOOK_TMP=self.tmp)
+        (Path(self.tmp) / "pyproject.toml").write_text("[project]\nname = 'x'\n", encoding="utf-8")
+
+    def hook(self, script, payload):
+        proc = subprocess.run([sys.executable, str(HOOKS_DIR / script)],
+                              input=json.dumps(payload), text=True, capture_output=True,
+                              env=self.env)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        return json.loads(proc.stdout)
+
+    def notes(self, events):
+        path = write_transcript(Path(self.tmp) / "t.jsonl", events, self.tmp)
+        res = self.hook("reinforce.py", {"invocationNum": 5, "workspacePaths": [self.tmp],
+                                         "transcriptPath": path})
+        return [s["ephemeralMessage"] for s in res["injectSteps"]]
+
+    def marker(self):
+        return list((Path(self.tmp) / "pending").glob("*.json"))
+
+    def test_error_stop_marks_then_reinforce_says_it_once_and_clears(self):
+        path = write_transcript(Path(self.tmp) / "crash.jsonl", [("edit", "app.py")], self.tmp)
+        res = self.hook("stop_gate.py", {
+            "executionNum": 0, "terminationReason": "ERROR", "fullyIdle": True,
+            "workspacePaths": [self.tmp], "transcriptPath": path,
+        })
+        self.assertEqual(res.get("decision"), "stop")
+        self.assertEqual(len(self.marker()), 1)
+
+        said = self.notes([("edit", "app.py")])
+        self.assertEqual(len(said), 1)
+        self.assertIn("still pending", said[0])
+        self.assertIn("step 0", said[0])
+        self.assertEqual(self.notes([("edit", "app.py")]), [])
+
+        self.assertEqual(self.notes([("edit", "app.py"), ("verifier", True)]), [])
+        self.assertEqual(self.marker(), [])
+
+    def test_error_stop_without_edits_marks_nothing(self):
+        path = write_transcript(Path(self.tmp) / "crash.jsonl", [("verifier", True)], self.tmp)
+        self.hook("stop_gate.py", {
+            "executionNum": 0, "terminationReason": "ERROR", "fullyIdle": True,
+            "workspacePaths": [self.tmp], "transcriptPath": path,
+        })
+        self.assertEqual(self.marker(), [])
 
 
 class TestGateInternals(unittest.TestCase):
@@ -857,6 +968,12 @@ class TestGateInternals(unittest.TestCase):
     def test_cmd_script_runs_through_call(self):
         argv = self.gate.script_argv(os.path.join(".agents", "verify.cmd"))
         self.assertEqual(argv[:3], ["cmd", "/c", "call"])
+
+    def test_sh_script_argv_needs_bash(self):
+        real_which = shutil.which
+        self.addCleanup(setattr, shutil, "which", real_which)
+        shutil.which = lambda name, *a, **k: None if name == "bash" else real_which(name, *a, **k)
+        self.assertIsNone(self.gate.script_argv(os.path.join(".agents", "verify.sh")))
 
     def test_sh_script_without_bash_is_not_a_verifier(self):
         agents = Path(self.tmp) / ".agents"

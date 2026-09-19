@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Stop hook: blocks finishing while the repo's own verifier fails on files the agent changed."""
+"""Stop hook: blocks finishing until the transcript proves the changed code was verified."""
 import glob
 import json
 import os
@@ -10,26 +10,24 @@ import sys
 import time
 
 import hookpaths
+import transcript
 
 LOG = os.path.join(hookpaths.TMP, "stop_gate.log")
 LINT_TIMEOUT = 120
 # one budget for the whole gate: every lint, verifier and docs run across every workspace
 GATE_BUDGET = 800
 MIN_STEP = 5
-MAX_EXECUTIONS = 3
-MAX_AUDIT_ROUNDS = 5
+# one forced continue per conversation, counted by agy's 0-based executionNum
+MAX_EXECUTIONS = 1
 MAX_REPORTED = 40
-AUDIT_REL = ".agents/audit.json"
 VISUAL_REL = ".agents/visual.md"
-DECISIONS_REL = ".agents/DECISIONS.md"
-# the agent's own answers to the gate, not work the gate should judge or date-stamp against
-SCRATCH_FILES = {AUDIT_REL, DECISIONS_REL}
-# agy 1.1.27 sends "NO_TOOL_CALL" here; "model_stop" is only in the docs. Every other
+# agy 1.2.6 sends "NO_TOOL_CALL" here; "model_stop" is only in the docs. Every other
 # reason (ERROR, USER_CANCELED, MAX_*) means the agent did not choose to finish.
 MODEL_FINISHED = {"model_stop", "NO_TOOL_CALL"}
-WRITE_TOOLS = {"replace_file_content", "write_to_file", "multi_replace_file_content", "sed_file"}
+ERRORED = {"error", "ERROR"}
 VERIFY_SCRIPTS = ("verify.cmd", "verify.ps1", "verify.sh")
 PYTEST_MARKERS = ("pyproject.toml", "pytest.ini", "setup.cfg")
+RENPY_LABEL = "renpy lint"
 # marker files in the workspace root -> the steps that verify it, first match wins
 MARKER_VERIFIERS = (
     (("Cargo.toml",), (("cargo test -q", ["cargo", "test", "-q"]),)),
@@ -44,26 +42,23 @@ IS_WINDOWS = os.name == "nt"
 # on Windows renpy.sh is a Linux binary and always fails, so only renpy.exe counts there
 SDK_EXE = "renpy.exe" if IS_WINDOWS else "renpy.sh"
 
-AUDIT_REASON = (
-    "Audit round {round}: review `git diff HEAD` plus untracked files you created. "
-    "Delegate: reviewer for findings, linter for lint fixes, tester for missing tests, "
-    "visual-qa for .agents/visual.md. Work inline only when subagents are unavailable. "
-    "Fix every bug, security, wrong-result, dead-code and over-engineering finding; "
-    "re-run the verifier; then write .agents/audit.json {{clean, findings, round}} and "
-    "finish. clean is true only when the last audit found nothing to fix."
+VERIFIER_REASON = (
+    "Blocked: no passing verifier run after your last edit (step {step}). "
+    "Run {cmds}, fix what it reports, then finish."
+)
+
+REVIEWER_REASON = (
+    "Blocked: no reviewer spawned after your last edit (step {step}). "
+    "invoke_subagent with TypeName reviewer on `git diff HEAD` in {ws}, "
+    "fix its findings, then finish."
 )
 
 VISUAL_REASON = (
-    "Visual audit: for each URL in .agents/visual.md, open_browser_url, "
-    "capture_browser_screenshot, check every bullet under ## Accept against the screenshot, "
-    "fix defects, repeat until every page passes. Record visual results in audit.json under "
-    '"visual": {"pages": n, "failed": m}.'
+    "Also {rel}: open_browser_url then capture_browser_screenshot every URL under "
+    "## Pages, fix anything that fails a bullet under ## Accept."
 )
 
-
-def norm(path):
-    """Case-folded, forward-slash form for comparing two paths on either platform."""
-    return os.path.normcase(path).replace("\\", "/")
+HUMAN_NOTE = "Stop allowed after one forced retry, still unmet: {summary}"
 
 
 def windows_path(p):
@@ -87,9 +82,10 @@ def remaining(deadline):
 
 
 def log(project, kind, detail):
+    """One tab-separated line per decision: kind first, because a path can hold spaces."""
     try:
         stamp = time.strftime("%Y-%m-%dT%H:%M:%S")
-        hookpaths.append(LOG, f"{stamp} {project} {kind} {detail}\n")
+        hookpaths.append(LOG, f"{stamp}\t{kind}\t{project}\t{detail}\n")
     except Exception:
         pass
 
@@ -117,45 +113,6 @@ def git(project, *args):
     return proc.stdout.decode("utf-8", "replace") if proc.returncode == 0 else None
 
 
-def unwrap(v):
-    """Transcript tool args are JSON-encoded strings: '"C:\\\\a\\\\b.rpy"' -> 'C:\\a\\b.rpy'."""
-    if isinstance(v, str):
-        try:
-            v = json.loads(v)
-        except Exception:
-            pass
-    return v if isinstance(v, str) and v else None
-
-
-def touched_files(transcript, project):
-    """Project-relative paths written this session, or None when the transcript is unusable."""
-    try:
-        with open(os.path.expanduser(transcript), encoding="utf-8") as fh:
-            lines = [ln for ln in fh if ln.strip()]
-    except Exception:
-        return None
-    root = norm(os.path.abspath(project)).rstrip("/") + "/"
-    out, parsed = set(), 0
-    for line in lines:
-        try:
-            step = json.loads(line)
-        except Exception:
-            continue
-        parsed += 1
-        for call in step.get("tool_calls") or []:
-            if call.get("name") not in WRITE_TOOLS:
-                continue
-            args = call.get("args") or {}
-            for key in ("TargetFile", "AbsolutePath"):
-                path = unwrap(args.get(key))
-                if not path:
-                    continue
-                path = os.path.abspath(path).replace("\\", "/")
-                if norm(path).startswith(root):
-                    out.add(path[len(root):])
-    return out if parsed else None
-
-
 def changed_files(project):
     """Project-relative paths git reports as modified or untracked, or None when not a git repo."""
     try:
@@ -177,11 +134,11 @@ def changed_files(project):
         return None
 
 
-def session_files(transcript, project):
+def session_files(steps, project):
     """What this session wrote under project. None means unknown, so nothing gets filtered out."""
-    touched = touched_files(transcript, project) if transcript else None
+    touched = set(transcript.edits(steps, project)) if steps else None
     files = changed_files(project) if touched is None else touched
-    return files if files is None else files - SCRATCH_FILES
+    return files if files is None else files - transcript.SCRATCH_FILES
 
 
 def read_json(path):
@@ -206,6 +163,7 @@ def script_argv(path):
 def trusted(ws):
     """agy only runs commands in workspaces the user trusted; the gate honours that list."""
     roots = (read_json(hookpaths.CLI_SETTINGS) or {}).get("trustedWorkspaces") or []
+    norm = transcript.norm
     target = norm(os.path.abspath(ws)).rstrip("/")
     return any(target == norm(r).rstrip("/") or target.startswith(norm(r).rstrip("/") + "/")
                for r in roots)
@@ -232,7 +190,7 @@ def renpy_lint(ws, files, deadline):
         return None
     left = remaining(deadline)
     if left < MIN_STEP:
-        return "renpy lint", 1, [f"verifier budget exhausted: {GATE_BUDGET}s spent before lint ran"]
+        return RENPY_LABEL, 1, [f"verifier budget exhausted: {GATE_BUDGET}s spent before lint ran"]
     # ponytail: re-lints the whole project on every Stop (~4 s); cache on .rpy mtimes if that drags
     try:
         proc = subprocess.run(
@@ -240,12 +198,12 @@ def renpy_lint(ws, files, deadline):
             cwd=sdk, capture_output=True, timeout=min(LINT_TIMEOUT, max(1, deadline - time.monotonic())),
         )
     except Exception as exc:
-        return "renpy lint", 1, [f"could not run renpy lint: {exc}"]
-    text = proc.stdout.decode("utf-8", "replace").lstrip("\ufeff")
+        return RENPY_LABEL, 1, [f"could not run renpy lint: {exc}"]
+    text = proc.stdout.decode("utf-8", "replace").lstrip("﻿")
     hits = []
     parsed_any = False
     for line in text.splitlines():
-        line = line.strip().lstrip("\ufeff")
+        line = line.strip().lstrip("﻿")
         m = LINT_LINE.match(line)
         if m:
             parsed_any = True
@@ -254,8 +212,8 @@ def renpy_lint(ws, files, deadline):
     if not parsed_any and proc.returncode != 0:
         # lint failed without a parseable report line: crash, bad project path, missing asset dir
         err = proc.stderr.decode("utf-8", "replace").splitlines()
-        return "renpy lint", 1, [f"renpy lint exited {proc.returncode}"] + err[-MAX_REPORTED:]
-    return "renpy lint", 1 if hits else 0, hits
+        return RENPY_LABEL, 1, [f"renpy lint exited {proc.returncode}"] + err[-MAX_REPORTED:]
+    return RENPY_LABEL, 1 if hits else 0, hits
 
 
 def run_steps(ws, steps, deadline):
@@ -267,8 +225,8 @@ def run_steps(ws, steps, deadline):
     return (steps[-1][0], 0, []) if steps else None
 
 
-def verify(ws, files, deadline):
-    """Run the first verifier that fits this workspace. None when the repo has none."""
+def verifier_steps(ws):
+    """(label, argv) for what verifies this workspace, first match wins. renpy lint has no argv."""
     for name in VERIFY_SCRIPTS:
         if not os.path.isfile(os.path.join(ws, ".agents", name)):
             continue
@@ -277,30 +235,39 @@ def verify(ws, files, deadline):
             break
         argv = script_argv(os.path.join(".agents", name))
         if argv:
-            return execute(ws, f".agents/{name}", argv, deadline)
+            return [(f".agents/{name}", argv)]
+        break
 
-    if os.path.isdir(os.path.join(ws, "game")):
-        found = renpy_lint(ws, files, deadline)
-        if found:
-            return found
+    if os.path.isdir(os.path.join(ws, "game")) and find_sdk(ws):
+        return [(RENPY_LABEL, None)]
 
-    pkg = read_json(os.path.join(ws, "package.json"))
-    scripts = (pkg or {}).get("scripts") or {}
+    scripts = (read_json(os.path.join(ws, "package.json")) or {}).get("scripts") or {}
     npm = shutil.which("npm") or "npm"
     steps = []
     if "lint" in scripts:
         steps.append(("npm run lint", [npm, "run", "lint"]))
     if "test" in scripts:
         steps.append(("npm test", [npm, "test"]))
-    found = run_steps(ws, steps, deadline)
-    if found:
-        return found
+    if steps:
+        return steps
 
     for markers, marker_steps in MARKER_VERIFIERS:
         if any(glob.glob(os.path.join(ws, m)) for m in markers):
-            return run_steps(ws, marker_steps, deadline)
+            return list(marker_steps)
+    return []
 
-    return None
+
+def verify(ws, files, deadline):
+    """Run the first verifier that fits this workspace. None when the repo has none."""
+    steps = verifier_steps(ws)
+    if steps and steps[0][1] is None:
+        return renpy_lint(ws, files, deadline)
+    return run_steps(ws, steps, deadline)
+
+
+def verifier_hint(ws):
+    """The command the agent is expected to have run here, or '' when the repo has no verifier."""
+    return " then ".join(f"`{label}`" for label, _argv in verifier_steps(ws))
 
 
 def docs_findings(ws, files, deadline):
@@ -322,61 +289,6 @@ def docs_findings(ws, files, deadline):
     except Exception as exc:
         return [f"could not run ai-docs-lint: {exc}"]
     return proc.stdout.splitlines() if proc.returncode else []
-
-
-def newest_mtime(ws, files):
-    stamps = []
-    for rel in files or ():
-        try:
-            stamps.append(os.path.getmtime(os.path.join(ws, rel)))
-        except OSError:
-            pass
-    return max(stamps) if stamps else None
-
-
-def audit_report(ws):
-    data = read_json(os.path.join(ws, AUDIT_REL))
-    return data if isinstance(data, dict) else None
-
-
-def audit_clean(ws, files):
-    """True when the audit report says the last round found nothing and predates no edit."""
-    data = audit_report(ws)
-    if not data or not data.get("clean"):
-        return False
-    newest = newest_mtime(ws, files)
-    try:
-        if newest is not None and os.path.getmtime(os.path.join(ws, AUDIT_REL)) < newest:
-            return False
-    except OSError:
-        return False
-    if os.path.isfile(os.path.join(ws, VISUAL_REL)):
-        return (data.get("visual") or {}).get("failed") == 0
-    return True
-
-
-def next_round(ws):
-    """The round number the agent is being asked to run now."""
-    try:
-        return int((audit_report(ws) or {}).get("round", 0)) + 1
-    except (TypeError, ValueError):
-        return 1
-
-
-def audit_reason(spaces):
-    text = AUDIT_REASON.format(round=max(next_round(ws) for ws in spaces))
-    if any(os.path.isfile(os.path.join(ws, VISUAL_REL)) for ws in spaces):
-        text += "\n" + VISUAL_REASON
-    return text
-
-
-def clear_audits(spaces):
-    """The audit report is per-run scratch, so the next run cannot inherit a stale pass."""
-    for ws in spaces:
-        try:
-            os.remove(os.path.join(ws, AUDIT_REL))
-        except OSError:
-            pass
 
 
 def leftovers(ws, files):
@@ -402,11 +314,11 @@ def leftovers(ws, files):
     return found
 
 
-def survey(spaces, transcript, deadline):
-    """(verifier failures, doc findings, leftovers, workspaces still owing an audit round)."""
-    failures, docs, junk, audits = [], [], [], []
+def survey(spaces, steps, deadline):
+    """(verifier failures, doc findings, leftovers) from the checks that run commands."""
+    failures, docs, junk = [], [], []
     for ws in spaces:
-        files = session_files(transcript, ws)
+        files = session_files(steps, ws)
         if files is not None and not files:
             continue
         found = verify(ws, files, deadline)
@@ -414,10 +326,7 @@ def survey(spaces, transcript, deadline):
             failures.append((found[0], found[2]))
         docs += docs_findings(ws, files, deadline)
         junk += leftovers(ws, files)
-        code = files is None or any(not hookpaths.is_instruction_doc(f) for f in files)
-        if code and not audit_clean(ws, files):
-            audits.append(ws)
-    return failures, docs, junk, audits
+    return failures, docs, junk
 
 
 def workspaces(raw_paths):
@@ -432,59 +341,112 @@ def workspaces(raw_paths):
     return good, dropped
 
 
-def decide(ev, deadline):
-    """(result, log kind, log detail, workspaces, whether this is a clean stop)."""
-    if ev.get("terminationReason") not in MODEL_FINISHED or ev.get("fullyIdle") is False:
-        detail = f"reason={ev.get('terminationReason')!r} idle={ev.get('fullyIdle')!r}"
-        return {"decision": "stop"}, "stop", detail, [], False
+def edited(steps, spaces, outside):
+    """{workspace-relative path: last step index that wrote it} across every workspace."""
+    outside = [p for p in outside if p]
+    out = {}
+    for ws in spaces:
+        out.update(transcript.edits(steps, ws, outside))
+    return out
 
+
+def evidence_gap(spaces, files, steps, role):
+    """What the transcript still fails to prove: (log kind, message), or None when it proves it."""
+    if not files:
+        return None
+    last_edit = max(files.values())
+    if not any(index > last_edit and ok for index, ok in transcript.verifier_runs(steps)):
+        cmds = [f"{hint} in {ws}" for ws, hint in ((w, verifier_hint(w)) for w in spaces) if hint]
+        if cmds:
+            return "no-verifier", VERIFIER_REASON.format(step=last_edit, cmds="; ".join(cmds))
+    # a subagent answers to the run that spawned it, so only a top-level run owes a reviewer
+    code = any(not hookpaths.is_instruction_doc(rel) for rel in files)
+    if role is None and code and not any(i > last_edit for i in transcript.reviewer_spawns(steps)):
+        reason = REVIEWER_REASON.format(step=last_edit, ws=spaces[0] if spaces else ".")
+        if any(os.path.isfile(os.path.join(ws, VISUAL_REL)) for ws in spaces):
+            reason += " " + VISUAL_REASON.format(rel=VISUAL_REL)
+        return "no-reviewer", reason
+    return None
+
+
+def mark_pending(spaces, files, cid):
+    """Remember unverified edits a crashed run left, for the next invocation to announce."""
+    step = max(files.values())
+    for ws in spaces:
+        hookpaths.write_pending(ws, {"workspace": ws, "step": step, "conversation": cid,
+                                     "when": time.strftime("%Y-%m-%dT%H:%M:%S")})
+
+
+def decide(ev, deadline):
+    """(result, log kind, log detail, workspaces)."""
     spaces, dropped = workspaces(ev.get("workspacePaths") or [])
     if dropped:
         log(",".join(dropped), "unresolved", "workspace path dropped")
+    brain = transcript.brain_root(ev.get("transcriptPath"))
+    steps = transcript.load(ev.get("transcriptPath"))
+    role = transcript.subagent_type(ev.get("conversationId"), brain)
+    files = edited(steps, spaces, (ev.get("artifactDirectoryPath"), brain))
+    gap = evidence_gap(spaces, files, steps, role)
+    reason = ev.get("terminationReason")
     execution_num = ev.get("executionNum", 0)
-    failures, docs, junk, audits = survey(spaces, ev.get("transcriptPath"), deadline)
-    budget = f"{int(max(0, remaining(deadline)))}s of the {GATE_BUDGET}s gate budget left."
-    rounds = max((next_round(ws) for ws in audits), default=0)
 
-    if failures and execution_num <= MAX_EXECUTIONS:
-        reason = "\n".join(
+    if reason not in MODEL_FINISHED:
+        if gap and reason in ERRORED:
+            mark_pending(spaces, files, ev.get("conversationId") or "")
+            return {"decision": "stop"}, "pending", f"{gap[0]} step {max(files.values())}", spaces
+        return ({"decision": "stop"}, "skip",
+                f"reason={reason!r} idle={ev.get('fullyIdle')!r}", spaces)
+
+    if gap:
+        kind, message = gap
+        detail = f"{'subagent ' + role if role else 'top-level'} step {max(files.values())}"
+        if execution_num < MAX_EXECUTIONS:
+            return {"decision": "continue", "reason": message}, kind, detail, spaces
+        return ({"decision": "stop", "reason": HUMAN_NOTE.format(summary=message)},
+                "release", f"{kind} {detail}", spaces)
+
+    # only the checks below run commands of their own, so they wait for the background tasks
+    if ev.get("fullyIdle") is False:
+        return {"decision": "stop"}, "stop", "background tasks still running", spaces
+
+    failures, docs, junk = survey(spaces, steps, deadline)
+    budget = f"{int(max(0, remaining(deadline)))}s of the {GATE_BUDGET}s gate budget left."
+    if failures:
+        message = "\n".join(
             f"Verifier failed ({label}):\n" + "\n".join(lines[-MAX_REPORTED:])
             + f"\nFix, re-run {label}, then finish."
             for label, lines in failures
         )
         kind, detail = "verifier", ",".join(label for label, _ in failures)
-    elif docs and execution_num <= MAX_EXECUTIONS:
-        reason = ("ai-docs-lint failed in files you changed:\n"
-                  + "\n".join(docs[:MAX_REPORTED]) + "\nFix them, re-run lint, then finish.")
+    elif docs:
+        message = ("ai-docs-lint failed in files you changed:\n"
+                   + "\n".join(docs[:MAX_REPORTED]) + "\nFix them, re-run lint, then finish.")
         kind, detail = "docs", f"{len(docs)} findings"
-    elif junk and execution_num <= MAX_EXECUTIONS:
-        reason = ("delete leftovers: " + ", ".join(sorted(set(junk))[:MAX_REPORTED])
-                  + "\nRemove them, then finish.")
+    elif junk:
+        message = ("delete leftovers: " + ", ".join(sorted(set(junk))[:MAX_REPORTED])
+                   + "\nRemove them, then finish.")
         kind, detail = "leftovers", f"{len(junk)} paths"
-    elif audits and rounds <= MAX_AUDIT_ROUNDS:
-        reason = audit_reason(audits)
-        kind, detail = "audit", f"round {rounds}"
     else:
-        detail = "audit cap" if audits else f"execution={execution_num}"
-        return {"decision": "stop"}, "stop", detail, spaces, True
+        return {"decision": "stop"}, "stop", f"execution={execution_num}", spaces
 
-    return {"decision": "continue", "reason": reason + "\n" + budget}, kind, detail, spaces, False
+    if execution_num < MAX_EXECUTIONS:
+        return {"decision": "continue", "reason": message + "\n" + budget}, kind, detail, spaces
+    return ({"decision": "stop", "reason": HUMAN_NOTE.format(summary=f"{kind}: {detail}")},
+            "release", f"{kind} {detail}", spaces)
 
 
 def main():
-    result, kind, detail, spaces, clean_stop = {"decision": "stop"}, "stop", "", [], False
-    project = "-"
+    result, kind, detail, spaces = {"decision": "stop"}, "stop", "", []
     try:
         ev = json.load(sys.stdin)
-        result, kind, detail, spaces, clean_stop = decide(ev, time.monotonic() + GATE_BUDGET)
-        project = ",".join(spaces) or "-"
+        result, kind, detail, spaces = decide(ev, time.monotonic() + GATE_BUDGET)
     except Exception as exc:
-        result, kind, detail, clean_stop = {"decision": "stop"}, "stop", f"exception {exc!r}", False
+        result, kind, detail = {"decision": "stop"}, "stop", f"exception {exc!r}"
 
-    # only a clean stop retires the audit report; an exception must not hide the last round
-    if clean_stop:
-        clear_audits(spaces)
-    log(project, kind, detail)
+    log(",".join(spaces) or "-", kind, detail)
+    if kind == "release":
+        # the stop goes through, so the terminal is the only thing the human still reads
+        print(result.get("reason", ""), file=sys.stderr)
     json.dump(result, sys.stdout)
 
 

@@ -10,6 +10,10 @@ CLI_SETTINGS = (os.environ.get("GEMINI_CLI_SETTINGS")
                 or os.path.expanduser("~/.gemini/antigravity-cli/settings.json"))
 DOCS_LINT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "scripts", "ai-docs-lint.py")
 
+# work a crashed run left unverified: one marker per workspace, read on the next invocation
+PENDING = os.path.join(TMP, "pending")
+SLUG = re.compile(r"[^A-Za-z0-9]+")
+
 INSTRUCTION_DOCS = {"GEMINI.md", "AGENTS.md", "SKILL.md"}
 # leftovers the write gate refuses to create and the stop gate refuses to leave behind
 BACKUP_SUFFIX = re.compile(r"\.(?:bak|orig|old|tmp)$", re.I)
@@ -59,6 +63,32 @@ def pre_tool_gate(check):
         print(f"{os.path.basename(sys.argv[0])}: {exc!r}", file=sys.stderr)
     json.dump({"decision": "deny", "reason": reason} if reason else {"decision": "allow"},
               sys.stdout)
+
+
+def pending_path(workspace):
+    slug = SLUG.sub("-", os.path.normcase(os.path.abspath(workspace))).strip("-")
+    return os.path.join(PENDING, slug[-120:] + ".json")
+
+
+def read_pending(workspace):
+    try:
+        with open(pending_path(workspace), encoding="utf-8") as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return None
+
+
+def write_pending(workspace, data):
+    os.makedirs(PENDING, exist_ok=True)
+    with open(pending_path(workspace), "w", encoding="utf-8") as fh:
+        json.dump(data, fh)
+
+
+def clear_pending(workspace):
+    try:
+        os.remove(pending_path(workspace))
+    except OSError:
+        pass
 
 
 def append(path, text):

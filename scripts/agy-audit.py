@@ -29,6 +29,11 @@ import statistics
 import sys
 import urllib.parse
 
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir, "hooks"))
+# one transcript parser for the hooks and this script
+from transcript import (EDIT_TOOLS, RUN_TOOLS, VERIFIERS, executed_text,  # noqa: E402
+                        read_transcript, result_failed)
+
 DEFAULT_ROOT = os.path.join(os.path.expanduser("~"), ".gemini", "antigravity-cli")
 STOP_GATE_LOG = os.path.join(os.path.expanduser("~"), ".gemini", "tmp", "stop_gate.log")
 DEFAULT_SNAPSHOT_DIR = os.path.join(os.path.expanduser("~"), ".claude", "cache", "agy-audit")
@@ -51,15 +56,6 @@ KV_KEY, KV_VALUE = ".1.20.1", ".1.20.2"
 # A larger model is an escalation away from the cheap flash default.
 BIG_MODEL = re.compile(r"(?i)(pro|opus|sonnet|thinking|-high\b)")
 
-VERIFIERS = (
-    ("verify.cmd", re.compile(r"(?i)verify\.cmd")),
-    ("verify.ps1", re.compile(r"(?i)verify\.ps1")),
-    ("audit_project.py", re.compile(r"(?i)audit_project\.py")),
-    ("renpy lint", re.compile(r"(?i)renpy(\.exe)?[^\n]{0,40}lint|renpy_run_lint")),
-    ("pytest", re.compile(r"(?i)\bpytest\b")),
-    ("simulate_birth.py", re.compile(r"(?i)simulate_birth\.py")),
-    ("test_*.py", re.compile(r"(?i)\btest_[a-z0-9_]+\.py")),
-)
 # Files that decide whether work passed. Editing one while the verifier is red moves
 # the goalposts, so every such edit is listed by conversation and step.
 GATE_FILE = re.compile(
@@ -69,10 +65,7 @@ GATE_FILE = re.compile(
     r"|(?:^|[\\/])hooks[\\/])")
 GIT_DIFF = re.compile(r"(?i)\bgit\b[^\n|;&]*\bdiff\b")
 COMPACTION_STEP = "CHECKPOINT"
-EDIT_TOOLS = {"replace_file_content", "write_to_file", "edit_file", "create_file"}
 VIEW_TOOLS = {"view_file", "view_code_item", "view_file_outline"}
-# only these actually execute something, so only these can be a verifier run
-RUN_TOOLS = {"run_command", "call_mcp_tool"}
 # the model rewrites this prose every call, so it must not enter a retry signature
 NOISE_ARGS = {"toolAction", "toolSummary", "Blocking", "WaitMsBeforeAsync"}
 
@@ -84,14 +77,10 @@ CORRECTION_WORDS = re.compile(
 # Tool-result bodies are raw file and command output, so a keyword search over them
 # is dominated by the content being read, not by failures (288 loose hits against 0
 # real ones on this data root). Only these are trusted: steps.error_details,
-# transcript status ERROR, db step status 7, and the exit code a result reports.
-EXIT_CODE = re.compile(r'"exit_code"\s*:\s*(-?\d+)')
-# run_command reports its status as prose at the head of the result, not as JSON;
-# anchored so the same sentence quoted inside a file being read is not a failure
-COMMAND_EXIT = re.compile(r"(?i)^\s*the command exited with code (-?\d+)")
-SUCCESS_FLAG = re.compile(r'"success"\s*:\s*(true|false)')
+# transcript status ERROR, db step status 7, and what transcript.result_failed reads.
 DB_STATUS_ERROR = 7
-STOP_GATE_KINDS = ("stop", "verifier", "audit", "leftovers", "allow", "deny", "block")
+STOP_GATE_KINDS = ("stop", "skip", "release", "pending", "no-verifier", "no-reviewer",
+                   "verifier", "docs", "audit", "leftovers", "allow", "deny", "block")
 PRINTABLE_RUN = re.compile(rb"[\x20-\x7e]{10,}")
 TOOL_HEADER = re.compile(
     r"^Created At: (\S+)\nCompleted At: (\S+)\n?", re.MULTILINE)
@@ -187,21 +176,6 @@ def parse_time(text):
     return stamp if stamp.tzinfo else stamp.replace(tzinfo=dt.timezone.utc)
 
 
-def read_transcript(path):
-    """Parse one transcript JSONL. Returns (steps, bad_line_count)."""
-    steps, bad = [], 0
-    with open(path, encoding="utf-8", errors="replace") as handle:
-        for line in handle:
-            if not line.strip():
-                continue
-            try:
-                steps.append(json.loads(line))
-            except ValueError:
-                bad += 1
-    steps.sort(key=lambda s: s.get("step_index", 0))
-    return steps, bad
-
-
 def active_seconds(stamps, idle_gap=IDLE_GAP_SECONDS):
     """Wall clock minus every gap longer than idle_gap."""
     stamps = sorted(t for t in stamps if t)
@@ -227,34 +201,10 @@ def tool_span(content):
     return max(0.0, (end - start).total_seconds()), body
 
 
-def result_failed(body):
-    """Did a tool result say it failed? Only self-reported signals count."""
-    head = body[:4000]
-    exited = COMMAND_EXIT.match(body)
-    if exited and int(exited.group(1)) != 0:
-        return f"exit code {exited.group(1)}"
-    code = EXIT_CODE.search(head)
-    if code and int(code.group(1)) != 0:
-        return f"exit_code {code.group(1)}"
-    flag = SUCCESS_FLAG.search(head)
-    if flag and flag.group(1) == "false":
-        return "success false"
-    return ""
-
-
 def retry_signature(name, args):
     """Tool identity with the model's per-call prose stripped out."""
     stable = {k: v for k, v in args.items() if k not in NOISE_ARGS}
     return name + "|" + json.dumps(stable, sort_keys=True)
-
-
-def executed_text(name, args):
-    """What a run-style tool actually executed, or '' for tools that run nothing."""
-    if name == "run_command":
-        return str(args.get("CommandLine") or "")
-    if name == "call_mcp_tool":
-        return f"{args.get('ServerName') or ''} {args.get('ToolName') or ''}"
-    return ""
 
 
 def file_target(args):
@@ -653,12 +603,16 @@ def quality_score(rec):
 # ---------------------------------------------------------------------- reports
 def parse_stop_line(line):
     """(timestamp, kind, detail) for one stop_gate.log line, or None."""
+    fields = line.rstrip("\n").split("\t")
+    if len(fields) >= 4:
+        when = parse_time(fields[0])
+        return (when, fields[1], fields[3]) if when else None
+    # gate format before 2026-09-18: "<stamp> <workspace> <kind> <detail>", and a
+    # workspace path can hold spaces ("Birth Battle"), so the kind is found by keyword
     stamp, _, rest = line.strip().partition(" ")
     when = parse_time(stamp)
     if not when:
         return None
-    # the workspace path sits between the stamp and the kind and can hold spaces
-    # ("Birth Battle"), so splitting on whitespace picks the wrong word
     words = rest.split()
     kind = next((w for w in words if w in STOP_GATE_KINDS), "")
     if not kind:
@@ -668,7 +622,7 @@ def parse_stop_line(line):
 
 def unchecked_stop(kind, detail):
     """A stop the gate returned from before running any check."""
-    return kind == "stop" and "NO_TOOL_CALL" in detail and "idle=False" in detail
+    return kind == "skip" or (kind == "stop" and "idle=False" in detail)
 
 
 def stop_gate_log(since):
@@ -1137,7 +1091,13 @@ def self_check():
     assert peak_overlap([(base, base + hour), (base + hour, base + 2 * hour)]) == 1
     assert peak_overlap([(None, base)]) == 0 and peak_overlap([]) == 0
 
-    # the workspace holds a space, so only keyword parsing finds the kind
+    when, kind, detail = parse_stop_line(
+        "2026-09-18T00:33:41\tno-verifier\tF:/Factory/renpy/Birth Battle\ttop-level step 42")
+    assert (kind, detail) == ("no-verifier", "top-level step 42") and when.day == 18
+    assert unchecked_stop(*parse_stop_line(
+        "2026-09-18T00:32:09\tskip\t-\treason='ERROR' idle=True")[1:])
+
+    # older lines hold the workspace before the kind, so only keyword parsing finds it
     when, kind, detail = parse_stop_line(
         "2026-09-18T00:33:41 F:/Factory/renpy/Birth Battle stop execution=0")
     assert (kind, detail) == ("stop", "execution=0") and when.day == 18

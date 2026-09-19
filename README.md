@@ -92,19 +92,20 @@ The `stop-gate` hook blocks an agent from finishing while the repo's own checks 
 
 A verify script only runs in a workspace listed in `trustedWorkspaces` in `~/.gemini/antigravity-cli/settings.json`; elsewhere the gate skips it and logs `untrusted workspace`. The gate also refuses to finish while the directories the session wrote still hold `.bak`, `.orig`, `.old` or `.tmp` files, an unignored `__pycache__`, or an empty directory. Nothing matching means no gate. Give a repo its own `.agents/verify.sh` to control exactly what runs. One 800 second budget covers every verifier, lint and docs run in the whole Stop pass.
 
-## Audit loop
+## Evidence from the transcript
 
-Once the verifier passes, a session that changed code keeps getting sent back until it reports a clean audit. The agent answers by writing `.agents/audit.json`:
+Before it runs anything, the gate reads the conversation transcript and looks at what the session actually did. If the session edited files in a workspace, it may only stop when the transcript shows, after the step of that last edit:
 
-```json
-{"clean": false, "findings": 3, "round": 1}
-```
+- a verifier run that exited 0, and
+- a `reviewer` subagent spawned with `invoke_subagent`.
 
-The gate sends another round when that file is missing, when `clean` is false, or when it is stale, meaning its mtime is older than the newest file the session wrote. A stale report judged code that has since changed. `clean` is true only when the last round found nothing left to fix.
+A run that is itself a subagent, which the gate detects from its parent's record under `brain/<parent>/.system_generated/subagents/`, owes the verifier run but not a reviewer: the agent that spawned it reviews the work. A subagent that edited nothing stops straight away. The same goes for a session that only edited `GEMINI.md`, `AGENTS.md` or `SKILL.md`, and for writes under the conversation's artifact directory, which are not workspace edits.
 
-The report is per-run scratch, so the gate deletes it when it lets the agent stop. Add `.agents/audit.json` to the repo's `.gitignore`.
+This check runs on every stop, including one where `fullyIdle` is false, because it only reads the transcript. The checks that execute something wait for an idle stop.
 
-The verifier gate gives up after 4 attempts and the audit loop after 5, so a repo that cannot be fixed does not spin forever.
+The gate forces one retry, then lets the stop through and prints one line to the terminal naming the check that is still failing. Work that stops unverified is therefore visible rather than blocked forever.
+
+If a run dies on an error with edits that were never verified, the gate leaves a marker in `~/.gemini/tmp/pending/`. The next invocation in that workspace gets one line saying verification and review are still owed; the marker clears once that conversation runs a verifier that passes.
 
 ## Discipline
 
@@ -138,7 +139,7 @@ A run that picked one approach over another writes a line about it to `<workspac
 
 ## Visual audit
 
-If a repo has `.agents/visual.md`, the audit round also asks for a screenshot pass. The file lists one URL per line under `## Pages` and the things each page has to get right under `## Accept`:
+If a repo has `.agents/visual.md`, the block that asks for a reviewer also asks for a screenshot pass. The file lists one URL per line under `## Pages` and the things each page has to get right under `## Accept`:
 
 ```markdown
 ## Pages
@@ -152,13 +153,7 @@ http://localhost:5173/settings
 - No horizontal scrollbar at 1280px wide
 ```
 
-The agent opens each URL, screenshots it, checks every bullet, fixes what fails, and records the outcome in the audit report:
-
-```json
-{"clean": true, "findings": 0, "round": 2, "visual": {"pages": 2, "failed": 0}}
-```
-
-While `visual.md` exists, an audit only counts as clean when `visual.failed` is 0.
+The agent opens each URL, screenshots it, checks every bullet and fixes what fails before it hands the diff to the reviewer.
 
 A dead http MCP server makes every headless run hang until the timeout expires. Setting `"disabled": true` does not help, it is ignored. The installer handles this: it sends a HEAD request to every `serverUrl` with a 3 second timeout and leaves the ones that do not answer out of the installed file, printing a warning that names them. Any HTTP status counts as answering, so a server that returns 404 on `/mcp` is kept.
 
