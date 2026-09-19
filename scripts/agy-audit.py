@@ -27,7 +27,67 @@ import re
 import sqlite3
 import statistics
 import sys
+import tempfile
 import urllib.parse
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir, "hooks"))
+# one transcript parser for the hooks and this script
+from transcript import EDIT_TOOLS, RUN_TOOLS, read_transcript  # noqa: E402
+
+# Command-text matching lives here, not in the hooks: the stop gate judges a workspace by
+# its git fingerprint, and only this report still asks what a past command line looked like.
+VERIFIER_COMMANDS = (
+    (".agents/verify", re.compile(r"(?i)verify\.(?:cmd|ps1|sh)\b")),
+    ("renpy lint", re.compile(r"(?i)renpy(?:\.exe)?[^\n]{0,60}\blint\b|renpy_run_lint")),
+    ("npm", re.compile(r"(?i)\bnpm\s+(?:run\s+)?(?:lint|test)\b")),
+    ("python -m pytest", re.compile(r"(?i)\bpytest\b")),
+    ("cargo test", re.compile(r"(?i)\bcargo\s+test\b")),
+    ("go ", re.compile(r"(?i)\bgo\s+(?:vet|test)\b")),
+    ("dotnet test", re.compile(r"(?i)\bdotnet\s+test\b")),
+)
+# a command that only prints or searches for the verifier has not run it
+QUOTING = re.compile(r"(?i)^\s*(?:echo|printf|cat|type|less|more|head|tail|grep|rg|findstr"
+                     r"|git\s+(?:log|grep|show|diff))\b")
+INSPECT_ONLY = re.compile(r"(?i)--collect-only|--co\b|--help\b|--version\b|--dry-run\b|\s-h\b")
+EXIT_CODE = re.compile(r'"exit_code"\s*:\s*(-?\d+)')
+# run_command reports its status as prose at the head of the result, not as JSON;
+# anchored so the same sentence quoted inside a file being read is not a failure
+COMMAND_EXIT = re.compile(r"(?i)^\s*the command exited with code (-?\d+)")
+SUCCESS_FLAG = re.compile(r'"success"\s*:\s*(true|false)')
+
+
+def executed_text(name, args):
+    """What a run-style tool actually executed, or '' for tools that run nothing."""
+    if name == "run_command":
+        return str(args.get("CommandLine") or "")
+    if name == "call_mcp_tool":
+        return f"{args.get('ServerName') or ''} {args.get('ToolName') or ''}"
+    return ""
+
+
+def result_failed(body):
+    """Did a tool result say it failed? Only self-reported signals count."""
+    head = body[:4000]
+    exited = COMMAND_EXIT.match(body)
+    if exited and int(exited.group(1)) != 0:
+        return f"exit code {exited.group(1)}"
+    code = EXIT_CODE.search(head)
+    if code and int(code.group(1)) != 0:
+        return f"exit_code {code.group(1)}"
+    flag = SUCCESS_FLAG.search(head)
+    if flag and flag.group(1) == "false":
+        return "success false"
+    return ""
+
+
+def verifier_of(name, args):
+    """The verifier label this call looks like it ran, or ''. Report only, never a gate."""
+    if name not in RUN_TOOLS:
+        return ""
+    text = executed_text(name, args)
+    if not text or QUOTING.match(text) or INSPECT_ONLY.search(text):
+        return ""
+    return next((lab for lab, pattern in VERIFIER_COMMANDS if pattern.search(text)), "")
 
 DEFAULT_ROOT = os.path.join(os.path.expanduser("~"), ".gemini", "antigravity-cli")
 STOP_GATE_LOG = os.path.join(os.path.expanduser("~"), ".gemini", "tmp", "stop_gate.log")
@@ -51,28 +111,15 @@ KV_KEY, KV_VALUE = ".1.20.1", ".1.20.2"
 # A larger model is an escalation away from the cheap flash default.
 BIG_MODEL = re.compile(r"(?i)(pro|opus|sonnet|thinking|-high\b)")
 
-VERIFIERS = (
-    ("verify.cmd", re.compile(r"(?i)verify\.cmd")),
-    ("verify.ps1", re.compile(r"(?i)verify\.ps1")),
-    ("audit_project.py", re.compile(r"(?i)audit_project\.py")),
-    ("renpy lint", re.compile(r"(?i)renpy(\.exe)?[^\n]{0,40}lint|renpy_run_lint")),
-    ("pytest", re.compile(r"(?i)\bpytest\b")),
-    ("simulate_birth.py", re.compile(r"(?i)simulate_birth\.py")),
-    ("test_*.py", re.compile(r"(?i)\btest_[a-z0-9_]+\.py")),
-)
 # Files that decide whether work passed. Editing one while the verifier is red moves
 # the goalposts, so every such edit is listed by conversation and step.
 GATE_FILE = re.compile(
     r"(?i)(?:(?:^|[\\/])(?:test_[^\\/]*\.py|[^\\/]*_test\.py|audit_project\.py"
-    r"|verify\.cmd|verify\.ps1)$"
-    r"|[\\/]\.agents[\\/]audit\.json$"
+    r"|verify\.cmd|verify\.ps1|verify\.sh)$"
     r"|(?:^|[\\/])hooks[\\/])")
 GIT_DIFF = re.compile(r"(?i)\bgit\b[^\n|;&]*\bdiff\b")
 COMPACTION_STEP = "CHECKPOINT"
-EDIT_TOOLS = {"replace_file_content", "write_to_file", "edit_file", "create_file"}
 VIEW_TOOLS = {"view_file", "view_code_item", "view_file_outline"}
-# only these actually execute something, so only these can be a verifier run
-RUN_TOOLS = {"run_command", "call_mcp_tool"}
 # the model rewrites this prose every call, so it must not enter a retry signature
 NOISE_ARGS = {"toolAction", "toolSummary", "Blocking", "WaitMsBeforeAsync"}
 
@@ -84,14 +131,19 @@ CORRECTION_WORDS = re.compile(
 # Tool-result bodies are raw file and command output, so a keyword search over them
 # is dominated by the content being read, not by failures (288 loose hits against 0
 # real ones on this data root). Only these are trusted: steps.error_details,
-# transcript status ERROR, db step status 7, and the exit code a result reports.
-EXIT_CODE = re.compile(r'"exit_code"\s*:\s*(-?\d+)')
-# run_command reports its status as prose at the head of the result, not as JSON;
-# anchored so the same sentence quoted inside a file being read is not a failure
-COMMAND_EXIT = re.compile(r"(?i)^\s*the command exited with code (-?\d+)")
-SUCCESS_FLAG = re.compile(r'"success"\s*:\s*(true|false)')
+# transcript status ERROR, db step status 7, and what transcript.result_failed reads.
 DB_STATUS_ERROR = 7
-STOP_GATE_KINDS = ("stop", "verifier", "audit", "leftovers", "allow", "deny", "block")
+# every kind stop_gate.py logs, plus the kinds older logs still hold
+STOP_GATE_KINDS = ("stop", "skip", "release", "pending", "review", "verifier", "docs",
+                   "leftovers", "no-review", "no-visual", "untrusted", "no-workspace",
+                   "no-transcript", "no-verifier", "no-reviewer", "trust", "unresolved",
+                   "lock", "audit")
+# a gate decision that returned before any check ran, whatever kind it logged
+UNCHECKED_KINDS = {"skip", "pending", "unresolved", "no-workspace", "no-transcript"}
+# lines the gate logs beside a decision: a judge's record, a dropped path, a trust or lock note
+BOOKKEEPING_KINDS = {"review", "unresolved", "trust", "lock"}
+# detail of a legacy line usually opens with one of these, so the word before it is the kind
+LEGACY_DETAIL = re.compile(r"(\S+)\s+((?:execution|reason)=.*)$")
 PRINTABLE_RUN = re.compile(rb"[\x20-\x7e]{10,}")
 TOOL_HEADER = re.compile(
     r"^Created At: (\S+)\nCompleted At: (\S+)\n?", re.MULTILINE)
@@ -187,21 +239,6 @@ def parse_time(text):
     return stamp if stamp.tzinfo else stamp.replace(tzinfo=dt.timezone.utc)
 
 
-def read_transcript(path):
-    """Parse one transcript JSONL. Returns (steps, bad_line_count)."""
-    steps, bad = [], 0
-    with open(path, encoding="utf-8", errors="replace") as handle:
-        for line in handle:
-            if not line.strip():
-                continue
-            try:
-                steps.append(json.loads(line))
-            except ValueError:
-                bad += 1
-    steps.sort(key=lambda s: s.get("step_index", 0))
-    return steps, bad
-
-
 def active_seconds(stamps, idle_gap=IDLE_GAP_SECONDS):
     """Wall clock minus every gap longer than idle_gap."""
     stamps = sorted(t for t in stamps if t)
@@ -227,34 +264,10 @@ def tool_span(content):
     return max(0.0, (end - start).total_seconds()), body
 
 
-def result_failed(body):
-    """Did a tool result say it failed? Only self-reported signals count."""
-    head = body[:4000]
-    exited = COMMAND_EXIT.match(body)
-    if exited and int(exited.group(1)) != 0:
-        return f"exit code {exited.group(1)}"
-    code = EXIT_CODE.search(head)
-    if code and int(code.group(1)) != 0:
-        return f"exit_code {code.group(1)}"
-    flag = SUCCESS_FLAG.search(head)
-    if flag and flag.group(1) == "false":
-        return "success false"
-    return ""
-
-
 def retry_signature(name, args):
     """Tool identity with the model's per-call prose stripped out."""
     stable = {k: v for k, v in args.items() if k not in NOISE_ARGS}
     return name + "|" + json.dumps(stable, sort_keys=True)
-
-
-def executed_text(name, args):
-    """What a run-style tool actually executed, or '' for tools that run nothing."""
-    if name == "run_command":
-        return str(args.get("CommandLine") or "")
-    if name == "call_mcp_tool":
-        return f"{args.get('ServerName') or ''} {args.get('ToolName') or ''}"
-    return ""
 
 
 def file_target(args):
@@ -559,8 +572,7 @@ def audit_conversation(root, cid, summary, since):
                            f"{args.get('ToolName') or '?'}")
                 rec["mcp_calls"][mcp_key] += 1
             ran = executed_text(name, args) if name in RUN_TOOLS else ""
-            verifier_label = next(
-                (label for label, pattern in VERIFIERS if pattern.search(ran)), "")
+            verifier_label = verifier_of(name, args)
             pending.append({"name": name, "mcp": mcp_key, "verifier": verifier_label,
                             "git_diff": bool(ran and GIT_DIFF.search(ran))})
             signature = retry_signature(name, args)
@@ -653,31 +665,43 @@ def quality_score(rec):
 # ---------------------------------------------------------------------- reports
 def parse_stop_line(line):
     """(timestamp, kind, detail) for one stop_gate.log line, or None."""
+    fields = line.rstrip("\n").split("\t")
+    if len(fields) >= 4:
+        when = parse_time(fields[0])
+        return (when, fields[1], fields[3]) if when else None
+    # gate format before 2026-09-18: "<stamp> <workspace> <kind> <detail>", and a
+    # workspace path can hold spaces ("Birth Battle"), so the kind is the word before
+    # the detail, which always started with execution= or reason=
     stamp, _, rest = line.strip().partition(" ")
     when = parse_time(stamp)
     if not when:
         return None
-    # the workspace path sits between the stamp and the kind and can hold spaces
-    # ("Birth Battle"), so splitting on whitespace picks the wrong word
-    words = rest.split()
-    kind = next((w for w in words if w in STOP_GATE_KINDS), "")
-    if not kind:
-        return when, "", rest
-    return when, kind, " ".join(words[words.index(kind) + 1:])
+    match = LEGACY_DETAIL.search(rest)
+    if match and match.group(1) in STOP_GATE_KINDS:
+        return when, match.group(1), match.group(2)
+    # a legacy line whose detail is not execution=/reason=, such as "verifier .agents/verify.cmd":
+    # the kind is the first kind word that is not part of a path, because the workspace comes
+    # first and the detail behind it can hold a kind word of its own
+    words = rest.split(" ")
+    for i, word in enumerate(words):
+        if word in STOP_GATE_KINDS and not any(c in word for c in "/\\:"):
+            return when, word, " ".join(words[i + 1:])
+    return when, "", rest
 
 
 def unchecked_stop(kind, detail):
     """A stop the gate returned from before running any check."""
-    return kind == "stop" and "NO_TOOL_CALL" in detail and "idle=False" in detail
+    return kind in UNCHECKED_KINDS or "idle=False" in detail
 
 
-def stop_gate_log(since):
+def stop_gate_log(since, path=None):
     """(decision counts, stops, stops that skipped every check) since a cutoff."""
+    path = path or STOP_GATE_LOG
     counts = collections.Counter()
     stops = unchecked = 0
-    if not os.path.exists(STOP_GATE_LOG):
+    if not os.path.exists(path):
         return counts, stops, unchecked
-    with open(STOP_GATE_LOG, encoding="utf-8", errors="replace") as handle:
+    with open(path, encoding="utf-8", errors="replace") as handle:
         for line in handle:
             parsed = parse_stop_line(line)
             if not parsed:
@@ -690,9 +714,11 @@ def stop_gate_log(since):
                 continue
             first = detail.split(" ")[0] if detail else ""
             counts[f"{kind} {first}" if first else kind] += 1
-            if kind == "stop":
-                stops += 1
-                unchecked += unchecked_stop(kind, detail)
+            if kind in BOOKKEEPING_KINDS:
+                continue  # lines the gate writes in passing, not decisions it took
+            # every gate line is one stop decision, so an unchecked one counts wherever it landed
+            stops += 1
+            unchecked += unchecked_stop(kind, detail)
     return counts, stops, unchecked
 
 
@@ -1106,10 +1132,12 @@ def self_check():
 
     assert executed_text("run_command", {"CommandLine": "pytest -q"}) == "pytest -q"
     assert executed_text("view_file", {"AbsolutePath": "test_x.py"}) == ""
-    assert any(p.search(executed_text("run_command", {"CommandLine": "pytest -q"}))
-               for _l, p in VERIFIERS)
-    # reading a test file must not count as running a verifier
+    assert verifier_of("run_command", {"CommandLine": "pytest -q"}) == "python -m pytest"
+    # reading a test file, printing the command or collecting tests is not a verifier run
     assert executed_text("view_file", {"AbsolutePath": "tests/test_x.py"}) == ""
+    assert verifier_of("view_file", {"AbsolutePath": "tests/test_x.py"}) == ""
+    assert verifier_of("run_command", {"CommandLine": "echo pytest"}) == ""
+    assert verifier_of("run_command", {"CommandLine": "pytest --collect-only"}) == ""
 
     assert [s["TypeName"] for s in subagent_specs(
         {"Subagents": [{"TypeName": "reviewer", "Model": "pro"}]})] == ["reviewer"]
@@ -1117,7 +1145,7 @@ def self_check():
 
     for path in ("F:/proj/tests/test_gameplay.py", "hooks/stop_gate.py",
                  "C:\\r\\hooks\\tests\\test_hooks.py", "x/audit_project.py",
-                 "F:/p/.agents/audit.json", "F:/p/.agents/verify.cmd",
+                 "F:/p/.agents/verify.cmd", "F:/p/.agents/verify.sh",
                  "F:/p/.agents/verify.ps1", "pkg/parser_test.py"):
         assert GATE_FILE.search(path), path
     for path in ("game/bb/bb_birth_loop.rpy", "docs/testing.md", "latest.json",
@@ -1137,19 +1165,46 @@ def self_check():
     assert peak_overlap([(base, base + hour), (base + hour, base + 2 * hour)]) == 1
     assert peak_overlap([(None, base)]) == 0 and peak_overlap([]) == 0
 
-    # the workspace holds a space, so only keyword parsing finds the kind
+    when, kind, detail = parse_stop_line(
+        "2026-09-18T00:33:41\tno-verifier\tF:/Factory/renpy/Birth Battle\ttop-level step 42")
+    assert (kind, detail) == ("no-verifier", "top-level step 42") and when.day == 18
+    assert unchecked_stop(*parse_stop_line(
+        "2026-09-18T00:32:09\tskip\t-\treason='ERROR' idle=True")[1:])
+
+    # older lines hold the workspace before the kind, and a path can hold spaces, so the
+    # kind is the word in front of the execution=/reason= detail
     when, kind, detail = parse_stop_line(
         "2026-09-18T00:33:41 F:/Factory/renpy/Birth Battle stop execution=0")
     assert (kind, detail) == ("stop", "execution=0") and when.day == 18
+    # an old line with no execution=/reason= detail still names its kind after the path
     assert parse_stop_line(
         "2026-09-18T00:33:41 F:/Factory/renpy/Birth Battle verifier .agents/verify.cmd"
     )[1:] == ("verifier", ".agents/verify.cmd")
+    assert parse_stop_line("2026-09-18T00:33:41 F:/p leftovers 3 paths")[1:] == \
+        ("leftovers", "3 paths")
+    # a release line carries the gap kind inside its detail, so the kind is the one by position
+    assert parse_stop_line("2026-09-18T00:33:41 F:/p release no-review top-level")[1:] == \
+        ("release", "no-review top-level")
+    assert parse_stop_line("2026-09-18T00:33:41 F:/p nothing here")[1] == ""
     assert parse_stop_line("not a log line") is None
     skipped_stop = parse_stop_line("2026-09-18T00:32:09 - stop reason='NO_TOOL_CALL' idle=False")
     assert unchecked_stop(*skipped_stop[1:])
     assert not unchecked_stop(*parse_stop_line(
         "2026-09-18T00:32:09 - stop reason='NO_TOOL_CALL' idle=True")[1:])
     assert not unchecked_stop("stop", "execution=0")
+
+    # what a judge reviewed, a path that would not resolve and a trust note are all things the
+    # gate writes down beside a decision, not stops it decided anything about
+    with tempfile.NamedTemporaryFile("w", suffix=".log", delete=False,
+                                     encoding="utf-8") as handle:
+        handle.write("2026-09-18T00:33:41\tstop\tF:/p\tverified\n"
+                     "2026-09-18T00:33:42\treview\tF:/p\treviewer recorded 1/1\n"
+                     "2026-09-18T00:33:43\tunresolved\t/no/such\tpath dropped\n"
+                     "2026-09-18T00:33:44\ttrust\tF:/p\tuntrusted workspace\n")
+    counts, stops, unchecked = stop_gate_log(base - dt.timedelta(days=1), handle.name)
+    os.unlink(handle.name)
+    assert (stops, unchecked) == (1, 0) and counts["review reviewer"] == 1
+    assert counts["unresolved path"] == 1 and counts["trust untrusted"] == 1
 
     assert snapshot_delta({"stops": 10, "date": "2026-09-11"},
                           {"stops": 4, "date": "2026-09-18"}) == ["stops: 10 -> 4 (-6)"]
