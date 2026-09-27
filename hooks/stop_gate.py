@@ -186,7 +186,7 @@ def renpy_lint(ws, files, deadline, beat=None):
     left = remaining(deadline)
     if left < MIN_STEP:
         return RENPY_LABEL, 1, [f"verifier budget exhausted: {GATE_BUDGET}s spent before lint ran"]
-    # ponytail: re-lints the whole project on every changed fingerprint (~4 s); cache per
+    # ceiling: re-lints the whole project on every changed fingerprint (~4 s); cache per
     # fingerprint with the verified record if that drags
     try:
         proc = subprocess.Popen([os.path.join(sdk, SDK_EXE), ws, "lint", "--error-code"],

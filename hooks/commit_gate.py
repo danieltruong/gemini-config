@@ -50,10 +50,10 @@ def check(tool, args):
         return None
     if not CC.match(head):
         return (f"Commit subject is not Conventional Commits: '{head}'. Invoke the "
-                "caveman-commit skill to write a compliant message.")
+                "commit-msg skill to write a compliant message.")
     if len(head) > SUBJECT_LIMIT:
         return (f"Commit subject is {len(head)} chars (limit {SUBJECT_LIMIT}): '{head}'. "
-                "Shorten it using caveman-commit format.")
+                "Shorten it using the commit-msg skill.")
     return None
 
 

@@ -11,26 +11,39 @@ Sources and what each is trusted for:
       extractable), gen_metadata.data (protobuf: real token counts + model string)
   conversation_summaries.db  title, workspace, killed, agent_name, parent conversation
   ~/.gemini/tmp/stop_gate.log  hook stop decisions
+  git log of --config-repo  config commits listed under a fired quality flag
+
+Quality trend: 4 full ISO weeks of ci_first_try, pass_share, bm_per_report and rework
+(definitions in quality_weeks), and a flag when a metric was worse than the median of
+up to 4 earlier weeks in both of the last 2, as claude-config's claude-audit.sh does.
 
 Self-check: --self-check exercises the protobuf walker, the transcript parser, the
 active-time calculation, the correction heuristic, the gate-file and stop-log parsers,
-the subagent overlap count and the snapshot delta against fixtures, no data root.
+the subagent overlap count, the snapshot delta, the worktree file key, the unreadable-
+conversation window, and the quality metric, flag math and flag printout (config commits
+from a throwaway git repo, so git must be on PATH) against fixtures, no data root.
 """
 import argparse
 import collections
+import contextlib
 import csv
 import datetime as dt
+import functools
 import glob
+import io
 import json
 import os
 import re
 import sqlite3
 import statistics
+import subprocess
 import sys
 import tempfile
 import urllib.parse
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir, "hooks"))
+# realpath: run through the ~/.gemini/config/scripts junction, the repo is still found
+REPO = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+sys.path.insert(0, os.path.join(REPO, "hooks"))
 # one transcript parser for the hooks and this script
 from transcript import EDIT_TOOLS, RUN_TOOLS, read_transcript  # noqa: E402
 
@@ -108,8 +121,7 @@ LATENCY_NS = ".1.11.2"
 MODEL_STRING = ".1.19"
 KV_KEY, KV_VALUE = ".1.20.1", ".1.20.2"
 
-# A larger model is an escalation away from the cheap flash default.
-BIG_MODEL = re.compile(r"(?i)(pro|opus|sonnet|thinking|-high\b)")
+INHERIT_MODELS = {"", "?", "inherit"}
 
 # Files that decide whether work passed. Editing one while the verifier is red moves
 # the goalposts, so every such edit is listed by conversation and step.
@@ -149,6 +161,33 @@ TOOL_HEADER = re.compile(
     r"^Created At: (\S+)\nCompleted At: (\S+)\n?", re.MULTILINE)
 DIGITS = re.compile(r"\d+")
 HEXISH = re.compile(r"(?i)\b[0-9a-f]{8,}\b")
+
+# Quality trend, modelled on claude-config's claude-quality.py; see quality_weeks for how
+# each metric maps onto what agy records.
+QUALITY_WEEKS = 8  # the table shows the newest 4; the flag takes up to 4 more as baseline
+REWORK_WINDOW = dt.timedelta(days=14)
+REVIEWER_AGENT = re.compile(r"(?i)(?<!security)(?:^|[-_])reviewer$")
+# a tester runs red first on purpose and a linter's red run is its output, so neither
+# first verifier run says anything about the work
+NOT_CI_AGENT = re.compile(r"(?i)^(?:test|linter$)")
+# agents/reviewer.md: one line per finding, `path:line: severity: problem. fix.`; a path
+# may hold spaces, a line may be a range or L-prefixed
+FINDING = re.compile(r"(?i)^[\s>*-]*`?(?:[a-z]:)?[^`:\n]*[^\s`:](?::L?\d+(?:-L?\d+)?)+`?:\s*\**"
+                     r"(bug|security|wrong-result|dead-code|over-engineering|nit)\b")
+BLOCKING_SEVERITIES = {"bug", "security", "wrong-result"}
+NOT_CODE = (".md", ".txt")  # plans, notes and DECISIONS.md change every run by design
+# <repo>/.claude/worktrees/<name> and the like: gone once merged, so matched by name
+WORKTREE_DIR = re.compile(r"[\\/]\.[^\\/]+[\\/]worktrees[\\/][^\\/]+(?=[\\/])")
+CONFIG_PATHS = (":(top)GEMINI.md", ":(top)AGENTS.md", ":(top)agents/", ":(top)skills/",
+                ":(top)rules/", ":(top)hooks/", ":(top)hooks.json", ":(top)mcp_config.json",
+                ":(top)scripts/", ":(top)install.sh", ":(top)install.ps1")
+# (metric, margin shown, worse than the baseline median); rounded so 0.8 - 0.75 is not > 0.05
+FLAG_RULES = (
+    ("ci_first_try", "-0.05 abs", lambda v, med: round(med - v, 6) > 0.05),
+    ("pass_share", "-0.10 abs", lambda v, med: round(med - v, 6) > 0.10),
+    ("bm_per_report", "x1.5", lambda v, med: round(v - med * 1.5, 6) > 0 and v > 0),
+    ("rework", "+0.05 abs", lambda v, med: round(v - med, 6) > 0.05),
+)
 
 
 def die(msg):
@@ -276,6 +315,44 @@ def file_target(args):
                args.get("Path") or args.get("File") or "")
 
 
+@functools.lru_cache(maxsize=None)
+def checkout_roots(folder):
+    """(checkout root, main checkout root) of the git checkout holding folder, or None."""
+    while True:
+        dot = folder + "/.git"
+        if os.path.isdir(dot):
+            return folder, folder
+        if os.path.isfile(dot):
+            try:
+                with open(dot, encoding="utf-8") as handle:
+                    text = handle.read()
+            except OSError:
+                return None
+            main = re.search(r"gitdir:\s*(.+?)[\\/]\.git[\\/]worktrees[\\/]", text)
+            return folder, main.group(1).replace("\\", "/") if main else folder
+        parent = os.path.dirname(folder)
+        if parent == folder:
+            return None
+        folder = parent
+
+
+def checkout_key(path):
+    """A file as its path in the repo's main checkout, so the same file edited in a
+    worktree and in the main checkout is one key."""
+    path = WORKTREE_DIR.sub("", os.path.abspath(path), count=1).replace("\\", "/")
+    roots = checkout_roots(os.path.dirname(path))
+    if roots:
+        path = roots[1] + path[len(roots[0]):]
+    return os.path.normcase(path)
+
+
+def off_session_model(requested, session_model):
+    """Did a subagent spawn pin a model other than the exact one its parent ran on?
+    Every agent inherits, so a tier alias ("flash", "pro") counts as drift too."""
+    requested = requested.strip().lower()
+    return requested not in INHERIT_MODELS and requested != session_model.strip().lower()
+
+
 def peak_overlap(spans):
     """Most intervals live at once, from (start, end) pairs."""
     marks = []
@@ -394,12 +471,14 @@ def load_generations(root, cid):
 
 
 # ----------------------------------------------------------------- conversation
+def transcript_path(root, cid):
+    logs = os.path.join(root, "brain", cid, ".system_generated", "logs")
+    full = os.path.join(logs, "transcript_full.jsonl")
+    return full if os.path.exists(full) else os.path.join(logs, "transcript.jsonl")
+
+
 def audit_conversation(root, cid, summary, since):
-    tpath = os.path.join(root, "brain", cid, ".system_generated",
-                         "logs", "transcript_full.jsonl")
-    if not os.path.exists(tpath):
-        tpath = os.path.join(root, "brain", cid, ".system_generated",
-                             "logs", "transcript.jsonl")
+    tpath = transcript_path(root, cid)
     if not os.path.exists(tpath):
         return None
     steps, bad_lines = read_transcript(tpath)
@@ -448,7 +527,7 @@ def audit_conversation(root, cid, summary, since):
         "tokens_in_uncached": 0, "tokens_in_cached": 0, "tokens_out": 0,
         "tokens_thinking": 0, "tokens_response": 0,
         "ctx_peak": 0, "ctx_window": 0,
-        "escalations": 0,
+        "model_switches": 0, "off_model_spawns": 0,
         "subagents": collections.Counter(),
         "subagent_models": collections.Counter(),
         "models": collections.Counter(),
@@ -467,6 +546,9 @@ def audit_conversation(root, cid, summary, since):
         "last_verifier_ok": "never",
         "edits_after_last_verifier": 0,
         "plans": 0,
+        "first_verifier_ok": "",
+        "edited_files": collections.defaultdict(list),
+        "review": None,
     }
 
     for gen in gens:
@@ -480,9 +562,8 @@ def audit_conversation(root, cid, summary, since):
         if gen["model"]:
             rec["models"][gen["model"]] += 1
     order = [g["model"] for g in gens if g["model"]]
-    for earlier, later in zip(order, order[1:]):
-        if later != earlier and BIG_MODEL.search(later) and not BIG_MODEL.search(earlier):
-            rec["escalations"] += 1
+    rec["model_switches"] = sum(1 for a, b in zip(order, order[1:]) if a != b)
+    session_model = rec["models"].most_common(1)[0][0] if rec["models"] else ""
 
     last_signature = None
     repeat_run = 0
@@ -492,6 +573,8 @@ def audit_conversation(root, cid, summary, since):
     edits_timeline = []
     verifier_red = False  # did the most recent verifier run in this conversation fail
     red_label = ""
+    sent = []             # send_message texts: where a subagent puts its report
+    last_reply = ""
 
     for step, stamp in zip(steps, stamps):
         stype = step.get("type")
@@ -526,6 +609,7 @@ def audit_conversation(root, cid, summary, since):
             rec["model_turns"] += 1
             rec["chars_model"] += len(content)
             rec["chars_thinking"] += len(thinking)
+            last_reply = content if content.strip() else last_reply
         elif stype == "GENERIC":
             seconds, body = tool_span(content)
             call_info = pending.pop(0) if pending else {}
@@ -551,6 +635,8 @@ def audit_conversation(root, cid, summary, since):
             if call_info.get("verifier"):
                 verifier_red = bool(step_failed or self_reported)
                 red_label = call_info["verifier"]
+                rec["first_verifier_ok"] = (rec["first_verifier_ok"]
+                                            or ("fail" if verifier_red else "pass"))
             if call_info.get("git_diff"):
                 rec["reviewer_diff_lines"] = max(
                     rec["reviewer_diff_lines"], body.count("\n") + bool(body))
@@ -588,12 +674,16 @@ def audit_conversation(root, cid, summary, since):
             for spec in specs:
                 rec["subagents"][str(spec.get("TypeName") or spec.get("Role") or "?")] += 1
                 rec["subagent_models"][str(spec.get("Model") or "?")] += 1
-                if BIG_MODEL.search(str(spec.get("Model") or "")):
-                    rec["escalations"] += 1
+                rec["off_model_spawns"] += off_session_model(
+                    str(spec.get("Model") or ""), session_model)
+            if name == "send_message":
+                sent.append(str(args.get("Message") or ""))
             if name in EDIT_TOOLS:
                 rec["edits"] += 1
                 edits_timeline.append(stamp)
                 target = file_target(args)
+                if target and stamp and not target.lower().endswith(NOT_CODE):
+                    rec["edited_files"][checkout_key(target)].append(stamp)
                 if verifier_red and target and GATE_FILE.search(target):
                     rec["red_gate_edits"] += 1
                     rec["red_gate_edit_rows"].append({
@@ -633,6 +723,10 @@ def audit_conversation(root, cid, summary, since):
         rec["edits_after_last_verifier"] = sum(
             1 for t in edits_timeline if t and t > last_verifier_at)
 
+    report_text = "\n".join(sent) or last_reply
+    if REVIEWER_AGENT.search(rec["agent_name"]) and report_text.strip():
+        rec["review"] = review_findings(report_text)
+
     rec["hot_files"] = sum(1 for _f, n in rec["file_reads"].items() if n > 3)
     gaps = []
     marks = user_stamps + [rec["end"]]
@@ -660,6 +754,172 @@ def quality_score(rec):
     score += 20.0 * rec["fail_rate"]
     score += 5.0 * rec["killed"] + 5.0 * rec["not_fully_idle"]
     return round(score, 1)
+
+
+# ---------------------------------------------------------------------- quality
+def review_findings(text):
+    """Severity counts of the distinct finding lines in a reviewer's report."""
+    return collections.Counter(m.group(1).lower() for m in map(
+        FINDING.match, set(text.splitlines())) if m)
+
+
+def iso_week(when):
+    year, week, _ = when.astimezone(dt.timezone.utc).isocalendar()
+    return f"{year}-W{week:02d}"
+
+
+def full_weeks(now, count):
+    """Monday 00:00 UTC of the `count` full ISO weeks before the week holding now."""
+    today = now.astimezone(dt.timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+    current = today - dt.timedelta(days=today.weekday())
+    return [current - dt.timedelta(weeks=count - i) for i in range(count)]
+
+
+def share(num, den):
+    return round(num / den, 3) if den else None
+
+
+def tree_root(cid, parents):
+    """The top conversation of a subagent tree; a parent outside the window still names it."""
+    seen = set()
+    while parents.get(cid) and cid not in seen:
+        seen.add(cid)
+        cid = parents[cid]
+    return cid
+
+
+def quality_weeks(records, now, count=QUALITY_WEEKS):
+    """One row per full ISO week (UTC), oldest first. agy records no CI run, review
+    verdict or merge, so each metric reads the nearest thing its transcripts hold:
+      ci_first_try   share of conversations whose first verifier run passed
+      pass_share     share of reviewer reports with no bug/security/wrong-result finding
+      bm_per_report  bug/security/wrong-result findings per reviewer report
+      rework         share of files a conversation tree last edited in the week that a
+                     different tree edited again within 14 days; None until all closed
+    """
+    cells = {iso_week(start): collections.Counter() for start in full_weeks(now, count)}
+    closed = dict.fromkeys(cells, True)
+    parents = {r["conversation_id"]: r["parent"] for r in records}
+    edits = collections.defaultdict(lambda: collections.defaultdict(list))
+    for rec in records:
+        cell = cells.get(iso_week(rec["start"]))
+        if cell is not None and rec["first_verifier_ok"] and not NOT_CI_AGENT.search(
+                rec["agent_name"]):
+            cell["verified"] += 1
+            cell["first_try"] += rec["first_verifier_ok"] == "pass"
+        if cell is not None and rec["review"] is not None:
+            blocking = sum(n for sev, n in rec["review"].items() if sev in BLOCKING_SEVERITIES)
+            cell["reports"] += 1
+            cell["passed"] += not blocking
+            cell["blocking"] += blocking
+        tree = tree_root(rec["conversation_id"], parents)
+        for path, stamps in rec["edited_files"].items():
+            edits[path][tree].extend(stamps)
+    # a tree lands a file at its last edit: churn before that is the task still in
+    # progress, as a branch is before merge
+    for trees in edits.values():
+        for stamps in trees.values():
+            landed = max(stamps)
+            week = iso_week(landed)
+            if week not in cells:
+                continue
+            cells[week]["landed"] += 1
+            cells[week]["reworked"] += any(
+                landed < t <= landed + REWORK_WINDOW
+                for times in trees.values() for t in times)
+            closed[week] = closed[week] and now >= landed + REWORK_WINDOW
+    return [{"week": week, "verified": c["verified"],
+             "ci_first_try": share(c["first_try"], c["verified"]),
+             "reports": c["reports"], "pass_share": share(c["passed"], c["reports"]),
+             "bm_per_report": share(c["blocking"], c["reports"]), "landed": c["landed"],
+             "rework": share(c["reworked"], c["landed"]) if closed[week] else None,
+             "rework_open": not closed[week]}
+            for week, c in cells.items()]
+
+
+def quality_flags(rows):
+    """Per metric: fired when both checked weeks are worse than the median of up to 4
+    weeks before them, so one bad week never fires alone. Skipped without 2 checked
+    values and 2 baseline values."""
+    out = []
+    for name, margin, worse in FLAG_RULES:
+        values = [(row["week"], row[name]) for row in rows]
+        stop = len(values)
+        if name == "rework":  # the newest 2 adjacent closed weeks, since open weeks read None
+            pairs = [i for i in range(1, stop)
+                     if values[i][1] is not None and values[i - 1][1] is not None]
+            stop = pairs[-1] + 1 if pairs else 0
+        checked = values[stop - 2:stop] if stop >= 2 else []
+        base = [(w, v) for w, v in values[:max(stop - 2, 0)][-4:] if v is not None]
+        flag = {"name": name, "margin": margin, "checked": checked, "baseline": base,
+                "median": None, "status": "skipped"}
+        if len(checked) == 2 and all(v is not None for _w, v in checked) and len(base) >= 2:
+            flag["median"] = round(statistics.median(v for _w, v in base), 6)
+            fired = all(worse(v, flag["median"]) for _w, v in checked)
+            flag["status"] = "fired" if fired else "ok"
+        out.append(flag)
+    return out
+
+
+def config_commits(repo, since, until):
+    """Commits to config paths authored in [since, until), newest first."""
+    proc = subprocess.run(
+        ["git", "-C", repo, "log", f"--since={since.isoformat()}",
+         "--format=%h%x09%at%x09%s", "--", *CONFIG_PATHS],
+        capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60)
+    if proc.returncode:
+        raise RuntimeError((proc.stderr.strip().splitlines() or [f"git exit {proc.returncode}"])[-1])
+    rows = []
+    for text in proc.stdout.splitlines():
+        sha, stamp, subject = text.split("\t", 2)
+        when = dt.datetime.fromtimestamp(int(stamp), dt.timezone.utc)
+        if since <= when < until:  # --since trims by commit date, the window is author date
+            rows.append(f"{sha} {when:%Y-%m-%d} {subject}")
+    return rows
+
+
+def print_quality(rows, flags, config_repo):
+    print("\nQUALITY TREND (last 4 full ISO weeks, UTC; rework open until 14 days after "
+          "the week's last edit)")
+    def pct(value):
+        return "-" if value is None else f"{value * 100:.0f}%"
+
+    print(f"  {'week':<9} {'verified':>8} {'ci_first_try':>12} {'reports':>7} "
+          f"{'b+m/report':>10} {'pass':>5} {'rework':>7}")
+    for row in rows[-4:]:
+        bm = "-" if row["bm_per_report"] is None else f"{row['bm_per_report']:.2f}"
+        rework = "open" if row["rework_open"] else pct(row["rework"])
+        print(f"  {row['week']:<9} {row['verified']:>8} {pct(row['ci_first_try']):>12} "
+              f"{row['reports']:>7} {bm:>10} {pct(row['pass_share']):>5} {rework:>7}")
+    print("  ci_first_try: first verifier run per conversation passed (testers and linters"
+          " left out); agy records no CI run")
+    print("  b+m, pass: bug/security/wrong-result findings in reviewer subagent reports")
+    print("  rework: code files a separate conversation tree edited again within 14 days")
+    fired = [flag for flag in flags if flag["status"] == "fired"]
+    if not fired:
+        # rework checks older weeks than the rest, so each metric names its own pair
+        checked = [f"{flag['name']} {flag['checked'][0][0]}..{flag['checked'][1][0]}"
+                   for flag in flags if flag["status"] == "ok"]
+        short = [flag["name"] for flag in flags if flag["status"] == "skipped"]
+        print("quality flag: none (" + ("checked " + ", ".join(checked) if checked
+                                        else "insufficient data")
+              + (f"; too little data: {', '.join(short)}" if checked and short else "") + ")")
+    for flag in fired:
+        (w1, v1), (w2, v2) = flag["checked"]
+        side = "below" if flag["name"] in ("ci_first_try", "pass_share") else "above"
+        print(f"quality flag: {flag['name']} {side} baseline 2 weeks ({w1} {v1:.3f}, {w2} "
+              f"{v2:.3f}; baseline median {flag['median']:.3f} over "
+              f"{flag['baseline'][0][0]}..{flag['baseline'][-1][0]}; margin {flag['margin']})")
+        start = dt.datetime.strptime(w1 + "-1", "%G-W%V-%u").replace(tzinfo=dt.timezone.utc)
+        end = start + dt.timedelta(weeks=2)
+        try:
+            commits = config_commits(config_repo, start, end)
+        except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
+            print(f"  config commits: unavailable ({exc})")
+            continue
+        print(f"  config commits {start:%Y-%m-%d}..{end - dt.timedelta(days=1):%Y-%m-%d} UTC:")
+        for text in commits or ["none"]:
+            print(f"    {text}")
 
 
 # ---------------------------------------------------------------------- reports
@@ -785,7 +1045,7 @@ def save_snapshot(metrics, snapshot_dir):
     return path, (earlier[-1] if earlier else ""), snapshot_delta(previous, metrics)
 
 
-def report(records, days, since, out_dir, snapshot_dir, skipped):
+def report(records, days, since, out_dir, snapshot_dir, skipped, quality):
     os.makedirs(out_dir, exist_ok=True)
     total_tool_calls = sum(r["tool_calls"] for r in records)
     all_tools, all_fails, all_errors = (collections.Counter() for _ in range(3))
@@ -875,12 +1135,13 @@ def report(records, days, since, out_dir, snapshot_dir, skipped):
 
     print("\nMODEL MIX")
     top(models, 8)
-    line("generations on a larger model",
-         sum(n for m, n in models.items() if BIG_MODEL.search(m)))
-    line("conversations using more than one model",
-         sum(1 for r in records if len(r["models"]) > 1))
-    line("escalations (subagent asked for the big model)",
-         sum(r["escalations"] for r in records))
+    line("generations off the most-used model",
+         sum(models.values()) - max(models.values(), default=0))
+    line("conversations on 2+ models / switches",
+         f"{sum(1 for r in records if len(r['models']) > 1)} / "
+         f"{sum(r['model_switches'] for r in records)}")
+    # policy is model: inherit, so a spawn pinning another model is drift
+    line("subagent spawns off the session model", sum(r["off_model_spawns"] for r in records))
     print("    subagent model requests:")
     submodels = collections.Counter()
     for rec in records:
@@ -957,6 +1218,8 @@ def report(records, days, since, out_dir, snapshot_dir, skipped):
          f"{percentile(reviewer_diffs, 0.5):,} / {max(reviewer_diffs, default=0):,}"
          f" over {len(reviewer_diffs)} reviewer runs")
 
+    print_quality(*quality)
+
     print("\nUSER CORRECTIONS (keyword heuristic, human turns only)")
     line("human turns after the first",
          sum(max(0, r["human_turns"] - 1) for r in records if not r["is_subagent"]))
@@ -1008,7 +1271,8 @@ def report(records, days, since, out_dir, snapshot_dir, skipped):
                  "reviewer_diff_lines",
                  "wall_s", "active_s", "killed", "not_fully_idle",
                  "tokens_in_uncached", "tokens_in_cached", "tokens_out",
-                 "tokens_thinking", "ctx_peak", "ctx_window", "models", "escalations",
+                 "tokens_thinking", "ctx_peak", "ctx_window", "models", "model_switches",
+                 "off_model_spawns",
                  "tool_calls", "tool_failures", "fail_rate", "retry_loop_calls",
                  "chars_user", "chars_model", "chars_thinking", "chars_tool_args",
                  "chars_tool_results", "chars_view_results", "views", "edits",
@@ -1113,7 +1377,10 @@ def self_check():
         "failed at line N in <hex>"
     assert workspace_of('["file:///F:/Factory/renpy/Birth%20Battle"]') == \
         "F:/Factory/renpy/Birth Battle"
-    assert BIG_MODEL.search("gemini-3.1-pro-low") and not BIG_MODEL.search("gemini-3.8-flash")
+    for requested in ("gemini-3.1-pro", "flash", "pro", "gemini-3.8-flash"):
+        assert off_session_model(requested, "gemini-3.8-flash-high"), requested
+    for requested in ("", "inherit", "Inherit", "gemini-3.8-flash-high", "Gemini-3.8-Flash-High"):
+        assert not off_session_model(requested, "gemini-3.8-flash-high"), requested
 
     assert result_failed('{"success":true,"exit_code":0}') == ""
     assert result_failed('{"success":true,"exit_code":2}') == "exit_code 2"
@@ -1209,7 +1476,174 @@ def self_check():
     assert snapshot_delta({"stops": 10, "date": "2026-09-11"},
                           {"stops": 4, "date": "2026-09-18"}) == ["stops: 10 -> 4 (-6)"]
     assert snapshot_delta({}, {"stops": 4}) == []
+
+    check_quality()
     print("self-check ok")
+
+
+def check_quality():
+    assert review_findings("a/b.py:3: bug: x. fix.\na/b.py:3: bug: x. fix.\n"
+                           "F:/p/c.rpy:9: nit: y\n- `d.py:1`: security: z\n"
+                           "Birth Battle/game/x.rpy:3: bug: w\n"
+                           "- `F:/renpy/Birth Battle/y.rpy:12-14`: wrong-result: v\n"
+                           "e.py:L12: dead-code: u\ne.py:L3-L5: nit: t\n"
+                           "no finding: bug\nsee step 3: bug\nLean already") == \
+        collections.Counter({"bug": 2, "nit": 2, "security": 1, "wrong-result": 1,
+                             "dead-code": 1})
+    for name in ("tester", "Tester", "test-writer", "linter"):
+        assert NOT_CI_AGENT.search(name), name
+    for name in ("coder", "attester", "contest-judge", "linter-fixer", "reviewer"):
+        assert not NOT_CI_AGENT.search(name), name
+    for name in ("reviewer", "br_reviewer", "lite-reviewer"):
+        assert REVIEWER_AGENT.search(name), name
+    assert not REVIEWER_AGENT.search("security-reviewer")
+
+    now = dt.datetime(2026, 9, 26, 12, tzinfo=dt.timezone.utc)  # a Saturday in W39
+    assert [iso_week(w) for w in full_weeks(now, 2)] == ["2026-W37", "2026-W38"]
+
+    def rec(cid, start, parent="", agent="", first="", review=None, edits=None):
+        return {"conversation_id": cid, "parent": parent, "start": start, "agent_name": agent,
+                "first_verifier_ok": first, "review": review, "edited_files": edits or {}}
+    mon = dt.datetime(2026, 9, 14, 9, tzinfo=dt.timezone.utc)  # W38
+    hour, day = dt.timedelta(hours=1), dt.timedelta(days=1)
+    records = [
+        rec("a", mon, first="pass", edits={"x.py": [mon], "y.py": [mon]}),
+        rec("a2", mon, parent="a", agent="coder", edits={"x.py": [mon + hour]}),
+        rec("b", mon, first="fail"),
+        rec("t", mon, agent="tester", first="fail"),
+        rec("r1", mon, parent="a", agent="reviewer",
+            review=collections.Counter({"bug": 1, "nit": 2})),
+        rec("r2", mon, parent="a", agent="reviewer", review=collections.Counter()),
+        rec("d", mon + 3 * day, edits={"x.py": [mon + 3 * day]}),
+        # past the 14-day window, so it reworks nothing
+        rec("e", mon + 20 * day, edits={"y.py": [mon + 20 * day]}),
+    ]
+    w38 = next(r for r in quality_weeks(records, now + 30 * day) if r["week"] == "2026-W38")
+    # a's own subagent editing x.py is not rework, d a few days later is; testers left out
+    assert (w38["verified"], w38["ci_first_try"]) == (2, 0.5), w38
+    assert (w38["reports"], w38["pass_share"], w38["bm_per_report"]) == (2, 0.5, 0.5), w38
+    assert (w38["landed"], w38["rework"], w38["rework_open"]) == (3, 0.333, False), w38
+    still_open = quality_weeks(records, now)[-1]
+    assert still_open["rework"] is None and still_open["rework_open"], still_open
+
+    def status(metric, values):
+        table = [{"week": f"W{i}", **dict.fromkeys(m for m, _margin, _worse in FLAG_RULES),
+                  metric: v} for i, v in enumerate(values)]
+        return next(f for f in quality_flags(table) if f["name"] == metric)
+
+    fired = status("ci_first_try", [0.9, 0.8, 0.9, 0.8, 0.7, 0.7])
+    assert fired["status"] == "fired" and fired["median"] == 0.85, fired
+    assert fired["checked"] == [("W4", 0.7), ("W5", 0.7)], fired
+    assert status("ci_first_try", [0.9, 0.8, 0.9, 0.8, 0.9, 0.7])["status"] == "ok"
+    # exactly the margin is not worse
+    assert status("ci_first_try", [0.8, 0.8, 0.75, 0.75])["status"] == "ok"
+    assert status("pass_share", [0.9, 0.9, 0.7, None])["status"] == "skipped"
+    assert status("pass_share", [0.9, 0.7, 0.7])["status"] == "skipped"
+    assert status("bm_per_report", [0.0, 0.0, 0.5, 0.5])["status"] == "fired"
+    # rework checks the newest closed pair, not the open weeks after it
+    flag = status("rework", [0.1, 0.1, 0.1, 0.3, 0.3, None, None])
+    assert flag["status"] == "fired" and flag["checked"] == [("W3", 0.3), ("W4", 0.3)], flag
+
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+        check_checkout_key(tmp.replace("\\", "/"))
+        check_print_quality(tmp)
+        check_load_records(tmp)
+
+
+def check_checkout_key(tmp):
+    main = f"{tmp}/main"
+    os.makedirs(f"{main}/.git")
+    for wt in (f"{main}/.claude/worktrees/feat", f"{tmp}/main-side"):
+        os.makedirs(wt)
+        with open(f"{wt}/.git", "w", encoding="utf-8") as handle:
+            handle.write(f"gitdir: {main}/.git/worktrees/{os.path.basename(wt)}\n")
+    # a live worktree inside the repo, one beside it, and one already removed
+    keys = {checkout_key(f"{root}/src/a.py") for root in (
+        main, f"{main}/.claude/worktrees/feat", f"{tmp}/main-side",
+        f"{main}/.agents/worktrees/gone")}
+    assert len(keys) == 1, keys
+
+
+def check_print_quality(tmp):
+    repo = os.path.join(tmp, "config")
+    os.makedirs(repo)
+
+    def git(*args, when="2026-09-01T10:00:00+00:00"):
+        subprocess.run(["git", "-C", repo, "-c", "user.name=t", "-c", "user.email=t@t.invalid",
+                        "-c", "commit.gpgsign=false", *args], check=True, capture_output=True,
+                       env={**os.environ, "GIT_AUTHOR_DATE": when, "GIT_COMMITTER_DATE": when})
+    git("init", "-q")
+    # config paths inside the flagged fortnight, a non-config file inside it, and a
+    # config path after it
+    for rel, when in (("scripts/x.py", "2026-09-08T10:00:00+00:00"),
+                      ("install.ps1", "2026-09-15T10:00:00+00:00"),
+                      ("notes.txt", "2026-09-16T10:00:00+00:00"),
+                      ("install.sh", "2026-09-30T10:00:00+00:00")):
+        os.makedirs(os.path.dirname(os.path.join(repo, rel)), exist_ok=True)
+        with open(os.path.join(repo, rel), "w", encoding="utf-8") as handle:
+            handle.write(rel)
+        git("add", rel)
+        git("commit", "-q", "-m", f"change {rel}", when=when)
+
+    def quality_output(flags):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            print_quality([], flags, repo)
+        return out.getvalue().splitlines()
+
+    def flag(name, status, weeks=("2026-W37", "2026-W38"), values=(0.5, 0.4)):
+        return {"name": name, "status": status, "margin": "-0.05 abs",
+                "checked": list(zip(weeks, values)) if status != "skipped" else [],
+                "baseline": [("2026-W33", 0.9), ("2026-W36", 0.9)], "median": 0.9}
+    text = quality_output([flag("ci_first_try", "fired"), flag("pass_share", "ok")])
+    at = text.index("quality flag: ci_first_try below baseline 2 weeks (2026-W37 0.500, "
+                    "2026-W38 0.400; baseline median 0.900 over 2026-W33..2026-W36; "
+                    "margin -0.05 abs)")
+    assert text[at + 1] == "  config commits 2026-09-07..2026-09-20 UTC:", text
+    assert [row.strip().split(" ", 1)[-1] for row in text[at + 2:]] == [
+        "2026-09-15 change install.ps1", "2026-09-08 change scripts/x.py"], text
+
+    text = quality_output([flag("ci_first_try", "ok"), flag("pass_share", "skipped"),
+                           flag("rework", "ok", weeks=("2026-W35", "2026-W36"))])
+    assert text[-1] == ("quality flag: none (checked ci_first_try 2026-W37..2026-W38, "
+                        "rework 2026-W35..2026-W36; too little data: pass_share)"), text
+
+
+def check_load_records(tmp):
+    root = os.path.join(tmp, "agy")
+    now = dt.datetime.now(dt.timezone.utc)
+    for cid, age in (("new", 0), ("old", 30)):
+        # a transcript that is a folder cannot be read, so auditing it raises
+        tpath = os.path.join(root, "brain", cid, ".system_generated", "logs",
+                             "transcript_full.jsonl")
+        os.makedirs(tpath)
+        stamp = (now - dt.timedelta(days=age)).timestamp()
+        os.utime(tpath, (stamp, stamp))
+    loaded, skipped = load_records(root, now - dt.timedelta(days=60), now - dt.timedelta(days=7))
+    assert loaded == [] and [cid for cid, _why in skipped] == ["new"], skipped
+
+
+def load_records(root, load_since, since):
+    """(records back to load_since, unreadable conversations inside the --days window)."""
+    summaries = load_summaries(root)
+    loaded, skipped = [], []
+    for path in sorted(glob.glob(os.path.join(root, "brain", "*"))):
+        cid = os.path.basename(path)
+        try:
+            rec = audit_conversation(root, cid, summaries.get(cid, {}), load_since)
+        except Exception as exc:                       # one bad file must not stop the run
+            # no record to date it, so the summary or the file's mtime says if it is in the window
+            tpath = transcript_path(root, cid)
+            modified = summaries.get(cid, {}).get("last_modified") or dt.datetime.fromtimestamp(
+                os.path.getmtime(tpath if os.path.exists(tpath) else path), dt.timezone.utc)
+            if modified >= since:
+                skipped.append((cid, f"{type(exc).__name__}: {exc}"))
+            continue
+        if rec:
+            if rec["db_note"] and rec["end"] >= since:
+                skipped.append((cid, rec["db_note"]))
+            loaded.append(rec)
+    return loaded, skipped
 
 
 def main(argv=None):
@@ -1226,8 +1660,10 @@ def main(argv=None):
         help="directory for the detail files")
     parser.add_argument("--snapshot-dir", default=DEFAULT_SNAPSHOT_DIR,
                         help=f"dated headline-metric snapshots (default {DEFAULT_SNAPSHOT_DIR})")
+    parser.add_argument("--config-repo", default=REPO,
+        help="git repo whose config commits a quality flag lists (default: this script's repo)")
     parser.add_argument("--self-check", action="store_true",
-                        help="run the built-in parser and active-time checks, then exit")
+                        help="run the built-in parser, active-time and quality checks, then exit")
     args = parser.parse_args(argv)
 
     if args.self_check:
@@ -1239,23 +1675,17 @@ def main(argv=None):
     if not os.path.isdir(os.path.join(root, "brain")):
         die(f"no brain/ under {root}")
 
-    since = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=args.days)
-    summaries = load_summaries(root)
-    records, skipped = [], []
-    for path in sorted(glob.glob(os.path.join(root, "brain", "*"))):
-        cid = os.path.basename(path)
-        try:
-            rec = audit_conversation(root, cid, summaries.get(cid, {}), since)
-        except Exception as exc:                       # one bad file must not stop the run
-            skipped.append((cid, f"{type(exc).__name__}: {exc}"))
-            continue
-        if rec:
-            if rec["db_note"]:
-                skipped.append((cid, rec["db_note"]))
-            records.append(rec)
+    now = dt.datetime.now(dt.timezone.utc)
+    since = now - dt.timedelta(days=args.days)
+    # the quality trend reads further back than the window, so load back to its first week
+    load_since = min(since, full_weeks(now, QUALITY_WEEKS)[0])
+    loaded, skipped = load_records(root, load_since, since)
+    records = [rec for rec in loaded if rec["end"] >= since]
     if not records:
         die(f"no conversations modified in the last {args.days} days under {root}")
-    report(records, args.days, since, args.out, args.snapshot_dir, skipped)
+    rows = quality_weeks(loaded, now)
+    report(records, args.days, since, args.out, args.snapshot_dir, skipped,
+           (rows, quality_flags(rows), args.config_repo))
     return 0
 
 

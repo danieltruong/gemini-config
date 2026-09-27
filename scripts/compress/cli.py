@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Caveman Compress CLI
+Compress CLI
 
 Usage:
-    caveman <filepath>
+    python3 -m compress <filepath>
 """
 
 import sys
@@ -26,7 +26,7 @@ from .detect import detect_file_type, should_compress
 
 
 def print_usage():
-    print("Usage: caveman <filepath>")
+    print("Usage: python3 -m compress <filepath>")
 
 
 def main():
@@ -57,7 +57,7 @@ def main():
         print("Skipping: file is not natural language (code/config)")
         sys.exit(0)
 
-    print("Starting caveman compression...\n")
+    print("Starting compression...\n")
 
     try:
         success = compress_file(filepath)

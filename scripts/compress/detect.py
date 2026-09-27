@@ -87,10 +87,10 @@ def detect_file_type(filepath: Path) -> str:
     if ext in SKIP_EXTENSIONS:
         return "code" if ext not in {".json", ".yaml", ".yml", ".toml", ".ini", ".cfg", ".env"} else "config"
 
-    # Extensionless files (like CLAUDE.md, TODO) — check content
+    # Extensionless files (like GEMINI.md, TODO) — check content
     if not ext:
         try:
-            text = filepath.read_text(errors="ignore")
+            text = filepath.read_text(encoding="utf-8", errors="ignore")
         except (OSError, PermissionError):
             return "unknown"
 

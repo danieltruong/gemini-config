@@ -107,7 +107,7 @@ class TestHooks(unittest.TestCase):
         res = json.loads(proc.stdout)
         self.assertIn("injectSteps", res)
         self.assertTrue(len(res["injectSteps"]) > 0)
-        self.assertIn("CAVEMAN", res["injectSteps"][0]["ephemeralMessage"])
+        self.assertIn("shortest working diff", res["injectSteps"][0]["ephemeralMessage"])
 
     def reinforce(self, num):
         proc = subprocess.run(
@@ -123,7 +123,7 @@ class TestHooks(unittest.TestCase):
 
     def test_banner_returns_every_tenth_invocation(self):
         for num in (10, 20):
-            self.assertIn("CAVEMAN", self.reinforce(num)[0]["ephemeralMessage"])
+            self.assertIn("shortest working diff", self.reinforce(num)[0]["ephemeralMessage"])
 
     def test_deny_circuit_breaker(self):
         script = HOOKS_DIR / "deny_circuit_breaker.py"
@@ -1717,7 +1717,7 @@ class TestGateInternals(unittest.TestCase):
         self.assertEqual(self.gate.verifier_steps(self.tmp), [])
 
     def test_instruction_docs_are_markdown_in_an_instruction_place(self):
-        for rel in ("GEMINI.md", "AGENTS.md", "skills/caveman/SKILL.md", "agents/coder.md",
+        for rel in ("GEMINI.md", "AGENTS.md", "skills/commit-msg/SKILL.md", "agents/coder.md",
                     "rules/yagni.md", ".agents/rules/house.md"):
             self.assertTrue(self.paths.is_instruction_doc(rel), rel)
         for rel in ("src/agents/x.py", "src/agents/x.md", "agents/tool.py", "notes.md",

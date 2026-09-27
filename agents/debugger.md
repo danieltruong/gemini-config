@@ -10,7 +10,7 @@ tools:
   - command_status
 subagent: true
 mainAgent: false
-model: pro
+model: inherit
 commandExecutionPolicy: sandbox
 ---
 

@@ -10,7 +10,6 @@ import transcript
 
 
 BANNER = (
-    "CAVEMAN and PONYTAIL mode active.\n"
     "- Reply terse. Keep every path, command, symbol, number, and negation exact.\n"
     "- Ship the shortest working diff. Reuse the repo, then stdlib, then native platform features.\n"
     "- Never add filler, pleasantries, hedging, or unrequested abstractions."

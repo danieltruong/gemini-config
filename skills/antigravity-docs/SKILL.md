@@ -37,8 +37,12 @@ Modes are `always_on` and `model_decision`, plus `glob` and `manual` (spelling u
 `model_decision` also needs a `description:`, and `glob` takes `glob:` for one pattern or
 `globs:` for several — those three keys are unconfirmed too, read out of strings in the binary.
 
-Sources: `rules-workflows.md`, "Rule activation modes", names the four modes and the 12,000
-character limit per rule file. The built-in skill
+Size limits, from the built-in `agy-customizations/docs/rules.md`: 24 KB (24,000 bytes) per
+rule file, truncated on line boundaries past that, and a shared 20,000-token budget for
+always-on and global rules; a rule over budget is replaced by a pointer to its file. The older
+mirror page said 12,000 characters per file.
+
+Sources: `rules-workflows.md`, "Rule activation modes", names the four modes. The built-in skill
 `~/.gemini/antigravity-cli/builtin/skills/agy-customizations/SKILL.md` gives the frontmatter
 spelling: "**Rules** with `trigger: model_decision` behave similarly. Only `always_on` rules are
 loaded unconditionally."

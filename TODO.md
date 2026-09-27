@@ -1,0 +1,25 @@
+# TODO
+
+- 2026-10-12: Recheck the model change. The main session was already on Gemini 3.8 Flash (High); this change moved `reviewer`, `debugger` and `security-reviewer` off `pro`, and `researcher` and `linter` off `flash`, all to `inherit`. Run `python scripts/agy-audit.py --days 7` and compare the `ci_first_try` and `rework` trends for the 2 full weeks after the merge against the weeks before. Do not judge by `pass_share` or `bm_per_report`: a weaker reviewer finds fewer bugs, which raises `pass_share` and lowers `bm_per_report`, so those look better when quality drops. Also A/B the reviewer: run it on Gemini 3.1 Pro (High) and on Gemini 3.8 Flash (High) over 3 to 5 saved diffs, and have a separate judge compare the reports blind. Report to Daniel before changing a model again, then delete this line.
+- 2026-09-26: GEMINI.md:53 asks for one check per change, but GEMINI.md:74 says the writer never writes tests. Make the two agree.
+- 2026-09-26: GEMINI.md:71 says to run the debugger "Always before a fix". Reword so it applies only when the cause is unknown.
+- 2026-09-26: GEMINI.md:72 lets builders run in parallel, but GEMINI.md:81 forbids fan-out on a single file. Say which rule wins.
+- 2026-09-26: The descriptions in agents/builder.md:3 and agents/debugger.md:3 contradict the delegation rules in GEMINI.md. Align them.
+- 2026-09-26: The footer in agents/reviewer.md:30 conflicts with rules/yagni.md:60. Pick one wording.
+- 2026-09-26: ONBOARD.md:38 states a CLI thinking level that nobody has checked. Verify it or remove it.
+- 2026-09-26: The benchmark numbers in README.md:49 need a source URL.
+- 2026-09-26: Remove or justify the noqa markers in hooks/tests/test_compress.py:18 and scripts/compress-docs.py:26.
+- 2026-09-26: install.ps1:13 uses Test-Path, which returns false for a broken junction, so a broken link is not replaced.
+- 2026-09-26: rules/code.md:14 and rules/yagni.md:34 both state the ceiling rule. Keep it in one place.
+- 2026-09-26: The `*.ts` glob in rules/frontend.md also matches back-end TypeScript, so the rule loads when it does not apply.
+- 2026-09-26: scripts/agy-audit.py:727 counts a reviewer that was killed before it reported as a pass.
+- 2026-09-26: scripts/agy-audit.py:1088 matches the reviewer by exact name instead of `REVIEWER_AGENT`. Use the one definition.
+- 2026-09-26: scripts/ai-docs-lint.py:43 demands frontmatter in any project's rules/ directory when run from stop_gate. Limit it to config rule dirs.
+- 2026-09-26: scripts/ai-docs-lint.py:226 still prints warnings under --quiet.
+- 2026-09-26: scripts/compress-docs.py:38 builds the backup key twice. Keep one.
+- 2026-09-26: scripts/compress-docs.py:51 leaves the target unvalidated when Ctrl+C stops the run.
+- 2026-09-26: scripts/compress/compress.py:298 calls the SDK with no timeout.
+- 2026-09-26: skills/commit-msg lost its body rule and the BREAKING CHANGE footer. Restore them.
+- 2026-09-26: The compressor's agy turn is not read-only. Give it a restricted agent with a tools list.
+- 2026-09-26: scripts/agy-audit.py counts compressor turns as normal sessions. Exclude them.
+- 2026-09-26: Upstream claude-config compress has the same restore-on-raise and URL full-stop bugs. Fix them there too.

@@ -5,6 +5,7 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 echo "=== 1. AI Docs Lint ==="
+python3 "$REPO_ROOT/scripts/ai-docs-lint.py" --self-check
 python3 "$REPO_ROOT/scripts/ai-docs-lint.py" --all
 
 echo "=== 2. Hook Unit Tests ==="

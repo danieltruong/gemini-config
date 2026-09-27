@@ -1,3 +1,3 @@
 # Global Agent Directives
 
-Global guidelines, model matrix, and execution constraints are defined in [GEMINI.md](./GEMINI.md).
+Global rules, the model policy and execution constraints are in [GEMINI.md](./GEMINI.md). Rules scoped to a file type or topic are in [rules/](./rules/).

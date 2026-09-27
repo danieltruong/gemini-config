@@ -25,13 +25,18 @@ Antigravity reads global rules from `~/.gemini/GEMINI.md` and global customizati
 | Repo path | Installed to | Purpose |
 |---|---|---|
 | `GEMINI.md` | `~/.gemini/GEMINI.md` | Global rules |
+| `rules/` | `~/.gemini/config/rules/` | Rules for one file type or topic, plus machine facts in `rules/local.md` |
 | `agents/` | `~/.gemini/config/agents/` | Subagents, see the roster below |
 | `hooks.json`, `hooks/` | `~/.gemini/config/` | Lifecycle hooks |
-| `skills/` | `~/.gemini/config/skills/` | Skills |
-| `scripts/` | `~/.gemini/config/scripts/` | Linter, compressor, pre-push check, log audit |
+| `skills/` | `~/.gemini/config/skills/` | Skills; `commit-msg` writes commit messages the commit gate accepts |
+| `scripts/` | `~/.gemini/config/scripts/` | Docs linter, docs compressor, pre-push check, hook log audit, and `agy-audit.py` for the transcript and quality audit |
 | `mcp_config.json` | `~/.gemini/config/mcp_config.json` | MCP servers |
 
-agy 1.1.27 does not dispatch `PostToolUse` hooks. `PreToolUse`, `PreInvocation` and `Stop` all run, so the docs lint runs inside `stop-gate` at Stop.
+`rules/local.md` holds this machine's paths. Git ignores it. Copy it from `rules/local.example.md`; ONBOARD.md has the steps.
+
+agy 1.1.27 does not dispatch `PostToolUse` hooks. `PreToolUse`, `PreInvocation` and `Stop` all run, so the docs lint runs inside `stop-gate` at Stop. The docs lint also checks the frontmatter of every `rules/*.md` and the token budget of the always-on rules.
+
+The `reinforce` hook runs at `PreInvocation`. On the first turn and every tenth it repeats three working rules: reply tersely, ship the shortest working diff, add no filler. On every turn it records the baseline `stop-gate` compares against, and once per conversation it repeats any note about work an earlier run left unchecked.
 
 Machine-local MCP servers go in `~/.gemini/config/mcp_config.local.json`. The installer merges it over the repo file. It is not tracked.
 
@@ -39,22 +44,26 @@ Machine-local MCP servers go in `~/.gemini/config/mcp_config.local.json`. The in
 
 ## Subagents
 
-The main agent explores, plans, and delegates. Each subagent starts with a clean context and one job, so nobody inherits another agent's assumptions. None of them can spawn a subagent of its own.
+The main agent does the judgement work itself. It hands work to a subagent only for parts that can run in parallel without each other, for a check that has to be independent, or when the work would not fit in its own context. Each subagent starts with a clean context and one job, so nobody inherits another agent's assumptions. None of them can spawn a subagent of its own.
 
-| Agent | Model | Writes files | Returns |
-|---|---|---|---|
-| `coder` | inherit | yes, only the owned files in its brief | files changed, check results, what was left out |
-| `tester` | inherit | tests only | test files changed, verifier tail, gaps left |
-| `linter` | flash | yes, lint and format fixes only | pass or fail, files touched |
-| `debugger` | pro | no | cause with a file and line, evidence, blast radius, fix direction |
-| `reviewer` | pro | no | one line per finding, ordered by severity |
-| `security-reviewer` | pro | no | one line per finding, ordered by severity |
-| `visual-qa` | inherit | no | table of page, bullet, pass or fail, defect |
-| `researcher` | flash | no | answer first, then one source URL per claim |
+Every agent file sets `model: inherit`, so each one runs on the session model, Gemini 3.8 Flash (High). Artificial Analysis scores 3.8 Flash above 3.1 Pro (41 vs 30 on its index) and well ahead on agentic benchmarks. The thinking level behind the `flash` and `pro` tiers is not documented, and inherit is the only way to be sure a subagent runs at High.
 
-Send a failure to `debugger` before `coder` whenever the cause is unknown; guessing in an agent that can write files is how a symptom gets patched. Send the diff to `security-reviewer` as well as `reviewer` when it touches auth, input parsing, or anything reachable from the internet.
+| Agent | Writes files | Returns |
+|---|---|---|
+| `investigator` | no | table of file and line for each answer |
+| `builder` | yes, 1 or 2 files | a short receipt of the edit, or a refusal when the job needs more files |
+| `coder` | yes, only the owned files in its brief | files changed, check results, what was left out |
+| `tester` | tests only | test files changed, verifier tail, gaps left |
+| `linter` | yes, lint and format fixes only | pass or fail, files touched |
+| `debugger` | no | cause with a file and line, evidence, blast radius, fix direction |
+| `reviewer` | no | one line per finding, ordered by severity |
+| `security-reviewer` | no | one line per finding, ordered by severity |
+| `visual-qa` | no | table of page, bullet, pass or fail, defect |
+| `researcher` | no | answer first, then one source URL per claim |
 
-A brief has to name the owned files, the forbidden files, the check to run, and the return format. `reviewer` gets the diff and nothing else, since sharing the plan that produced the code makes it agree with the code.
+Diagnose an unknown cause before any fix. The main agent does it itself, or sends it to `debugger` when the evidence would flood its context or needs an independent look; guessing in an agent that can write files is how a symptom gets patched. Send the diff to `security-reviewer` as well as `reviewer` when it touches auth, input parsing, or anything reachable from the internet.
+
+A brief has to name the goal, the owned files, the forbidden files, what sibling agents own, the check to run, and the return format. `reviewer` gets the diff and nothing else, since sharing the plan that produced the code makes it agree with the code.
 
 All of them are `mainAgent: false`, so `agy --agent <name>` and the `/agents` picker do not see them. Those only list agents that can run a session on their own; `agy --agent tester` answers `Agent "tester" not found, falling back to default` in `cli.log` and then silently uses the default agent. To check the roster really loaded, ask for it:
 
@@ -65,10 +74,12 @@ MSYS_NO_PATHCONV=1 agy -p "List the names of every subagent you can invoke. Name
 ## Unattended run
 
 ```bash
-cd "F:/Factory/renpy/Birth Battle"
-agy -p "<task>" --add-dir "F:/Factory/renpy/Birth Battle" --mode accept-edits \
+cd "<project>"
+agy -p "<task>" --add-dir "<project>" --mode accept-edits \
     --output-format json --print-timeout 45m
 ```
+
+`<project>` is the project folder. This machine's Ren'Py SDK path, which holds its projects, is in `rules/local.md`.
 
 `~/scripts/agy-task.sh` wraps that line. It also sets `MSYS_NO_PATHCONV=1`, which Git Bash needs or it rewrites a leading `/` argument into a Windows path.
 
@@ -143,7 +154,9 @@ Known gap until the write gate lands: nothing stops an agent from editing `.agen
 
 ## Discipline
 
-The rules in `GEMINI.md` that a hook cannot check are grouped in four sections. Clean: every touch deletes the dead code, stale comment and temp file it leaves behind, and fixes any doc sentence the change made false, in the same commit. No shortcuts: fix the root cause, never suppress a lint or type error, never mock around a real bug, never widen a timeout or a permission to make a check pass. Reuse: look in `~/scripts`, `<workspace>/.agents/scripts` and `~/.gemini/config/scripts` before writing a script, promote the second copy of a throwaway into a real tool, extract the second copy of any logic. Improve config: when a run trips over a missing rule, a missing permission or a repeated manual step, the fix goes into this repo and ships as its own `chore(config):` commit.
+The rules in `GEMINI.md` that a hook cannot check are grouped in four sections. Constraints: never suppress a lint or type error, never mock around a real bug, never widen a timeout or a permission to make a check pass. Clean: every touch deletes the dead code, stale comment and temp file it leaves behind, and fixes any doc sentence the change made false, in the same commit. Tools: look in `~/scripts`, `<workspace>/.agents/scripts` and `~/.gemini/config/scripts` before writing a script, and promote the second copy of a throwaway into a real tool. Improve config: when a run trips over a missing rule, a missing permission or a repeated manual step, the fix goes into this repo and ships as its own `chore(config):` commit.
+
+The build ladder, the comment rule and the rule to extract the second copy of any logic are in `rules/yagni.md` and `rules/code.md`.
 
 ## Tool gates
 
@@ -159,13 +172,24 @@ Every gate is a `PreToolUse` hook that answers `allow` or `deny` with a reason t
 
 The linter rule is the point of `write-gate`: loosening the config is the cheapest way to make a check pass, so the config is off limits and the code is not.
 
+## Compress instruction docs
+
+```bash
+python scripts/compress-docs.py GEMINI.md skills/commit-msg/SKILL.md
+```
+
+Rewrites each file in place in plain, short English, then checks that every code block, URL, heading and path survived. A file that fails the check twice is put back. Originals are kept in a dated folder the script prints. It uses the Gemini API when `GEMINI_API_KEY` is set and `google-genai` is installed, otherwise one headless `agy` turn. `--help` names the default models and how to change them. The engine is vendored under `scripts/compress/`; see its `NOTICE`.
+
 ## Weekly audit
 
 ```bash
 bash scripts/agy-audit.sh --days 7
+python scripts/agy-audit.py --days 7
 ```
 
-One page from the logs: stop gate decisions by kind, which verifiers failed, workspaces the gate never ran a verifier in, denied tool calls, and the ten most repeated `cli.log` warnings. It reports and exits 0. Its top line is the input to the `## Improve config` step in `GEMINI.md`.
+`agy-audit.sh` prints one page from the logs: stop gate decisions by kind, which verifiers failed, workspaces the gate never ran a verifier in, denied tool calls, and the ten most repeated `cli.log` warnings. It reports and exits 0. Its top line is the input to the `## Improve config` step in `GEMINI.md`.
+
+`agy-audit.py` reads the transcripts. It ends with a quality trend over the last 4 full weeks. When a metric got worse in both of the last 2 weeks, it flags it and lists the config commits made in those weeks.
 
 ## Decisions
 

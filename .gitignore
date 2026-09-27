@@ -11,3 +11,4 @@ tmp/
 backups/
 mcp_config.local.json
 .claude/
+rules/local.md

@@ -1,17 +1,19 @@
 # PowerShell installer for gemini-config on Windows.
 # Links this repo into ~/.gemini (global rules) and ~/.gemini/config (global customizations).
 param(
-    [string]$GeminiDir = "$HOME\.gemini"
+    [string]$GeminiDir = "$HOME\.gemini",
+    [string]$AgentsSkillsDir = "$HOME\.agents\skills"
 )
 
 $ErrorActionPreference = "Stop"
 $Repo = $PSScriptRoot
 $Config = "$GeminiDir\config"
 
+# A real directory at a link path holds files made in the app: never replace it.
 function Link-Dir($src, $dst) {
     if (Test-Path $dst) {
-        $item = Get-Item $dst -Force
-        if ($item.Attributes -match "ReparsePoint") { $item.Delete() } else { Remove-Item -Recurse -Force $dst }
+        if (-not ((Get-Item $dst -Force).Attributes -match "ReparsePoint")) { throw "$dst is a real directory; move its files into $src, delete it, rerun" }
+        (Get-Item $dst -Force).Delete()
     }
     New-Item -ItemType Junction -Path $dst -Target $src | Out-Null
 }
@@ -23,20 +25,23 @@ function Link-File($src, $dst) {
 
 New-Item -ItemType Directory -Force -Path $Config | Out-Null
 
-# 1. Global rules
+# 1. Global rules. agy loads ~/.gemini/config/rules; ~/.gemini/antigravity-cli/rules is not read.
 Link-File "$Repo\GEMINI.md" "$GeminiDir\GEMINI.md"
+Link-Dir "$Repo\rules" "$Config\rules"
+if (-not (Test-Path "$Repo\rules\local.md")) {
+    Write-Warning "no rules\local.md; copy rules\local.example.md, set trigger: always_on, fill in paths"
+}
 
 # 2. Global customizations
-foreach ($d in @("agents", "hooks", "scripts")) { Link-Dir "$Repo\$d" "$Config\$d" }
+foreach ($d in @("agents", "hooks", "scripts", "skills")) { Link-Dir "$Repo\$d" "$Config\$d" }
 Link-File "$Repo\hooks.json" "$Config\hooks.json"
 
-# 3. Skills. agy scans the global config dir only; ~/.agents/skills is workspace-scoped.
-Link-Dir "$Repo\skills" "$Config\skills"
-
-# Older installs junctioned every skill into ~/.agents/skills. Drop the links, never the targets.
-$stale = "$HOME\.agents\skills"
-if (Test-Path $stale) {
-    Get-ChildItem $stale -Force | Where-Object { $_.Attributes -match "ReparsePoint" } | ForEach-Object {
+# 3. agy scans skills in the global config dir only; ~/.agents/skills is workspace-scoped.
+# Older installs junctioned every skill there. Drop those links, never another tool's or a target.
+if (Test-Path $AgentsSkillsDir) {
+    Get-ChildItem $AgentsSkillsDir -Force | Where-Object {
+        ($_.Attributes -match "ReparsePoint") -and "$(@($_.Target)[0])".StartsWith("$Repo\skills\", "OrdinalIgnoreCase")
+    } | ForEach-Object {
         Write-Host "removing stale skill junction $($_.Name)"
         $_.Delete()
     }

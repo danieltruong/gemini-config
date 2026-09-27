@@ -8,21 +8,45 @@ GEMINI_DIR="${GEMINI_CONFIG_DIR:-$HOME/.gemini}"
 CONFIG="$GEMINI_DIR/config"
 AGENTS_SKILLS="${AGENTS_SKILLS_DIR:-$HOME/.agents/skills}"
 
-mkdir -p "$CONFIG" "$AGENTS_SKILLS"
+# Git Bash without native symlinks makes ln -s copy instead: stop before anything is replaced.
+probe="$(mktemp -d)"
+ln -s "$REPO/install.sh" "$probe/link" 2>/dev/null || true
+if [ ! -L "$probe/link" ]; then
+  rm -rf "$probe"
+  echo "ln -s made a copy, not a link (Git Bash without symlink support); run install.ps1 instead" >&2
+  exit 1
+fi
+rm -rf "$probe"
 
-# 1. Global rules
+mkdir -p "$CONFIG"
+
+# A real directory at a link path holds files made in the app: never replace it.
+link_dir() {
+  if [ -d "$2" ] && [ ! -L "$2" ]; then
+    echo "$2 is a real directory; move its files into $1, delete it, rerun" >&2
+    exit 1
+  fi
+  ln -sfn "$1" "$2"
+}
+
+# 1. Global rules. agy loads ~/.gemini/config/rules; ~/.gemini/antigravity-cli/rules is not read.
 ln -sfn "$REPO/GEMINI.md" "$GEMINI_DIR/GEMINI.md"
+link_dir "$REPO/rules" "$CONFIG/rules"
+[ -f "$REPO/rules/local.md" ] || echo "no rules/local.md; copy rules/local.example.md, set trigger: always_on, fill in paths" >&2
 
 # 2. Global customizations
-for d in agents hooks scripts; do ln -sfn "$REPO/$d" "$CONFIG/$d"; done
+for d in agents hooks scripts skills; do link_dir "$REPO/$d" "$CONFIG/$d"; done
 ln -sfn "$REPO/hooks.json" "$CONFIG/hooks.json"
 
-# 3. Skills into the global root and the cross-agent ~/.agents/skills dir
-ln -sfn "$REPO/skills" "$CONFIG/skills"
-for s in "$REPO"/skills/*/; do
-  name="$(basename "$s")"
-  ln -sfn "${s%/}" "$AGENTS_SKILLS/$name"
-done
+# 3. agy scans skills in the global config dir only; ~/.agents/skills is workspace-scoped.
+# Older installs linked every skill there. Drop those links, never another tool's.
+if [ -d "$AGENTS_SKILLS" ]; then
+  for l in "$AGENTS_SKILLS"/*; do
+    if [ -L "$l" ]; then
+      case "$(readlink "$l")" in "$REPO/skills/"*) rm "$l" ;; esac
+    fi
+  done
+fi
 
 # 4. MCP config: repo servers merged with machine-local mcp_config.local.json
 LOCAL="$CONFIG/mcp_config.local.json"
