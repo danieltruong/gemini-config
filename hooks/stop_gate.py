@@ -616,6 +616,10 @@ def answer(gap, culprit, cid, fp, spaces, deadline, detail, tag=""):
 
 def decide(ev, deadline):
     """(result, log kind, log detail, workspaces)."""
+    if os.environ.get("AGY_HARNESS_JOB"):
+        # a job started by the agy-harness MCP server: the caller reviews the result, so
+        # the verifier and review gate here would only spend tokens twice
+        return {"decision": "stop"}, "harness", "harness job, gate skipped", []
     tpath = hookpaths.real_path(ev.get("transcriptPath") or "")
     artifact = hookpaths.real_path(ev.get("artifactDirectoryPath") or "")
     brain = transcript.brain_root(tpath)
