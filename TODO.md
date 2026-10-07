@@ -4,6 +4,8 @@
 - 2026-10-12: Recheck move to `inherit` (reviewer, debugger, security-reviewer off `pro`; researcher, linter off `flash`): `python scripts/agy-audit.py --days 7`, compare `ci_first_try` and `rework` 2 weeks after merge vs before; not `pass_share` or `bm_per_report` (weaker reviewer inflates them).
 - 2026-10-12: A/B the reviewer on Gemini 3.1 Pro (High) vs Gemini 3.8 Flash (High) over 3 to 5 saved diffs with a separate blind judge; report to Daniel before changing a model again.
 - 2026-10-14: agy's call_mcp_tool passed Arguments as a JSON string to deepseek_subtask 3 times ("Invalid request parameters", GLM run 2026-10-07, transcript 2709cb2b); check whether deepseek_mcp.py should accept a string payload or the harness-worker prompt should say to pass an object.
+- 2026-10-14: glm-5.3-flash returned reasoning only with no text on 4 of 5 long review runs in the 2026-10-07 A/B; before trusting it for long outputs, test provider.order or allow_fallbacks false in openrouter_bridge.py provider_routing.
+- 2026-10-21: recheck the 2026-10-07 OpenRouter role change (critique to V4.1 Flash high, security to glm-5.3 max, creative to glm-5.3-flash): python scripts/agy-audit.py --days 14, judge by rework and ci_first_try, not pass_share.
 - 2026-11-04: Recheck `xiaomi/mimo-v2.6-pro` for coder A/B: loop issues on the flash sibling (XiaomiMiMo/MiMo-Code#2497, #2498) closed, and Vals TB4.0 still ranks it first under $0.50/test.
 - 2026-09-26: GEMINI.md:53 asks for one check per change, but GEMINI.md:74 says the writer never writes tests. Make the two agree.
 - 2026-09-26: GEMINI.md:71 says to run the debugger "Always before a fix". Reword so it applies only when the cause is unknown.

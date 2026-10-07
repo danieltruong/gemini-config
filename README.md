@@ -41,7 +41,7 @@ The `reinforce` hook runs at `PreInvocation`. On the first turn and every tenth 
 
 Machine-local MCP servers go in `~/.gemini/config/mcp_config.local.json`. The installer merges it over the repo file. It is not tracked. The installer also turns a leading `~/` (or `~\` on Windows) in any server's `args` into the real home path.
 
-The `deepseek` MCP server runs on whichever `python` is first on PATH. Run `pip install mcp` with that same Python. The server reads `OPENROUTER_API_KEY` from the environment. To use another Python, override the `deepseek` entry's `command` in `mcp_config.local.json`.
+The `deepseek` MCP server runs on whichever `python` is first on PATH. Run `pip install mcp` with that same Python. The server reads `OPENROUTER_API_KEY` from the environment. To use another Python, override the `deepseek` entry's `command` in `mcp_config.local.json`. The same server holds the GLM tools. DeepSeek V4.1 Flash writes code and does review, planning and root-cause work. GLM 5.3 Flash writes creative text and scripts and handles images. GLM 5.3 checks security, plan verification and high-risk diffs. `rules/openrouter.md` has the full split.
 
 `AGENTS.md` in the repo root is a pointer for other tools that read that file. It is not installed.
 

@@ -128,7 +128,9 @@ def _subtask_execution(prompt: str, cwd: str, model: str, timeout_seconds: int, 
 
 @mcp.tool()
 def deepseek_chat(prompt: str, system_prompt: str = "", model: str = DEFAULT_MODEL, effort: str = "") -> str:
-    """Direct query to DeepSeek Flash via OpenRouter for code generation, analysis, or creative writing.
+    """Direct query to DeepSeek Flash via OpenRouter.
+
+    Use for code, tests, routine review, audit, planning and root cause.
 
     Args:
         prompt: The prompt or instructions for the model.
@@ -141,7 +143,10 @@ def deepseek_chat(prompt: str, system_prompt: str = "", model: str = DEFAULT_MOD
 
 @mcp.tool()
 def glm_chat(prompt: str, system_prompt: str = "", model: str = GLM_MODEL, effort: str = "") -> str:
-    """Direct query to GLM 5.3 Flash via OpenRouter for adversarial review, critique, or planning.
+    """Direct query to GLM 5.3 Flash via OpenRouter.
+
+    Use for creative writing and scripts (text only; vision goes through glm_subtask);
+    pass model="z-ai/glm-5.3" for security and plan verification.
 
     Args:
         prompt: The prompt or instructions for the model.
@@ -163,6 +168,8 @@ def deepseek_subtask(
 ) -> str:
     """Run an autonomous subtask using DeepSeek Flash via OpenRouter with file and shell access.
 
+    Use for code, tests, routine review, audit, planning and root cause.
+
     Args:
         prompt: Task instructions for the agent to execute.
         cwd: Working directory for the subtask (defaults to current directory).
@@ -183,7 +190,10 @@ def glm_subtask(
     effort: str = "",
     allow_all_tools: bool = False
 ) -> str:
-    """Run an autonomous subtask using GLM 5.3 Flash via OpenRouter for critique, audit, or planning.
+    """Run an autonomous subtask using GLM 5.3 Flash via OpenRouter with file and shell access.
+
+    Use for creative writing, scripts and vision; pass model="z-ai/glm-5.3"
+    for security and plan verification.
 
     Args:
         prompt: Task instructions for the agent to execute.
