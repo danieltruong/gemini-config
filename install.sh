@@ -37,6 +37,11 @@ link_dir "$REPO/rules" "$CONFIG/rules"
 # 2. Global customizations
 for d in agents hooks scripts skills; do link_dir "$REPO/$d" "$CONFIG/$d"; done
 ln -sfn "$REPO/hooks.json" "$CONFIG/hooks.json"
+# OpenRouter launchers and MCP server go to ~/scripts, where rules/openrouter.md calls them.
+mkdir -p "$HOME/scripts"
+for f in "$REPO"/scripts/openrouter/*; do
+  if [ -f "$f" ]; then ln -sfn "$f" "$HOME/scripts/$(basename "$f")"; fi
+done
 
 # 3. agy scans skills in the global config dir only; ~/.agents/skills is workspace-scoped.
 # Older installs linked every skill there. Drop those links, never another tool's.
@@ -50,11 +55,13 @@ fi
 
 # 4. MCP config: repo servers merged with machine-local mcp_config.local.json
 LOCAL="$CONFIG/mcp_config.local.json"
+# The agy MCP docs list no ~ expansion in args: repo entries say ~/ and get the real home here.
+HOME_ARGS='.mcpServers |= map_values(if .args then .args |= map(if startswith("~/") then $home + .[1:] else . end) else . end)'
 if [ -f "$LOCAL" ]; then
-  jq -s '.[0] * .[1]' "$REPO/mcp_config.json" "$LOCAL" > "$CONFIG/mcp_config.json"
+  jq -s --arg home "$HOME" ".[0] * .[1] | $HOME_ARGS" "$REPO/mcp_config.json" "$LOCAL" > "$CONFIG/mcp_config.json"
 else
   echo "no $LOCAL; only repo MCP servers installed" >&2
-  cp "$REPO/mcp_config.json" "$CONFIG/mcp_config.json"
+  jq --arg home "$HOME" "$HOME_ARGS" "$REPO/mcp_config.json" > "$CONFIG/mcp_config.json"
 fi
 
 echo "installed into $GEMINI_DIR and $CONFIG"

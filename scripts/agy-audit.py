@@ -122,6 +122,8 @@ MODEL_STRING = ".1.19"
 KV_KEY, KV_VALUE = ".1.20.1", ".1.20.2"
 
 INHERIT_MODELS = {"", "?", "inherit"}
+# rules/openrouter.md pins these on purpose, so they are not drift
+OPENROUTER_PREFIXES = ("deepseek/", "z-ai/")
 
 # Files that decide whether work passed. Editing one while the verifier is red moves
 # the goalposts, so every such edit is listed by conversation and step.
@@ -348,9 +350,11 @@ def checkout_key(path):
 
 def off_session_model(requested, session_model):
     """Did a subagent spawn pin a model other than the exact one its parent ran on?
-    Every agent inherits, so a tier alias ("flash", "pro") counts as drift too."""
+    Every agent inherits, so a tier alias ("flash", "pro") counts as drift too.
+    OpenRouter pins do not."""
     requested = requested.strip().lower()
-    return requested not in INHERIT_MODELS and requested != session_model.strip().lower()
+    return (requested not in INHERIT_MODELS and requested != session_model.strip().lower()
+            and not requested.startswith(OPENROUTER_PREFIXES))
 
 
 def peak_overlap(spans):
@@ -1379,7 +1383,8 @@ def self_check():
         "F:/Factory/renpy/Birth Battle"
     for requested in ("gemini-3.1-pro", "flash", "pro", "gemini-3.8-flash"):
         assert off_session_model(requested, "gemini-3.8-flash-high"), requested
-    for requested in ("", "inherit", "Inherit", "gemini-3.8-flash-high", "Gemini-3.8-Flash-High"):
+    for requested in ("", "inherit", "Inherit", "gemini-3.8-flash-high", "Gemini-3.8-Flash-High",
+                      "deepseek/deepseek-v4.1-flash", "z-ai/glm-5.3"):
         assert not off_session_model(requested, "gemini-3.8-flash-high"), requested
 
     assert result_failed('{"success":true,"exit_code":0}') == ""

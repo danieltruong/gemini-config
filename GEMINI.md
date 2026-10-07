@@ -32,7 +32,7 @@ Before each tool call or reply, check these points. A read or search needs only 
 ## Models
 
 - Main session and every subagent: `Gemini 3.8 Flash (High)` (`gemini-3.8-flash-high`).
-- Every subagent file sets `model: inherit`, so it runs on the session model at High. The thinking level behind the `flash` and `pro` tiers is undocumented; never set them.
+- Every subagent file sets `model: inherit`, so it runs on the session model at High. The thinking level behind the `flash` and `pro` tiers is undocumented; never set a Gemini tier on a subagent. OpenRouter model pins from `rules/openrouter.md` are the one exception.
 - High thinking only. Never pick Low, Medium or Fast on any model.
 - Never set temperature on a Gemini 3 model, in settings or in code that calls the API. Keep the 1.0 default: Google says lower values cause looping and worse reasoning.
 - Forum reports say 3.8 Flash in Antigravity can loop on shell commands and ignore negative constraints, so the stop gate and the deny circuit breaker stay on.

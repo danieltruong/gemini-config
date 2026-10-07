@@ -6,6 +6,10 @@
     "playwright": {
       "command": "npx",
       "args": ["-y", "@playwright/mcp@latest"]
+    },
+    "deepseek": {
+      "command": "python",
+      "args": ["~/scripts/deepseek_mcp.py"]
     }
   }
 }

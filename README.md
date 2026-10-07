@@ -30,6 +30,7 @@ Antigravity reads global rules from `~/.gemini/GEMINI.md` and global customizati
 | `hooks.json`, `hooks/` | `~/.gemini/config/` | Lifecycle hooks |
 | `skills/` | `~/.gemini/config/skills/` | Skills; `commit-msg` writes commit messages the commit gate accepts |
 | `scripts/` | `~/.gemini/config/scripts/` | Docs linter, docs compressor, pre-push check, hook log audit, and `agy-audit.py` for the transcript and quality audit |
+| `scripts/openrouter/` | `~/scripts/` | OpenRouter launchers (`agy-deepseek`, `agy-glm`), their protocol bridge and the `deepseek` MCP server, see `rules/openrouter.md` |
 | `mcp_config.json` | `~/.gemini/config/mcp_config.json` | MCP servers |
 
 `rules/local.md` holds this machine's paths. Git ignores it. Copy it from `rules/local.example.md`; ONBOARD.md has the steps.
@@ -38,7 +39,9 @@ agy 1.1.27 does not dispatch `PostToolUse` hooks. `PreToolUse`, `PreInvocation` 
 
 The `reinforce` hook runs at `PreInvocation`. On the first turn and every tenth it repeats three working rules: reply tersely, ship the shortest working diff, add no filler. On every turn it records the baseline `stop-gate` compares against, and once per conversation it repeats any note about work an earlier run left unchecked.
 
-Machine-local MCP servers go in `~/.gemini/config/mcp_config.local.json`. The installer merges it over the repo file. It is not tracked.
+Machine-local MCP servers go in `~/.gemini/config/mcp_config.local.json`. The installer merges it over the repo file. It is not tracked. The installer also turns a leading `~/` in any server's `args` into the real home path.
+
+The `deepseek` MCP server runs on `python` from PATH, which needs the `mcp` package, and reads `OPENROUTER_API_KEY` from the environment. To use another Python, override the `deepseek` entry in `mcp_config.local.json`.
 
 `AGENTS.md` in the repo root is a pointer for other tools that read that file. It is not installed.
 
@@ -46,7 +49,7 @@ Machine-local MCP servers go in `~/.gemini/config/mcp_config.local.json`. The in
 
 The main agent does the judgement work itself. It hands work to a subagent only for parts that can run in parallel without each other, for a check that has to be independent, or when the work would not fit in its own context. Each subagent starts with a clean context and one job, so nobody inherits another agent's assumptions. None of them can spawn a subagent of its own.
 
-Every agent file sets `model: inherit`, so each one runs on the session model, Gemini 3.8 Flash (High). Artificial Analysis scores 3.8 Flash above 3.1 Pro (41 vs 30 on its index) and well ahead on agentic benchmarks. The thinking level behind the `flash` and `pro` tiers is not documented, and inherit is the only way to be sure a subagent runs at High.
+Every agent file sets `model: inherit`, so each one runs on the session model, Gemini 3.8 Flash (High). Artificial Analysis scores 3.8 Flash above 3.1 Pro (41 vs 30 on its index) and well ahead on agentic benchmarks. The thinking level behind the `flash` and `pro` tiers is not documented, and inherit is the only way to be sure a subagent runs at High. So no subagent sets a Gemini tier. The exception is an OpenRouter model pinned by `rules/openrouter.md`; `agy-audit.py` does not count those as drift.
 
 | Agent | Writes files | Returns |
 |---|---|---|
