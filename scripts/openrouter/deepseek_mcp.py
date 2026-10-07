@@ -7,7 +7,7 @@ import urllib.request
 import urllib.error
 from mcp.server.fastmcp import FastMCP
 
-from openrouter_bridge import DEFAULT_EFFORT, DEFAULT_MODEL, OPENROUTER_URL, PROVIDER_ROUTING
+from openrouter_bridge import DEFAULT_MODEL, OPENROUTER_URL, default_effort, provider_routing
 
 mcp = FastMCP("deepseek")
 
@@ -27,8 +27,8 @@ def _chat_completion(prompt: str, system_prompt: str, model: str, title: str, ef
     payload = {
         "model": model,
         "messages": messages,
-        "reasoning": {"effort": effort or DEFAULT_EFFORT},
-        "provider": PROVIDER_ROUTING
+        "reasoning": {"effort": effort or default_effort(model)},
+        "provider": provider_routing(model)
     }
 
     req = urllib.request.Request(
@@ -63,7 +63,7 @@ def _subtask_execution(prompt: str, cwd: str, model: str, timeout_seconds: int, 
     if not os.path.isfile(launcher):
         return f"Error: launcher script not found at {launcher}"
 
-    target_effort = effort or DEFAULT_EFFORT
+    target_effort = effort or default_effort(model)
 
     cmd = [
         "pwsh",
@@ -111,7 +111,7 @@ def _subtask_execution(prompt: str, cwd: str, model: str, timeout_seconds: int, 
 
 
 @mcp.tool()
-def deepseek_chat(prompt: str, system_prompt: str = "", model: str = DEFAULT_MODEL, effort: str = DEFAULT_EFFORT) -> str:
+def deepseek_chat(prompt: str, system_prompt: str = "", model: str = DEFAULT_MODEL, effort: str = default_effort(DEFAULT_MODEL)) -> str:
     """Direct query to DeepSeek Flash via OpenRouter for code generation, analysis, or creative writing.
 
     Args:
@@ -124,14 +124,14 @@ def deepseek_chat(prompt: str, system_prompt: str = "", model: str = DEFAULT_MOD
 
 
 @mcp.tool()
-def glm_chat(prompt: str, system_prompt: str = "", model: str = GLM_MODEL, effort: str = DEFAULT_EFFORT) -> str:
+def glm_chat(prompt: str, system_prompt: str = "", model: str = GLM_MODEL, effort: str = default_effort(GLM_MODEL)) -> str:
     """Direct query to GLM 5.3 Flash via OpenRouter for adversarial review, critique, or planning.
 
     Args:
         prompt: The prompt or instructions for the model.
         system_prompt: Optional system instructions.
         model: OpenRouter model slug (defaults to z-ai/glm-5.3-flash).
-        effort: Reasoning effort: low, high or max (defaults to high; max only to escalate).
+        effort: Reasoning effort: low, high or max (defaults to max; high is the cheaper fallback under test).
     """
     return _chat_completion(prompt, system_prompt, model, "Local GLM MCP", effort)
 
@@ -142,7 +142,7 @@ def deepseek_subtask(
     cwd: str = "",
     model: str = DEFAULT_MODEL,
     timeout_seconds: int = 180,
-    effort: str = DEFAULT_EFFORT
+    effort: str = default_effort(DEFAULT_MODEL)
 ) -> str:
     """Run an autonomous subtask using DeepSeek Flash via OpenRouter with file and shell access.
 
@@ -162,7 +162,7 @@ def glm_subtask(
     cwd: str = "",
     model: str = GLM_MODEL,
     timeout_seconds: int = 180,
-    effort: str = DEFAULT_EFFORT
+    effort: str = default_effort(GLM_MODEL)
 ) -> str:
     """Run an autonomous subtask using GLM 5.3 Flash via OpenRouter for critique, audit, or planning.
 
@@ -171,7 +171,7 @@ def glm_subtask(
         cwd: Working directory for the subtask (defaults to current directory).
         model: OpenRouter model slug (defaults to z-ai/glm-5.3-flash).
         timeout_seconds: Max seconds to wait for task completion.
-        effort: Reasoning effort: low, high or max (defaults to high; max only to escalate).
+        effort: Reasoning effort: low, high or max (defaults to max; high is the cheaper fallback under test).
     """
     return _subtask_execution(prompt, cwd, model, timeout_seconds, effort)
 

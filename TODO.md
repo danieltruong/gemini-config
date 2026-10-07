@@ -2,7 +2,6 @@
 
 - 2026-10-12: Recheck move to `inherit` (reviewer, debugger, security-reviewer off `pro`; researcher, linter off `flash`): `python scripts/agy-audit.py --days 7`, compare `ci_first_try` and `rework` 2 weeks after merge vs before; not `pass_share` or `bm_per_report` (weaker reviewer inflates them).
 - 2026-10-12: A/B the reviewer on Gemini 3.1 Pro (High) vs Gemini 3.8 Flash (High) over 3 to 5 saved diffs with a separate blind judge; report to Daniel before changing a model again.
-- 2026-10-21: Recheck effort change xhigh->high: run `python scripts/agy-audit.py --days 14`, compare `ci_first_try` and `rework` before and after 2026-10-07; not `pass_share`.
 - 2026-11-04: Recheck `xiaomi/mimo-v2.6-pro` for coder A/B: loop issues on the flash sibling (XiaomiMiMo/MiMo-Code#2497, #2498) closed, and Vals TB4.0 still ranks it first under $0.50/test.
 - 2026-09-26: GEMINI.md:53 asks for one check per change, but GEMINI.md:74 says the writer never writes tests. Make the two agree.
 - 2026-09-26: GEMINI.md:71 says to run the debugger "Always before a fix". Reword so it applies only when the cause is unknown.

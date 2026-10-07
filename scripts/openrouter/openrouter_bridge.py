@@ -13,10 +13,22 @@ import urllib.error
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 DEFAULT_MODEL = "deepseek/deepseek-v4.1-flash"
-DEFAULT_EFFORT = "high"
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
-# List prices hide cheap low-bit endpoints; skip any provider that would drop reasoning or tools.
-PROVIDER_ROUTING = {"quantizations": ["fp8", "bf16", "fp16", "unknown"], "require_parameters": True}
+
+
+def default_effort(model):
+    """GLM's own default is max (high is the cheaper fallback under A/B); DeepSeek gains little from max."""
+    return "max" if "glm" in model.lower() else "high"
+
+
+def provider_routing(model):
+    """fp8 or better, and skip any provider that would drop reasoning or tools."""
+    quantizations = ["fp8", "bf16", "fp16"]
+    # Unlabelled endpoints are the cheapest and win load balancing, which defeats the pin.
+    # Every Anthropic endpoint is first-party and labelled unknown, so allow it there only.
+    if model.lower().startswith("anthropic/"):
+        quantizations.append("unknown")
+    return {"quantizations": quantizations, "require_parameters": True}
 
 
 def merge_reasoning_details(acc, pieces):
@@ -159,7 +171,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
             "model": self.target_model,
             "messages": messages,
             "stream": is_streaming,
-            "provider": PROVIDER_ROUTING
+            "provider": provider_routing(self.target_model)
         }
         if tools:
             payload["tools"] = tools
@@ -169,7 +181,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
             or self.headers.get("x-reasoning-effort")
             or self.target_effort
             or os.environ.get("OPENROUTER_EFFORT")
-            or DEFAULT_EFFORT
+            or default_effort(self.target_model)
         )
         payload["reasoning"] = {"effort": effort}
 

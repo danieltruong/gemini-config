@@ -13,6 +13,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts" / "openro
 import openrouter_bridge as bridge  # noqa: E402
 
 GEMINI_PATH = "/v1beta/models/m:streamGenerateContent?alt=sse"
+PINNED = ["fp8", "bf16", "fp16"]
 
 
 def sse(*chunks):
@@ -35,6 +36,7 @@ FINAL_TURN = sse({"choices": [{"delta": {"content": "done"}, "finish_reason": "s
 class BridgeTest(unittest.TestCase):
     def setUp(self):
         bridge.ProxyHandler.api_key = "test"
+        bridge.ProxyHandler.target_model = bridge.DEFAULT_MODEL
         bridge.ProxyHandler.target_effort = ""
         bridge.ProxyHandler.reasoning_by_call = {}
         quiet = mock.patch.object(bridge.ProxyHandler, "log_message", lambda *a: None)
@@ -64,7 +66,7 @@ class BridgeTest(unittest.TestCase):
         user = {"role": "user", "parts": [{"text": "read a"}]}
         first, body = self.post([user], TOOL_TURN)
         self.assertIn('"functionCall"', body)
-        self.assertEqual(first["provider"], bridge.PROVIDER_ROUTING)
+        self.assertEqual(first["provider"], {"quantizations": PINNED, "require_parameters": True})
         self.assertEqual(first["reasoning"], {"effort": "high"})
 
         history = [
@@ -88,6 +90,17 @@ class BridgeTest(unittest.TestCase):
             {"functionCall": {"id": "call_other", "name": "read", "args": {}}}]}]
         sent, _ = self.post(history, FINAL_TURN)
         self.assertNotIn("reasoning_details", sent["messages"][0])
+
+    def test_glm_defaults_to_max_and_skips_unlabelled_endpoints(self):
+        bridge.ProxyHandler.target_model = "z-ai/glm-5.3"
+        sent, _ = self.post([{"role": "user", "parts": [{"text": "review"}]}], FINAL_TURN)
+        self.assertEqual(sent["reasoning"], {"effort": "max"})
+        self.assertEqual(sent["provider"]["quantizations"], PINNED)
+
+    def test_anthropic_allows_unlabelled_endpoints(self):
+        bridge.ProxyHandler.target_model = "anthropic/claude-haiku"
+        sent, _ = self.post([{"role": "user", "parts": [{"text": "review"}]}], FINAL_TURN)
+        self.assertEqual(sent["provider"]["quantizations"], PINNED + ["unknown"])
 
 
 if __name__ == "__main__":

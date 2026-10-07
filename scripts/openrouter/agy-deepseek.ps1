@@ -5,7 +5,7 @@ if (-not $env:OPENROUTER_API_KEY) {
 }
 
 $Model = if ($env:OPENROUTER_MODEL) { $env:OPENROUTER_MODEL } else { "deepseek/deepseek-v4.1-flash" }
-$Effort = if ($env:OPENROUTER_EFFORT) { $env:OPENROUTER_EFFORT } else { "high" }
+$Effort = if ($env:OPENROUTER_EFFORT) { $env:OPENROUTER_EFFORT } elseif ($Model -like "*glm*") { "max" } else { "high" }
 $Port = if ($env:AGY_PROXY_PORT) { [int]$env:AGY_PROXY_PORT } elseif ($Model -like "*glm*") { 8046 } else { 8045 }
 
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
