@@ -14,12 +14,14 @@ import uuid
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 DEFAULT_MODEL = "deepseek/deepseek-v4.1-flash"
+GLM_MODEL = "z-ai/glm-5.3-flash"
+ESCALATION_MODEL = "z-ai/glm-5.3"
+PINNED_MODELS = {DEFAULT_MODEL, GLM_MODEL, ESCALATION_MODEL}  # the slugs rules/openrouter.md names
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 UPSTREAM_TIMEOUT = 600  # GLM at max effort can think for minutes before the first token
 # Closed-weight vendors serve only first-party endpoints, which OpenRouter labels unknown.
 CLOSED_WEIGHT_PREFIXES = ("anthropic/", "openai/", "google/", "x-ai/")
-# Models whose endpoints reject `reasoning`; with require_parameters it would exclude them all.
-NO_REASONING_MODELS = set()
+REASONING_CACHE_SIZE = 256
 
 
 def default_effort(model):
@@ -28,7 +30,7 @@ def default_effort(model):
 
 
 def resolve_effort(model, explicit=""):
-    return explicit or os.environ.get("OPENROUTER_EFFORT") or default_effort(model)
+    return explicit or default_effort(model)
 
 
 def provider_routing(model):
@@ -66,14 +68,11 @@ def remember_reasoning(cache, call_ids, details):
     """Store reasoning under real upstream ids only; a synthetic id is never sent back to match."""
     for call_id in call_ids:
         if call_id and details:
+            cache.pop(call_id, None)
             cache[call_id] = details
-
-
-def prune_reasoning(cache, messages):
-    """Drop reasoning for calls the client no longer sends, so the cache tracks one history."""
-    live = {tc["id"] for m in messages for tc in m.get("tool_calls", [])}
-    for call_id in [k for k in cache if k not in live]:
-        del cache[call_id]
+    # LRU, not pruning by request: subagents share this bridge, so one history never lists every live call
+    while len(cache) > REASONING_CACHE_SIZE:
+        del cache[next(iter(cache))]
 
 
 def to_openai_messages(contents, system_instruction=None, reasoning_by_call=None):
@@ -87,6 +86,7 @@ def to_openai_messages(contents, system_instruction=None, reasoning_by_call=None
             messages.append({"role": "system", "content": sys_text})
 
     pending_ids = []  # ids of the last assistant turn's calls, to pair responses that carry none
+    answered = 0  # responses seen since that turn, across user turns
     for turn, item in enumerate(contents):
         role = item.get("role", "user")
         if role == "model":
@@ -116,7 +116,8 @@ def to_openai_messages(contents, system_instruction=None, reasoning_by_call=None
                 })
             elif "functionResponse" in p:
                 fr = p["functionResponse"]
-                n = len(tool_responses)
+                n = answered
+                answered += 1
                 call_id = fr.get("id") or (pending_ids[n] if n < len(pending_ids) else f"call_{turn}_{n}")
                 tool_responses.append({
                     "role": "tool",
@@ -137,9 +138,11 @@ def to_openai_messages(contents, system_instruction=None, reasoning_by_call=None
         if tool_calls:
             msg["tool_calls"] = tool_calls
             pending_ids = [tc["id"] for tc in tool_calls]
+            answered = 0
             # Gemini-format history has no reasoning_details; OpenRouter wants them back in tool loops.
             details = (reasoning_by_call or {}).get(tool_calls[0]["id"])
             if details:
+                remember_reasoning(reasoning_by_call, [tool_calls[0]["id"]], details)  # mark recently used
                 msg["reasoning_details"] = details
         if "content" in msg or "tool_calls" in msg:
             messages.append(msg)
@@ -214,7 +217,6 @@ class ProxyHandler(BaseHTTPRequestHandler):
             req_data.get("systemInstruction"),
             self.reasoning_by_call
         )
-        prune_reasoning(self.reasoning_by_call, messages)
         tools = to_openai_tools(req_data.get("tools", []))
 
         payload = {
@@ -226,13 +228,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
         if tools:
             payload["tools"] = tools
 
-        if self.target_model not in NO_REASONING_MODELS:
-            effort = resolve_effort(self.target_model, (
-                self.headers.get("x-openrouter-effort")
-                or self.headers.get("x-reasoning-effort")
-                or self.target_effort
-            ))
-            payload["reasoning"] = {"effort": effort}
+        payload["reasoning"] = {"effort": resolve_effort(self.target_model, self.target_effort)}
 
         # require_parameters drops endpoints lacking any sent parameter, so send only what was set.
         gen_cfg = req_data.get("generationConfig") or {}
@@ -474,10 +470,10 @@ def check_bridge(url, model, effort=""):
 
 def main():
     parser = argparse.ArgumentParser(description="CLI to OpenRouter model proxy bridge")
-    parser.add_argument("--port", type=int, default=int(os.environ.get("AGY_PROXY_PORT", 8045)))
+    parser.add_argument("--port", type=int, default=0, help="0 picks a free port")
     parser.add_argument("--host", type=str, default="127.0.0.1")
     parser.add_argument("--model", type=str, default=os.environ.get("OPENROUTER_MODEL", DEFAULT_MODEL))
-    parser.add_argument("--effort", type=str, default=os.environ.get("OPENROUTER_EFFORT", ""))
+    parser.add_argument("--effort", type=str, default="", help="empty picks the model default")
     parser.add_argument("--port-file", default="",
                         help="once listening, write the bound port here (use with --port 0)")
     parser.add_argument("--check", metavar="URL", default="",

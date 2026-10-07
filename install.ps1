@@ -39,7 +39,9 @@ Link-File "$Repo\hooks.json" "$Config\hooks.json"
 New-Item -ItemType Directory -Force -Path "$HOME\scripts" | Out-Null
 Link-Dir "$Repo\scripts\openrouter" "$HOME\scripts\openrouter"
 # Older installs hard-linked each file into ~/scripts itself.
-Get-ChildItem "$Repo\scripts\openrouter" -File | ForEach-Object { Remove-Item "$HOME\scripts\$($_.Name)" -Force -ErrorAction SilentlyContinue }
+Get-ChildItem "$Repo\scripts\openrouter" -File | ForEach-Object {
+    Remove-Item "$HOME\scripts\$($_.Name)", "$HOME\scripts\__pycache__\$($_.BaseName).*.pyc" -Force -ErrorAction SilentlyContinue
+}
 
 # 3. agy scans skills in the global config dir only; ~/.agents/skills is workspace-scoped.
 # Older installs junctioned every skill there. Drop those links, never another tool's or a target.
@@ -57,11 +59,18 @@ $local = "$Config\mcp_config.local.json"
 $out = "$Config\mcp_config.json"
 # PSObject rather than -AsHashtable: that switch does not exist in Windows PowerShell 5.1.
 $base = Get-Content "$Repo\mcp_config.json" -Raw | ConvertFrom-Json
-if (Test-Path $local) {
-    $extra = Get-Content $local -Raw | ConvertFrom-Json
-    foreach ($k in $extra.mcpServers.PSObject.Properties.Name) {
-        $base.mcpServers | Add-Member -NotePropertyName $k -NotePropertyValue $extra.mcpServers.$k -Force
+# Per key, like install.sh's jq merge: a local entry setting only command keeps the repo args.
+function Merge-McpServers($servers, $extra) {
+    foreach ($k in $extra.PSObject.Properties.Name) {
+        if ($servers.$k) {
+            foreach ($p in $extra.$k.PSObject.Properties) { $servers.$k | Add-Member -NotePropertyName $p.Name -NotePropertyValue $p.Value -Force }
+        } else {
+            $servers | Add-Member -NotePropertyName $k -NotePropertyValue $extra.$k
+        }
     }
+}
+if (Test-Path $local) {
+    Merge-McpServers $base.mcpServers (Get-Content $local -Raw | ConvertFrom-Json).mcpServers
 } else {
     Write-Warning "no $local; only repo MCP servers installed"
 }

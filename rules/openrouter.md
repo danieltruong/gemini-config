@@ -37,5 +37,7 @@ Dual-model strategy via OpenRouter prioritizing quality over speed:
 - GLM: default `max`, OpenRouter's own default for GLM 5.3; `high` cheaper fallback, under A/B test.
 - Every request pins providers: `provider: {"quantizations": ["fp8", "bf16", "fp16"], "require_parameters": true}`. Never allow `unknown` for DeepSeek or GLM: unlabelled endpoints cheapest, win load balancing. Only closed-weight vendors (`anthropic/`, `openai/`, `google/`, `x-ai/`) add it, since first-party endpoints labelled `unknown`.
 
+- Launcher killed before cleanup leaves `modelProvider` patched in agy settings: run `python ~/scripts/openrouter/settings_lease.py recover`.
+
 ## Security
 - Never log or hard-code API tokens; read `OPENROUTER_API_KEY` from the environment.

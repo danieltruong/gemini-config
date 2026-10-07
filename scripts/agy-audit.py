@@ -123,7 +123,8 @@ KV_KEY, KV_VALUE = ".1.20.1", ".1.20.2"
 
 INHERIT_MODELS = {"", "?", "inherit"}
 # rules/openrouter.md pins these exact slugs on purpose, so they are not drift
-OPENROUTER_MODELS = {"deepseek/deepseek-v4.1-flash", "z-ai/glm-5.3-flash", "z-ai/glm-5.3"}
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "openrouter"))
+from openrouter_bridge import PINNED_MODELS as OPENROUTER_MODELS  # noqa: E402
 
 # Files that decide whether work passed. Editing one while the verifier is red moves
 # the goalposts, so every such edit is listed by conversation and step.

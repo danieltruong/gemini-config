@@ -2,17 +2,18 @@
 
 import json
 import os
+import signal
 import subprocess
 import urllib.request
 import urllib.error
 from mcp.server.fastmcp import FastMCP
 
-from openrouter_bridge import (DEFAULT_MODEL, OPENROUTER_URL, UPSTREAM_TIMEOUT, provider_routing,
-                               resolve_effort)
+import settings_lease
+from openrouter_bridge import (DEFAULT_MODEL, GLM_MODEL, OPENROUTER_URL, UPSTREAM_TIMEOUT,
+                               provider_routing, resolve_effort)
 
 mcp = FastMCP("deepseek")
 
-GLM_MODEL = "z-ai/glm-5.3-flash"
 SUBTASK_TIMEOUT = 900  # a GLM subtask at max effort can run for many minutes
 
 
@@ -57,6 +58,29 @@ def _chat_completion(prompt: str, system_prompt: str, model: str, title: str, ef
         return f"Execution error: {e}"
 
 
+def kill_tree(proc):
+    if os.name == "nt":
+        subprocess.run(["taskkill", "/T", "/F", "/PID", str(proc.pid)], capture_output=True)
+    else:
+        os.killpg(proc.pid, signal.SIGKILL)
+
+
+def run_launcher(cmd, cwd, env, timeout_seconds, settings=settings_lease.DEFAULT_SETTINGS):
+    """Run a launcher; on timeout kill its whole tree (bridge and agy too) and drop its settings lease."""
+    group = ({"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if os.name == "nt"
+             else {"start_new_session": True})
+    proc = subprocess.Popen(cmd, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            text=True, **group)
+    try:
+        out, err = proc.communicate(timeout=timeout_seconds)
+        return proc.returncode, out, err
+    except subprocess.TimeoutExpired:
+        kill_tree(proc)
+        proc.communicate(timeout=30)
+        settings_lease.release(settings, proc.pid)  # the launcher died before its own cleanup
+        raise
+
+
 def _subtask_execution(prompt: str, cwd: str, model: str, timeout_seconds: int, effort: str = "",
                        allow_all_tools: bool = False) -> str:
     work_dir = cwd if cwd and os.path.isdir(cwd) else os.getcwd()
@@ -79,22 +103,14 @@ def _subtask_execution(prompt: str, cwd: str, model: str, timeout_seconds: int, 
 
     env = os.environ.copy()
     env["OPENROUTER_MODEL"] = model
-    env["OPENROUTER_EFFORT"] = target_effort
 
     try:
-        proc = subprocess.run(
-            cmd,
-            cwd=work_dir,
-            env=env,
-            capture_output=True,
-            text=True,
-            timeout=timeout_seconds
-        )
-        out = proc.stdout.strip()
+        code, out, err = run_launcher(cmd, work_dir, env, timeout_seconds)
+        out = out.strip()
         if not out:
-            if proc.stderr:
-                return f"Subtask error: {proc.stderr.strip()}"
-            return f"Subtask exited with code {proc.returncode} and no output."
+            if err:
+                return f"Subtask error: {err.strip()}"
+            return f"Subtask exited with code {code} and no output."
 
         try:
             parsed = json.loads(out)
