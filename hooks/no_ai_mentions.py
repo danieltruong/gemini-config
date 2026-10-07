@@ -24,7 +24,7 @@ QUOTED = r"""(?:'((?:[^'\\]|\\.)*)'|"((?:[^"\\]|\\.)*)")"""
 MESSAGE_ARG = re.compile(r"(?:-m|--message|-b|--body|-t|--title)(?:=|\s+)" + QUOTED)
 HEREDOC = re.compile(r"<<-?\s*'?(\w+)'?\n(.*?)\n\1", re.S)
 # config and docs about the toolchain have to name it; SDK glue has to import it
-EXEMPT_DIRS = ("/.agents/", "/.gemini/", "/gemini-config/", "/sdk/", "/api/")
+EXEMPT_DIRS = ("/.agents/", "/.gemini/", "/gemini-config/", "/.config/opencode/", "/.claude/", "/claude-config/", "/sdk/", "/api/")
 EXEMPT_NAMES = {"README.md", "GEMINI.md", "AGENTS.md", "SKILL.md"}
 
 
