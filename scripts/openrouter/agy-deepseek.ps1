@@ -10,6 +10,8 @@ $EffortArgs = @()
 $i = [array]::IndexOf($args, "--effort")
 if ($i -ge 0 -and $i + 1 -lt $args.Count) { $EffortArgs = @("--effort", $args[$i + 1]) }
 $PrintMode = [bool]($args | Where-Object { $_ -in "-p", "--print", "--prompt" -or $_ -like "--print=*" -or $_ -like "--prompt=*" })
+$i = [array]::IndexOf($args, "--output-format")
+$JsonMode = ($i -ge 0 -and $i + 1 -lt $args.Count -and $args[$i + 1] -eq "json") -or $args -contains "--output-format=json"
 
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $BridgeScript = Join-Path $ScriptDir "openrouter_bridge.py"
@@ -48,19 +50,26 @@ try {
 
     $Started = $true
     if ($PrintMode) {
-        # A killed or timed-out print run can exit 0 with nothing printed; count output so that fails.
-        $Printed = $false
+        # A killed or timed-out print run can exit 0 with nothing printed or status ERROR; keep the output to check.
+        $Out = [System.Collections.Generic.List[string]]::new()
         $ConsoleEncoding = [Console]::OutputEncoding
         [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
         try {
-            & agy @args | ForEach-Object { if ($_ -match '\S') { $Printed = $true }; $_ }
+            & agy @args | ForEach-Object { $Out.Add($_); $_ }
             $Code = $LASTEXITCODE
         } finally {
             [Console]::OutputEncoding = $ConsoleEncoding
         }
-        if ($Code -eq 0 -and -not $Printed) {
+        $Text = $Out -join "`n"
+        if ($Code -eq 0 -and $Text -notmatch '\S') {
             [Console]::Error.WriteLine("agy exited 0 but printed nothing")
             $Code = 1
+        } elseif ($Code -eq 0 -and $JsonMode) {
+            $Status = try { ($Text | ConvertFrom-Json).status } catch { $null }
+            if ($Status -ne "SUCCESS") {
+                [Console]::Error.WriteLine("agy exited 0 with status $Status")
+                $Code = 2
+            }
         }
     } else {
         & agy @args

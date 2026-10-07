@@ -14,8 +14,12 @@ for ((i = 0; i + 1 < ${#ARGV[@]}; i++)); do
     if [[ "${ARGV[i]}" == "--effort" ]]; then EFFORT_ARGS=(--effort "${ARGV[i + 1]}"); break; fi
 done
 PRINT_MODE=""
+JSON_MODE=""
+PREV=""
 for a in "$@"; do
     case "$a" in -p | --print | --prompt | --print=* | --prompt=*) PRINT_MODE=1 ;; esac
+    if [[ "$a" == "--output-format=json" || ("$PREV" == "--output-format" && "$a" == "json") ]]; then JSON_MODE=1; fi
+    PREV="$a"
 done
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BRIDGE="${SCRIPT_DIR}/openrouter_bridge.py"
@@ -68,9 +72,14 @@ if [[ -z "${PRINT_MODE}" ]]; then
     agy "$@"
     exit
 fi
-# A killed print run can exit 0 with nothing printed, so keep a copy to check; pipefail passes agy's own failure.
+# A killed print run can exit 0 with nothing printed or status ERROR, so keep a copy to check; pipefail passes agy's own failure.
 agy "$@" | tee "${TMP_DIR}/out"
 if ! grep -q '[^[:space:]]' "${TMP_DIR}/out"; then
     echo "Error: agy exited 0 but printed nothing" >&2
     exit 1
+fi
+if [[ -n "${JSON_MODE}" ]] && ! python -c 'import json, sys; sys.exit(json.load(sys.stdin).get("status") != "SUCCESS")' \
+    < "${TMP_DIR}/out" 2>/dev/null; then
+    echo "Error: agy exited 0 but its status is not SUCCESS" >&2
+    exit 2
 fi
