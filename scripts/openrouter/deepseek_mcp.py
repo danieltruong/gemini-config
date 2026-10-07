@@ -7,11 +7,13 @@ import urllib.request
 import urllib.error
 from mcp.server.fastmcp import FastMCP
 
-from openrouter_bridge import DEFAULT_MODEL, OPENROUTER_URL, default_effort, provider_routing
+from openrouter_bridge import (DEFAULT_MODEL, OPENROUTER_URL, UPSTREAM_TIMEOUT, provider_routing,
+                               resolve_effort)
 
 mcp = FastMCP("deepseek")
 
 GLM_MODEL = "z-ai/glm-5.3-flash"
+SUBTASK_TIMEOUT = 900  # a GLM subtask at max effort can run for many minutes
 
 
 def _chat_completion(prompt: str, system_prompt: str, model: str, title: str, effort: str = "") -> str:
@@ -27,7 +29,7 @@ def _chat_completion(prompt: str, system_prompt: str, model: str, title: str, ef
     payload = {
         "model": model,
         "messages": messages,
-        "reasoning": {"effort": effort or default_effort(model)},
+        "reasoning": {"effort": resolve_effort(model, effort)},
         "provider": provider_routing(model)
     }
 
@@ -43,11 +45,11 @@ def _chat_completion(prompt: str, system_prompt: str, model: str, title: str, ef
     )
 
     try:
-        with urllib.request.urlopen(req, timeout=120) as resp:
+        with urllib.request.urlopen(req, timeout=UPSTREAM_TIMEOUT) as resp:
             data = json.loads(resp.read().decode("utf-8"))
             choice = data.get("choices", [{}])[0]
             msg = choice.get("message", {})
-            return msg.get("content", "")
+            return msg.get("content") or ""
     except urllib.error.HTTPError as e:
         err = e.read().decode("utf-8", errors="replace")
         return f"HTTP error {e.code}: {err}"
@@ -55,27 +57,25 @@ def _chat_completion(prompt: str, system_prompt: str, model: str, title: str, ef
         return f"Execution error: {e}"
 
 
-def _subtask_execution(prompt: str, cwd: str, model: str, timeout_seconds: int, effort: str = "") -> str:
+def _subtask_execution(prompt: str, cwd: str, model: str, timeout_seconds: int, effort: str = "",
+                       allow_all_tools: bool = False) -> str:
     work_dir = cwd if cwd and os.path.isdir(cwd) else os.getcwd()
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    launcher = os.path.join(script_dir, "agy-deepseek.ps1")
+    if os.name == "nt":
+        launcher = os.path.join(script_dir, "agy-deepseek.ps1")
+        cmd = ["pwsh", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", launcher]
+    else:
+        launcher = os.path.join(script_dir, "agy-deepseek.sh")
+        cmd = ["bash", launcher]
 
     if not os.path.isfile(launcher):
         return f"Error: launcher script not found at {launcher}"
 
-    target_effort = effort or default_effort(model)
-
-    cmd = [
-        "pwsh",
-        "-NoProfile",
-        "-ExecutionPolicy", "Bypass",
-        "-File", launcher,
-        "--agent", "harness-worker",
-        "--effort", target_effort,
-        "-p", prompt,
-        "--dangerously-skip-permissions",
-        "--output-format", "json"
-    ]
+    target_effort = resolve_effort(model, effort)
+    cmd += ["--agent", "harness-worker", "--effort", target_effort, "-p", prompt,
+            "--output-format", "json"]
+    if allow_all_tools:
+        cmd.append("--dangerously-skip-permissions")
 
     env = os.environ.copy()
     env["OPENROUTER_MODEL"] = model
@@ -111,27 +111,27 @@ def _subtask_execution(prompt: str, cwd: str, model: str, timeout_seconds: int, 
 
 
 @mcp.tool()
-def deepseek_chat(prompt: str, system_prompt: str = "", model: str = DEFAULT_MODEL, effort: str = default_effort(DEFAULT_MODEL)) -> str:
+def deepseek_chat(prompt: str, system_prompt: str = "", model: str = DEFAULT_MODEL, effort: str = "") -> str:
     """Direct query to DeepSeek Flash via OpenRouter for code generation, analysis, or creative writing.
 
     Args:
         prompt: The prompt or instructions for the model.
         system_prompt: Optional system instructions.
         model: OpenRouter model slug (defaults to deepseek/deepseek-v4.1-flash).
-        effort: Reasoning effort: low, high or max (defaults to high; max only to escalate).
+        effort: Reasoning effort low, high or max; empty picks the model default (GLM max, others high).
     """
     return _chat_completion(prompt, system_prompt, model, "Local DeepSeek MCP", effort)
 
 
 @mcp.tool()
-def glm_chat(prompt: str, system_prompt: str = "", model: str = GLM_MODEL, effort: str = default_effort(GLM_MODEL)) -> str:
+def glm_chat(prompt: str, system_prompt: str = "", model: str = GLM_MODEL, effort: str = "") -> str:
     """Direct query to GLM 5.3 Flash via OpenRouter for adversarial review, critique, or planning.
 
     Args:
         prompt: The prompt or instructions for the model.
         system_prompt: Optional system instructions.
-        model: OpenRouter model slug (defaults to z-ai/glm-5.3-flash).
-        effort: Reasoning effort: low, high or max (defaults to max; high is the cheaper fallback under test).
+        model: OpenRouter model slug (defaults to z-ai/glm-5.3-flash; z-ai/glm-5.3 to escalate).
+        effort: Reasoning effort low, high or max; empty picks the model default (GLM max, others high).
     """
     return _chat_completion(prompt, system_prompt, model, "Local GLM MCP", effort)
 
@@ -141,8 +141,9 @@ def deepseek_subtask(
     prompt: str,
     cwd: str = "",
     model: str = DEFAULT_MODEL,
-    timeout_seconds: int = 180,
-    effort: str = default_effort(DEFAULT_MODEL)
+    timeout_seconds: int = SUBTASK_TIMEOUT,
+    effort: str = "",
+    allow_all_tools: bool = False
 ) -> str:
     """Run an autonomous subtask using DeepSeek Flash via OpenRouter with file and shell access.
 
@@ -151,9 +152,10 @@ def deepseek_subtask(
         cwd: Working directory for the subtask (defaults to current directory).
         model: OpenRouter model slug (defaults to deepseek/deepseek-v4.1-flash).
         timeout_seconds: Max seconds to wait for task completion.
-        effort: Reasoning effort: low, high or max (defaults to high; max only to escalate).
+        effort: Reasoning effort low, high or max; empty picks the model default (GLM max, others high).
+        allow_all_tools: Approve every tool call without asking (agy --dangerously-skip-permissions).
     """
-    return _subtask_execution(prompt, cwd, model, timeout_seconds, effort)
+    return _subtask_execution(prompt, cwd, model, timeout_seconds, effort, allow_all_tools)
 
 
 @mcp.tool()
@@ -161,19 +163,21 @@ def glm_subtask(
     prompt: str,
     cwd: str = "",
     model: str = GLM_MODEL,
-    timeout_seconds: int = 180,
-    effort: str = default_effort(GLM_MODEL)
+    timeout_seconds: int = SUBTASK_TIMEOUT,
+    effort: str = "",
+    allow_all_tools: bool = False
 ) -> str:
     """Run an autonomous subtask using GLM 5.3 Flash via OpenRouter for critique, audit, or planning.
 
     Args:
         prompt: Task instructions for the agent to execute.
         cwd: Working directory for the subtask (defaults to current directory).
-        model: OpenRouter model slug (defaults to z-ai/glm-5.3-flash).
+        model: OpenRouter model slug (defaults to z-ai/glm-5.3-flash; z-ai/glm-5.3 to escalate).
         timeout_seconds: Max seconds to wait for task completion.
-        effort: Reasoning effort: low, high or max (defaults to max; high is the cheaper fallback under test).
+        effort: Reasoning effort low, high or max; empty picks the model default (GLM max, others high).
+        allow_all_tools: Approve every tool call without asking (agy --dangerously-skip-permissions).
     """
-    return _subtask_execution(prompt, cwd, model, timeout_seconds, effort)
+    return _subtask_execution(prompt, cwd, model, timeout_seconds, effort, allow_all_tools)
 
 
 if __name__ == "__main__":

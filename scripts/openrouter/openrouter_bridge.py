@@ -10,10 +10,16 @@ import os
 import sys
 import urllib.request
 import urllib.error
+import uuid
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 DEFAULT_MODEL = "deepseek/deepseek-v4.1-flash"
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+UPSTREAM_TIMEOUT = 600  # GLM at max effort can think for minutes before the first token
+# Closed-weight vendors serve only first-party endpoints, which OpenRouter labels unknown.
+CLOSED_WEIGHT_PREFIXES = ("anthropic/", "openai/", "google/", "x-ai/")
+# Models whose endpoints reject `reasoning`; with require_parameters it would exclude them all.
+NO_REASONING_MODELS = set()
 
 
 def default_effort(model):
@@ -21,12 +27,16 @@ def default_effort(model):
     return "max" if "glm" in model.lower() else "high"
 
 
+def resolve_effort(model, explicit=""):
+    return explicit or os.environ.get("OPENROUTER_EFFORT") or default_effort(model)
+
+
 def provider_routing(model):
     """fp8 or better, and skip any provider that would drop reasoning or tools."""
     quantizations = ["fp8", "bf16", "fp16"]
-    # Unlabelled endpoints are the cheapest and win load balancing, which defeats the pin.
-    # Every Anthropic endpoint is first-party and labelled unknown, so allow it there only.
-    if model.lower().startswith("anthropic/"):
+    # Unlabelled endpoints of open-weight models are the cheapest and win load balancing,
+    # which defeats the pin, so allow unknown only where every endpoint is first-party.
+    if model.lower().startswith(CLOSED_WEIGHT_PREFIXES):
         quantizations.append("unknown")
     return {"quantizations": quantizations, "require_parameters": True}
 
@@ -34,12 +44,36 @@ def provider_routing(model):
 def merge_reasoning_details(acc, pieces):
     """Join streamed reasoning_details fragments into whole blocks, keyed by index."""
     for piece in pieces:
-        block = acc.setdefault(piece.get("index", len(acc)), {})
+        index = piece.get("index")
+        if index is None:
+            index = max(acc) if acc else 0
+        block = acc.setdefault(index, {})
         for key, value in piece.items():
+            if value is None:
+                continue
             if key in ("text", "summary", "data") and isinstance(value, str):
                 block[key] = block.get(key, "") + value
             else:
                 block[key] = value
+
+
+def new_call_id():
+    """Unique id for an upstream call that came without one; a fixed call_0 would collide across turns."""
+    return f"call_{uuid.uuid4().hex[:12]}"
+
+
+def remember_reasoning(cache, call_ids, details):
+    """Store reasoning under real upstream ids only; a synthetic id is never sent back to match."""
+    for call_id in call_ids:
+        if call_id and details:
+            cache[call_id] = details
+
+
+def prune_reasoning(cache, messages):
+    """Drop reasoning for calls the client no longer sends, so the cache tracks one history."""
+    live = {tc["id"] for m in messages for tc in m.get("tool_calls", [])}
+    for call_id in [k for k in cache if k not in live]:
+        del cache[call_id]
 
 
 def to_openai_messages(contents, system_instruction=None, reasoning_by_call=None):
@@ -52,7 +86,8 @@ def to_openai_messages(contents, system_instruction=None, reasoning_by_call=None
         if sys_text:
             messages.append({"role": "system", "content": sys_text})
 
-    for item in contents:
+    pending_ids = []  # ids of the last assistant turn's calls, to pair responses that carry none
+    for turn, item in enumerate(contents):
         role = item.get("role", "user")
         if role == "model":
             role = "assistant"
@@ -72,7 +107,7 @@ def to_openai_messages(contents, system_instruction=None, reasoning_by_call=None
             elif "functionCall" in p:
                 fc = p["functionCall"]
                 tool_calls.append({
-                    "id": fc.get("id", f"call_{len(tool_calls)}"),
+                    "id": fc.get("id") or f"call_{turn}_{len(tool_calls)}",
                     "type": "function",
                     "function": {
                         "name": fc.get("name", ""),
@@ -81,27 +116,33 @@ def to_openai_messages(contents, system_instruction=None, reasoning_by_call=None
                 })
             elif "functionResponse" in p:
                 fr = p["functionResponse"]
+                n = len(tool_responses)
+                call_id = fr.get("id") or (pending_ids[n] if n < len(pending_ids) else f"call_{turn}_{n}")
                 tool_responses.append({
                     "role": "tool",
-                    "tool_call_id": fr.get("id", "call_0"),
+                    "tool_call_id": call_id,
                     "name": fr.get("name", ""),
                     "content": json.dumps(fr.get("response", {}))
                 })
 
         if tool_responses:
             messages.extend(tool_responses)
-        else:
-            msg = {"role": role}
             if text_content:
-                msg["content"] = text_content
-            if tool_calls:
-                msg["tool_calls"] = tool_calls
-                # Gemini-format history has no reasoning_details; OpenRouter wants them back in tool loops.
-                details = (reasoning_by_call or {}).get(tool_calls[0]["id"])
-                if details:
-                    msg["reasoning_details"] = details
-            if "content" in msg or "tool_calls" in msg:
-                messages.append(msg)
+                messages.append({"role": "user", "content": text_content})
+            continue
+
+        msg = {"role": role}
+        if text_content:
+            msg["content"] = text_content
+        if tool_calls:
+            msg["tool_calls"] = tool_calls
+            pending_ids = [tc["id"] for tc in tool_calls]
+            # Gemini-format history has no reasoning_details; OpenRouter wants them back in tool loops.
+            details = (reasoning_by_call or {}).get(tool_calls[0]["id"])
+            if details:
+                msg["reasoning_details"] = details
+        if "content" in msg or "tool_calls" in msg:
+            messages.append(msg)
 
     return messages
 
@@ -134,7 +175,15 @@ class ProxyHandler(BaseHTTPRequestHandler):
         sys.stderr.write(f"[proxy] {self.command} {self.path} - {format % args}\n")
 
     def do_GET(self):
-        if "/models" in self.path:
+        if self.path.split("?")[0] == "/health":
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            health = {"model": self.target_model,
+                      "effort": resolve_effort(self.target_model, self.target_effort)}
+            self.wfile.write(json.dumps(health).encode("utf-8"))
+        elif "/models" in self.path:
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Connection", "close")
@@ -165,6 +214,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
             req_data.get("systemInstruction"),
             self.reasoning_by_call
         )
+        prune_reasoning(self.reasoning_by_call, messages)
         tools = to_openai_tools(req_data.get("tools", []))
 
         payload = {
@@ -176,19 +226,19 @@ class ProxyHandler(BaseHTTPRequestHandler):
         if tools:
             payload["tools"] = tools
 
-        effort = (
-            self.headers.get("x-openrouter-effort")
-            or self.headers.get("x-reasoning-effort")
-            or self.target_effort
-            or os.environ.get("OPENROUTER_EFFORT")
-            or default_effort(self.target_model)
-        )
-        payload["reasoning"] = {"effort": effort}
+        if self.target_model not in NO_REASONING_MODELS:
+            effort = resolve_effort(self.target_model, (
+                self.headers.get("x-openrouter-effort")
+                or self.headers.get("x-reasoning-effort")
+                or self.target_effort
+            ))
+            payload["reasoning"] = {"effort": effort}
 
-        gen_cfg = req_data.get("generationConfig", {})
-        if "temperature" in gen_cfg:
+        # require_parameters drops endpoints lacking any sent parameter, so send only what was set.
+        gen_cfg = req_data.get("generationConfig") or {}
+        if gen_cfg.get("temperature") is not None:
             payload["temperature"] = gen_cfg["temperature"]
-        if "maxOutputTokens" in gen_cfg:
+        if gen_cfg.get("maxOutputTokens") is not None:
             payload["max_tokens"] = gen_cfg["maxOutputTokens"]
 
         req = urllib.request.Request(
@@ -203,7 +253,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
         )
 
         try:
-            upstream = urllib.request.urlopen(req, timeout=120)
+            upstream = urllib.request.urlopen(req, timeout=UPSTREAM_TIMEOUT)
         except urllib.error.HTTPError as e:
             err_body = e.read().decode("utf-8", errors="replace")
             sys.stderr.write(f"[proxy] Upstream HTTP {e.code}: {err_body}\n")
@@ -290,11 +340,13 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     idx = tc.get("index", 0)
                     if idx not in tool_calls_acc:
                         tool_calls_acc[idx] = {
-                            "id": tc.get("id", f"call_{idx}"),
+                            "id": tc.get("id") or "",
                             "name": tc.get("function", {}).get("name", ""),
                             "args_str": tc.get("function", {}).get("arguments", "")
                         }
                     else:
+                        if tc.get("id") and not tool_calls_acc[idx]["id"]:
+                            tool_calls_acc[idx]["id"] = tc["id"]
                         if "name" in tc.get("function", {}):
                             tool_calls_acc[idx]["name"] += tc["function"]["name"]
                         if "arguments" in tc.get("function", {}):
@@ -302,18 +354,18 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
                 if finish_reason:
                     had_finish = True
-                    details = [reasoning_acc[i] for i in sorted(reasoning_acc)]
+                    calls = [tc_info for _idx, tc_info in sorted(tool_calls_acc.items())]
+                    remember_reasoning(self.reasoning_by_call, [c["id"] for c in calls],
+                                       [reasoning_acc[i] for i in sorted(reasoning_acc)])
                     parts = []
-                    for idx, tc_info in sorted(tool_calls_acc.items()):
-                        if details:
-                            self.reasoning_by_call[tc_info["id"]] = details
+                    for tc_info in calls:
                         try:
                             parsed_args = json.loads(tc_info["args_str"])
                         except Exception:
                             parsed_args = {"raw": tc_info["args_str"]}
                         parts.append({
                             "functionCall": {
-                                "id": tc_info["id"],
+                                "id": tc_info["id"] or new_call_id(),
                                 "name": tc_info["name"],
                                 "args": parsed_args
                             }
@@ -363,16 +415,17 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 parts = []
                 if "content" in msg and msg["content"]:
                     parts.append({"text": msg["content"]})
-                for tc in msg.get("tool_calls") or []:
-                    if msg.get("reasoning_details"):
-                        self.reasoning_by_call[tc.get("id", "")] = msg["reasoning_details"]
+                tool_calls = msg.get("tool_calls") or []
+                remember_reasoning(self.reasoning_by_call, [tc.get("id") for tc in tool_calls],
+                                   msg.get("reasoning_details"))
+                for tc in tool_calls:
                     try:
                         args = json.loads(tc.get("function", {}).get("arguments", "{}"))
                     except Exception:
                         args = {}
                     parts.append({
                         "functionCall": {
-                            "id": tc.get("id", ""),
+                            "id": tc.get("id") or new_call_id(),
                             "name": tc.get("function", {}).get("name", ""),
                             "args": args
                         }
@@ -404,13 +457,35 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 self.send_error(500, f"Error formatting response: {e}")
 
 
+def check_bridge(url, model, effort=""):
+    """0 when the bridge at url serves model at the effort this caller would resolve, else 1."""
+    expected = {"model": model, "effort": resolve_effort(model, effort)}
+    try:
+        with urllib.request.urlopen(url.rstrip("/") + "/health", timeout=5) as resp:
+            health = json.loads(resp.read().decode("utf-8"))
+    except Exception as e:
+        sys.stderr.write(f"bridge at {url} did not answer /health: {e}\n")
+        return 1
+    if health != expected:
+        sys.stderr.write(f"bridge at {url} serves {health}, expected {expected}\n")
+        return 1
+    return 0
+
+
 def main():
     parser = argparse.ArgumentParser(description="CLI to OpenRouter model proxy bridge")
     parser.add_argument("--port", type=int, default=int(os.environ.get("AGY_PROXY_PORT", 8045)))
     parser.add_argument("--host", type=str, default="127.0.0.1")
     parser.add_argument("--model", type=str, default=os.environ.get("OPENROUTER_MODEL", DEFAULT_MODEL))
     parser.add_argument("--effort", type=str, default=os.environ.get("OPENROUTER_EFFORT", ""))
+    parser.add_argument("--port-file", default="",
+                        help="once listening, write the bound port here (use with --port 0)")
+    parser.add_argument("--check", metavar="URL", default="",
+                        help="do not serve: exit 1 unless the bridge at URL serves --model at its resolved effort")
     args = parser.parse_args()
+
+    if args.check:
+        sys.exit(check_bridge(args.check, args.model, args.effort))
 
     api_key = os.environ.get("OPENROUTER_API_KEY")
     if not api_key:
@@ -422,7 +497,13 @@ def main():
     ProxyHandler.api_key = api_key
 
     server = HTTPServer((args.host, args.port), ProxyHandler)
-    sys.stderr.write(f"Proxy bridge listening on http://{args.host}:{args.port}\n")
+    port = server.server_address[1]
+    if args.port_file:
+        tmp = args.port_file + ".tmp"
+        with open(tmp, "w", encoding="ascii") as f:
+            f.write(str(port))
+        os.replace(tmp, args.port_file)  # readers never see a half-written file
+    sys.stderr.write(f"Proxy bridge listening on http://{args.host}:{port}\n")
     sys.stderr.write(f"Target OpenRouter model: {args.model}\n")
     try:
         server.serve_forever()

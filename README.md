@@ -30,7 +30,7 @@ Antigravity reads global rules from `~/.gemini/GEMINI.md` and global customizati
 | `hooks.json`, `hooks/` | `~/.gemini/config/` | Lifecycle hooks |
 | `skills/` | `~/.gemini/config/skills/` | Skills; `commit-msg` writes commit messages the commit gate accepts |
 | `scripts/` | `~/.gemini/config/scripts/` | Docs linter, docs compressor, pre-push check, hook log audit, and `agy-audit.py` for the transcript and quality audit |
-| `scripts/openrouter/` | `~/scripts/` | OpenRouter launchers (`agy-deepseek`, `agy-glm`), their protocol bridge and the `deepseek` MCP server, see `rules/openrouter.md` |
+| `scripts/openrouter/` | `~/scripts/openrouter/` | OpenRouter launchers (`agy-deepseek`, `agy-glm`), their protocol bridge and the `deepseek` MCP server, see `rules/openrouter.md` |
 | `mcp_config.json` | `~/.gemini/config/mcp_config.json` | MCP servers |
 
 `rules/local.md` holds this machine's paths. Git ignores it. Copy it from `rules/local.example.md`; ONBOARD.md has the steps.
@@ -39,9 +39,9 @@ agy 1.1.27 does not dispatch `PostToolUse` hooks. `PreToolUse`, `PreInvocation` 
 
 The `reinforce` hook runs at `PreInvocation`. On the first turn and every tenth it repeats three working rules: reply tersely, ship the shortest working diff, add no filler. On every turn it records the baseline `stop-gate` compares against, and once per conversation it repeats any note about work an earlier run left unchecked.
 
-Machine-local MCP servers go in `~/.gemini/config/mcp_config.local.json`. The installer merges it over the repo file. It is not tracked. The installer also turns a leading `~/` in any server's `args` into the real home path.
+Machine-local MCP servers go in `~/.gemini/config/mcp_config.local.json`. The installer merges it over the repo file. It is not tracked. The installer also turns a leading `~/` (or `~\` on Windows) in any server's `args` into the real home path.
 
-The `deepseek` MCP server runs on `python` from PATH, which needs the `mcp` package, and reads `OPENROUTER_API_KEY` from the environment. To use another Python, override the `deepseek` entry in `mcp_config.local.json`.
+The `deepseek` MCP server runs on whichever `python` is first on PATH. Run `pip install mcp` with that same Python. The server reads `OPENROUTER_API_KEY` from the environment. To use another Python, override the `deepseek` entry's `command` in `mcp_config.local.json`.
 
 `AGENTS.md` in the repo root is a pointer for other tools that read that file. It is not installed.
 

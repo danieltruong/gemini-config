@@ -35,9 +35,11 @@ if (-not (Test-Path "$Repo\rules\local.md")) {
 # 2. Global customizations
 foreach ($d in @("agents", "hooks", "scripts", "skills")) { Link-Dir "$Repo\$d" "$Config\$d" }
 Link-File "$Repo\hooks.json" "$Config\hooks.json"
-# OpenRouter launchers and MCP server go to ~/scripts, where rules/openrouter.md calls them.
+# OpenRouter scripts: a junction, as git checkout strands hard links; a file deleted from the repo needs no pruning.
 New-Item -ItemType Directory -Force -Path "$HOME\scripts" | Out-Null
-Get-ChildItem "$Repo\scripts\openrouter" -File | ForEach-Object { Link-File $_.FullName "$HOME\scripts\$($_.Name)" }
+Link-Dir "$Repo\scripts\openrouter" "$HOME\scripts\openrouter"
+# Older installs hard-linked each file into ~/scripts itself.
+Get-ChildItem "$Repo\scripts\openrouter" -File | ForEach-Object { Remove-Item "$HOME\scripts\$($_.Name)" -Force -ErrorAction SilentlyContinue }
 
 # 3. agy scans skills in the global config dir only; ~/.agents/skills is workspace-scoped.
 # Older installs junctioned every skill there. Drop those links, never another tool's or a target.
@@ -63,11 +65,18 @@ if (Test-Path $local) {
 } else {
     Write-Warning "no $local; only repo MCP servers installed"
 }
-# The agy MCP docs list no ~ expansion in args: repo entries say ~/ and get the real home here.
-foreach ($k in @($base.mcpServers.PSObject.Properties.Name)) {
-    $s = $base.mcpServers.$k
-    if ($s.args) { $s.args = @($s.args | ForEach-Object { if ($_ -like "~/*") { Join-Path $HOME ($_.Substring(2) -replace "/", "\") } else { $_ } }) }
+# The agy MCP docs list no ~ expansion in args: entries saying ~/ or ~\ get the real home here.
+function Expand-HomeArgs($servers, $homeDir) {
+    foreach ($k in @($servers.PSObject.Properties.Name)) {
+        $s = $servers.$k
+        if ($s.args) {
+            $s.args = @($s.args | ForEach-Object {
+                if ($_ -is [string] -and $_ -match '^~[\\/]') { Join-Path $homeDir ($_.Substring(2) -replace "/", "\") } else { $_ }
+            })
+        }
+    }
 }
+Expand-HomeArgs $base.mcpServers $HOME
 # A dead http server makes every headless run hang until its timeout, so drop it now.
 foreach ($k in @($base.mcpServers.PSObject.Properties.Name)) {
     $url = $base.mcpServers.$k.serverUrl

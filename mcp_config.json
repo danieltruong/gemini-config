@@ -9,7 +9,7 @@
     },
     "deepseek": {
       "command": "python",
-      "args": ["~/scripts/deepseek_mcp.py"]
+      "args": ["~/scripts/openrouter/deepseek_mcp.py"]
     }
   }
 }
