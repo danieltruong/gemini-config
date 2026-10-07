@@ -9,6 +9,7 @@ $Model = if ($env:OPENROUTER_MODEL) { $env:OPENROUTER_MODEL } else { "deepseek/d
 $EffortArgs = @()
 $i = [array]::IndexOf($args, "--effort")
 if ($i -ge 0 -and $i + 1 -lt $args.Count) { $EffortArgs = @("--effort", $args[$i + 1]) }
+$PrintMode = [bool]($args | Where-Object { $_ -in "-p", "--print", "--prompt" -or $_ -like "--print=*" -or $_ -like "--prompt=*" })
 
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $BridgeScript = Join-Path $ScriptDir "openrouter_bridge.py"
@@ -46,12 +47,25 @@ try {
     $env:GEMINI_API_KEY = "openrouter-local-key"
 
     $Started = $true
-    if ($args) {
-        & agy @args
+    if ($PrintMode) {
+        # A killed or timed-out print run can exit 0 with nothing printed; count output so that fails.
+        $Printed = $false
+        $ConsoleEncoding = [Console]::OutputEncoding
+        [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+        try {
+            & agy @args | ForEach-Object { if ($_ -match '\S') { $Printed = $true }; $_ }
+            $Code = $LASTEXITCODE
+        } finally {
+            [Console]::OutputEncoding = $ConsoleEncoding
+        }
+        if ($Code -eq 0 -and -not $Printed) {
+            [Console]::Error.WriteLine("agy exited 0 but printed nothing")
+            $Code = 1
+        }
     } else {
-        & agy
+        & agy @args
+        $Code = $LASTEXITCODE
     }
-    $Code = $LASTEXITCODE
 } finally {
     if ($Leased) {
         & python $LeaseScript release $SettingsFile $PID

@@ -162,7 +162,9 @@ def to_openai_tools(tools_list):
                 "function": {
                     "name": decl.get("name", ""),
                     "description": decl.get("description", ""),
-                    "parameters": decl.get("parameters", {"type": "object", "properties": {}})
+                    # agy declares its tools with parametersJsonSchema, not parameters
+                    "parameters": (decl.get("parameters") or decl.get("parametersJsonSchema")
+                                   or {"type": "object", "properties": {}})
                 }
             })
     return openai_tools
@@ -276,7 +278,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
             reasoning_acc = {}
             prompt_tokens = 0
             completion_tokens = 0
-            had_finish = False
+            finish_reason = None
 
             for line in upstream:
                 line_str = line.decode("utf-8", errors="replace").strip()
@@ -296,7 +298,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     completion_tokens = chunk["usage"].get("completion_tokens", completion_tokens)
 
                 choices = chunk.get("choices", [])
-                if not choices:
+                # OpenRouter repeats finish_reason on its closing usage chunk; past the first, read usage only.
+                if not choices or finish_reason:
                     continue
 
                 delta = choices[0].get("delta", {})
@@ -348,58 +351,39 @@ class ProxyHandler(BaseHTTPRequestHandler):
                         if "arguments" in tc.get("function", {}):
                             tool_calls_acc[idx]["args_str"] += tc["function"]["arguments"]
 
-                if finish_reason:
-                    had_finish = True
-                    calls = [tc_info for _idx, tc_info in sorted(tool_calls_acc.items())]
-                    remember_reasoning(self.reasoning_by_call, [c["id"] for c in calls],
-                                       [reasoning_acc[i] for i in sorted(reasoning_acc)])
-                    parts = []
-                    for tc_info in calls:
-                        try:
-                            parsed_args = json.loads(tc_info["args_str"])
-                        except Exception:
-                            parsed_args = {"raw": tc_info["args_str"]}
-                        parts.append({
-                            "functionCall": {
-                                "id": tc_info["id"] or new_call_id(),
-                                "name": tc_info["name"],
-                                "args": parsed_args
-                            }
-                        })
-
-                    if not parts:
-                        parts = [{"text": ""}]
-
-                    finish_chunk = {
-                        "candidates": [{
-                            "content": {"parts": parts, "role": "model"},
-                            "finishReason": "STOP" if finish_reason in ("stop", "tool_calls") else "MAX_TOKENS",
-                            "index": 0
-                        }],
-                        "usageMetadata": {
-                            "promptTokenCount": prompt_tokens,
-                            "candidatesTokenCount": completion_tokens,
-                            "totalTokenCount": prompt_tokens + completion_tokens
+            # Sent once, after the stream, so it carries the usage from the closing chunk.
+            parts = []
+            if finish_reason:
+                calls = [tc_info for _idx, tc_info in sorted(tool_calls_acc.items())]
+                remember_reasoning(self.reasoning_by_call, [c["id"] for c in calls],
+                                   [reasoning_acc[i] for i in sorted(reasoning_acc)])
+                for tc_info in calls:
+                    try:
+                        parsed_args = json.loads(tc_info["args_str"])
+                    except Exception:
+                        parsed_args = {"raw": tc_info["args_str"]}
+                    parts.append({
+                        "functionCall": {
+                            "id": tc_info["id"] or new_call_id(),
+                            "name": tc_info["name"],
+                            "args": parsed_args
                         }
-                    }
-                    self.wfile.write(f"data: {json.dumps(finish_chunk)}\n\n".encode("utf-8"))
-                    self.wfile.flush()
+                    })
 
-            if not had_finish:
-                fallback_chunk = {
-                    "candidates": [{
-                        "content": {"parts": [{"text": ""}], "role": "model"},
-                        "finishReason": "STOP",
-                        "index": 0
-                    }],
-                    "usageMetadata": {
-                        "promptTokenCount": prompt_tokens,
-                        "candidatesTokenCount": completion_tokens,
-                        "totalTokenCount": prompt_tokens + completion_tokens
-                    }
+            finish_chunk = {
+                "candidates": [{
+                    "content": {"parts": parts or [{"text": ""}], "role": "model"},
+                    "finishReason": "STOP" if finish_reason in (None, "stop", "tool_calls") else "MAX_TOKENS",
+                    "index": 0
+                }],
+                "usageMetadata": {
+                    "promptTokenCount": prompt_tokens,
+                    "candidatesTokenCount": completion_tokens,
+                    "totalTokenCount": prompt_tokens + completion_tokens
                 }
-                self.wfile.write(f"data: {json.dumps(fallback_chunk)}\n\n".encode("utf-8"))
-                self.wfile.flush()
+            }
+            self.wfile.write(f"data: {json.dumps(finish_chunk)}\n\n".encode("utf-8"))
+            self.wfile.flush()
 
             self.close_connection = True
         else:

@@ -144,6 +144,12 @@ class BridgeTest(unittest.TestCase):
                             generationConfig={"temperature": 0.2, "maxOutputTokens": 64})
         self.assertEqual((sent["temperature"], sent["max_tokens"]), (0.2, 64))
 
+    def test_tool_schema_is_forwarded_from_either_key(self):
+        schema = {"type": "object", "properties": {"DirectoryPath": {"type": "string"}}}
+        decls = [{"name": "list_dir", "parametersJsonSchema": schema}, {"name": "read", "parameters": schema}]
+        sent, _ = self.post([user("hi")], FINAL_TURN, tools=[{"functionDeclarations": decls}])
+        self.assertEqual([t["function"]["parameters"] for t in sent["tools"]], [schema, schema])
+
     def test_unknown_call_id_gets_no_reasoning(self):
         bridge.ProxyHandler.reasoning_by_call["call_x1"] = REASONING
         sent, _ = self.post([calls("call_other")], FINAL_TURN)
@@ -183,6 +189,23 @@ class BridgeTest(unittest.TestCase):
         self.assertEqual(len(sent["messages"][1]["tool_calls"]), 2)
         self.assertEqual(sent["messages"][1]["reasoning_details"][0]["text"], "both")
         self.assertEqual([m["tool_call_id"] for m in sent["messages"][2:4]], ["call_a", "call_b"])
+
+    def test_finish_then_usage_chunk_sends_one_finish_chunk(self):
+        # OpenRouter repeats finish_reason on the closing usage chunk; other providers may send null there.
+        for closing_reason in ("tool_calls", None):
+            with self.subTest(closing_reason=closing_reason):
+                _, body = self.post([user("read a")], sse(
+                    {"choices": [{"delta": {"tool_calls": [tool_delta(0, "call_r1", "read", {"p": "a"})]}}]},
+                    {"choices": [{"delta": {"content": ""}, "finish_reason": "tool_calls"}]},
+                    {"choices": [{"delta": {"content": ""}, "finish_reason": closing_reason}],
+                     "usage": {"prompt_tokens": 7, "completion_tokens": 3}}))
+                chunks = [json.loads(line[6:]) for line in body.splitlines() if line.startswith("data: ")]
+                finishes = [c for c in chunks if c["candidates"][0].get("finishReason")]
+                self.assertEqual(len(finishes), 1)
+                sent_calls = [p["functionCall"] for c in chunks for p in c["candidates"][0]["content"]["parts"]
+                              if "functionCall" in p]
+                self.assertEqual([(fc["id"], fc["args"]) for fc in sent_calls], [("call_r1", {"p": "a"})])
+                self.assertEqual(finishes[0]["usageMetadata"]["totalTokenCount"], 10)
 
     def test_responses_split_over_user_turns_pair_in_order(self):
         sent, _ = self.post([calls("call_a", "call_b"), responses(None), responses(None)], FINAL_TURN)

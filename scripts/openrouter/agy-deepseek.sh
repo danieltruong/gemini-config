@@ -13,6 +13,10 @@ ARGV=("$@")
 for ((i = 0; i + 1 < ${#ARGV[@]}; i++)); do
     if [[ "${ARGV[i]}" == "--effort" ]]; then EFFORT_ARGS=(--effort "${ARGV[i + 1]}"); break; fi
 done
+PRINT_MODE=""
+for a in "$@"; do
+    case "$a" in -p | --print | --prompt | --print=* | --prompt=*) PRINT_MODE=1 ;; esac
+done
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BRIDGE="${SCRIPT_DIR}/openrouter_bridge.py"
 LEASE="${SCRIPT_DIR}/settings_lease.py"
@@ -60,4 +64,13 @@ LEASED=1
 export GOOGLE_GEMINI_BASE_URL="http://127.0.0.1:${PORT}"
 export GEMINI_API_KEY="openrouter-local-key"
 
-agy "$@"
+if [[ -z "${PRINT_MODE}" ]]; then
+    agy "$@"
+    exit
+fi
+# A killed print run can exit 0 with nothing printed, so keep a copy to check; pipefail passes agy's own failure.
+agy "$@" | tee "${TMP_DIR}/out"
+if ! grep -q '[^[:space:]]' "${TMP_DIR}/out"; then
+    echo "Error: agy exited 0 but printed nothing" >&2
+    exit 1
+fi
