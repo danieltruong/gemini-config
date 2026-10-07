@@ -5,11 +5,11 @@ description: "Apply when delegating subtasks to DeepSeek Flash, GLM Flash or GLM
 
 # OpenRouter Delegation
 
-Model split via OpenRouter, quality over speed. Roles set by blind-judged A/B, 2026-10-07 (n=5 per comparison).
+Model split via OpenRouter, quality over speed. Roles set by blind-judged A/B, 2026-10-07 (n=5 diffs; glm-5.3 high vs max n=2).
 
 - **Code Generation & Execution**: `deepseek/deepseek-v4.1-flash` ($0.30/M prompt, $1.20/M completion)
   - Use for: implementation from spec, refactoring, test suite authoring, terminal-heavy tasks.
-  - **Reasoning Effort**: `high` for standard features, algorithms, and comprehensive test fixtures.
+  - **Reasoning Effort**: `high` for standard features, algorithms, test fixtures.
   - **Escalation**: Frontier algorithms or complex state engines where flash hits capability ceiling, rerun `deepseek/deepseek-v4.1-flash` at `max`. Still stuck: full model, `glm_subtask(model="z-ai/glm-5.3", effort="max")`. Its $0.07/$7.00 list price unreliable (endpoints charge $1.32 to $8.80/M completion), so keep provider pin below.
   - **Query**: Call `deepseek_chat` MCP tool.
   - **Subtasks**: Call `deepseek_subtask` MCP tool.
@@ -17,7 +17,8 @@ Model split via OpenRouter, quality over speed. Roles set by blind-judged A/B, 2
 
 - **Critique, Audit, Planning & Root-Cause**: `deepseek/deepseek-v4.1-flash` at `high`
   - Use for: independent pre-commit diff review, invariant verification, task planning, failure root-cause diagnosis.
-  - **Review Rule**: Independent review still separate call, stronger model reviews. Same-tier cross-family review measured add nothing (GLM Flash gave empty reviews on 4 of 5 diffs).
+  - **Review Rule**: Review of V4.1 Flash code runs as a separate V4.1 Flash high call; the A/B showed no gain from same-tier cross-family review (GLM Flash returned nothing on 4 of 5 diffs). High-risk diffs go to glm-5.3 max.
+  - **Escalation**: Same as Code: rerun V4.1 Flash at `max`, then `glm_subtask(model="z-ai/glm-5.3", effort="max")`.
   - **Query**: Call `deepseek_chat` MCP tool.
   - **Subtasks**: Call `deepseek_subtask` MCP tool.
 
@@ -25,14 +26,16 @@ Model split via OpenRouter, quality over speed. Roles set by blind-judged A/B, 2
   - **Call**: `glm_subtask(model="z-ai/glm-5.3", effort="max")`, or `glm_chat` with same arguments. Never `high`: scored lower in A/B and missed a major.
 
 - **Creative Writing, Script Authoring & Vision**: `z-ai/glm-5.3-flash` at `max` ($0.15/M prompt, $0.50/M completion)
-  - **Mandate**: All creative writing and script authoring (character dialogue, narrative scenes, game scenarios, story text, branching visual novel logic) must route to GLM Flash. Vision tasks stay here too.
+  - **Mandate**: All creative writing and script authoring (character dialogue, narrative scenes, game scenarios, story text, branching visual novel logic) must route to GLM Flash.
+  - **Vision**: Vision goes through `glm_subtask` with the image file in cwd; the chat tools take text only. Untested.
+  - **Reasoning Effort**: Reasoning cannot be turned off on this model.
   - **Voice Tuning**: Enforce character voice and cadence via few-shot exemplars and explicit style constraints rather than relying purely on reasoning tokens, preventing clinical or stiff dialogue.
   - **Query**: Call `glm_chat` MCP tool.
   - **Subtasks**: Call `glm_subtask` MCP tool.
   - **Standalone**: Run `pwsh ~/scripts/openrouter/agy-glm.ps1 -p "<prompt>"` or `bash ~/scripts/openrouter/agy-glm.sh`.
   - **Open failure (2026-10-07)**: on long outputs it can return reasoning only, no text (4 of 5 long reviews); check reply non-empty.
 
-`glm_chat` and `glm_subtask` default to `z-ai/glm-5.3-flash`; pass `model="z-ai/glm-5.3"` for security role.
+`glm_chat` and `glm_subtask` default to `z-ai/glm-5.3-flash`; pass `model="z-ai/glm-5.3"` for security and plan verification.
 
 ## Reasoning Effort Parameters
 - OpenRouter unified schema: pass `reasoning: {"effort": "<level>"}` in API payload.
