@@ -471,7 +471,6 @@ def check_bridge(url, model, effort=""):
 def main():
     parser = argparse.ArgumentParser(description="CLI to OpenRouter model proxy bridge")
     parser.add_argument("--port", type=int, default=0, help="0 picks a free port")
-    parser.add_argument("--host", type=str, default="127.0.0.1")
     parser.add_argument("--model", type=str, default=os.environ.get("OPENROUTER_MODEL", DEFAULT_MODEL))
     parser.add_argument("--effort", type=str, default="", help="empty picks the model default")
     parser.add_argument("--port-file", default="",
@@ -492,14 +491,15 @@ def main():
     ProxyHandler.target_effort = args.effort
     ProxyHandler.api_key = api_key
 
-    server = HTTPServer((args.host, args.port), ProxyHandler)
+    # loopback only: the proxy has no auth and injects the OpenRouter key
+    server = HTTPServer(("127.0.0.1", args.port), ProxyHandler)
     port = server.server_address[1]
     if args.port_file:
         tmp = args.port_file + ".tmp"
         with open(tmp, "w", encoding="ascii") as f:
             f.write(str(port))
         os.replace(tmp, args.port_file)  # readers never see a half-written file
-    sys.stderr.write(f"Proxy bridge listening on http://{args.host}:{port}\n")
+    sys.stderr.write(f"Proxy bridge listening on http://127.0.0.1:{port}\n")
     sys.stderr.write(f"Target OpenRouter model: {args.model}\n")
     try:
         server.serve_forever()

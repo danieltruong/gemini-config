@@ -17,11 +17,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BRIDGE="${SCRIPT_DIR}/openrouter_bridge.py"
 LEASE="${SCRIPT_DIR}/settings_lease.py"
 
-G_NAME="ge"
-G_NAME="${G_NAME}mini"
-A_NAME="anti"
-A_NAME="${A_NAME}gravity"
-SETTINGS_FILE="${HOME}/.${G_NAME}/${A_NAME}-cli/settings.json"
+SETTINGS_FILE="${HOME}/.gemini/antigravity-cli/settings.json"
 
 # The lease tracks live launchers by pid; under Git Bash that must be the Windows pid.
 HOLDER=$$

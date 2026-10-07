@@ -14,9 +14,7 @@ $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $BridgeScript = Join-Path $ScriptDir "openrouter_bridge.py"
 $LeaseScript = Join-Path $ScriptDir "settings_lease.py"
 
-$gName = [string]::Concat("ge", "mini")
-$aName = [string]::Concat("anti", "gravity")
-$SettingsFile = [System.IO.Path]::Combine($HOME, ".$gName", "$aName-cli", "settings.json")
+$SettingsFile = [System.IO.Path]::Combine($HOME, ".gemini", "antigravity-cli", "settings.json")
 
 $TmpBase = Join-Path ([System.IO.Path]::GetTempPath()) "openrouter-bridge-$PID"
 $PortFile = "$TmpBase.port"
@@ -44,10 +42,8 @@ try {
     if ($LASTEXITCODE -ne 0) { throw "could not patch $SettingsFile" }
     $Leased = $true
 
-    $varBase = [string]::Concat("GOOGLE_", $gName.ToUpper(), "_BASE_URL")
-    $varKey = [string]::Concat($gName.ToUpper(), "_API_KEY")
-    [System.Environment]::SetEnvironmentVariable($varBase, "http://127.0.0.1:$Port", "Process")
-    [System.Environment]::SetEnvironmentVariable($varKey, "openrouter-local-key", "Process")
+    $env:GOOGLE_GEMINI_BASE_URL = "http://127.0.0.1:$Port"
+    $env:GEMINI_API_KEY = "openrouter-local-key"
 
     $Started = $true
     if ($args) {
