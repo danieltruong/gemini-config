@@ -2,7 +2,8 @@
 # Links this repo into ~/.gemini (global rules) and ~/.gemini/config (global customizations).
 param(
     [string]$GeminiDir = "$HOME\.gemini",
-    [string]$AgentsSkillsDir = "$HOME\.agents\skills"
+    [string]$AgentsSkillsDir = "$HOME\.agents\skills",
+    [string]$ScriptsDir = "$HOME\scripts"
 )
 
 $ErrorActionPreference = "Stop"
@@ -18,9 +19,26 @@ function Link-Dir($src, $dst) {
     New-Item -ItemType Junction -Path $dst -Target $src | Out-Null
 }
 
+# New-Item -ItemType SymbolicLink on Windows PowerShell 5.1 ignores Developer Mode; flag 2 below honours it.
+Add-Type -Namespace Win32 -Name Symlink -MemberDefinition '[DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)] [return: MarshalAs(UnmanagedType.I1)] public static extern bool CreateSymbolicLink(string link, string target, int flags);'
+
+# A symlink, not a hard link: git replaces a file on checkout, which strands a hard link on the old copy.
 function Link-File($src, $dst) {
-    if (Test-Path $dst) { Remove-Item $dst -Force }
-    New-Item -ItemType HardLink -Path $dst -Target $src | Out-Null
+    $item = Get-Item -LiteralPath $dst -Force -ErrorAction SilentlyContinue
+    if ($item) {
+        if ($item.Attributes -match "ReparsePoint") {
+            $target = "$(@($item.Target)[0])"
+            if ($item.LinkType -eq "SymbolicLink" -and $target -eq $src) { return }
+            throw "$dst links to $target, not $src; remove it by hand if that link is not needed, rerun"
+        }
+        Remove-Item -LiteralPath $dst -Force
+    }
+    if (-not [Win32.Symlink]::CreateSymbolicLink($dst, $src, 2)) {
+        $err = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+        # 1314 = ERROR_PRIVILEGE_NOT_HELD
+        if ($err -eq 1314) { throw "Turn on Windows Developer Mode (Settings > System > For developers) or run elevated" }
+        throw (New-Object ComponentModel.Win32Exception $err)
+    }
 }
 
 New-Item -ItemType Directory -Force -Path $Config | Out-Null
@@ -36,11 +54,11 @@ if (-not (Test-Path "$Repo\rules\local.md")) {
 foreach ($d in @("agents", "hooks", "scripts", "skills")) { Link-Dir "$Repo\$d" "$Config\$d" }
 Link-File "$Repo\hooks.json" "$Config\hooks.json"
 # OpenRouter scripts: a junction, as git checkout strands hard links; a file deleted from the repo needs no pruning.
-New-Item -ItemType Directory -Force -Path "$HOME\scripts" | Out-Null
-Link-Dir "$Repo\scripts\openrouter" "$HOME\scripts\openrouter"
+New-Item -ItemType Directory -Force -Path $ScriptsDir | Out-Null
+Link-Dir "$Repo\scripts\openrouter" "$ScriptsDir\openrouter"
 # Older installs hard-linked each file into ~/scripts itself.
 Get-ChildItem "$Repo\scripts\openrouter" -File | ForEach-Object {
-    Remove-Item "$HOME\scripts\$($_.Name)", "$HOME\scripts\__pycache__\$($_.BaseName).*.pyc" -Force -ErrorAction SilentlyContinue
+    Remove-Item "$ScriptsDir\$($_.Name)", "$ScriptsDir\__pycache__\$($_.BaseName).*.pyc" -Force -ErrorAction SilentlyContinue
 }
 
 # 3. agy scans skills in the global config dir only; ~/.agents/skills is workspace-scoped.

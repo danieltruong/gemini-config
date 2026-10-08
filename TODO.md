@@ -1,6 +1,5 @@
 # TODO
 
-- 2026-10-07: install.ps1:29 and :37 hard-link GEMINI.md and hooks.json; the first merge that touches either leaves ~/.gemini stale. Pick: Developer Mode symlink, @import stub, or copy-on-install.
 - 2026-10-12: Recheck move to `inherit` (reviewer, debugger, security-reviewer off `pro`; researcher, linter off `flash`): `python scripts/agy-audit.py --days 7`, compare `ci_first_try` and `rework` 2 weeks after merge vs before; not `pass_share` or `bm_per_report` (weaker reviewer inflates them).
 - 2026-10-12: A/B the reviewer on Gemini 3.1 Pro (High) vs Gemini 3.8 Flash (High) over 3 to 5 saved diffs with a separate blind judge; report to Daniel before changing a model again.
 - 2026-10-14: agy's call_mcp_tool passed Arguments as a JSON string to deepseek_subtask 3 times ("Invalid request parameters", GLM run 2026-10-07, transcript 2709cb2b); check whether deepseek_mcp.py should accept a string payload or the harness-worker prompt should say to pass an object.

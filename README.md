@@ -11,6 +11,8 @@ git clone https://github.com/danieltruong/gemini-config.git ~/gemini-config
 & ~/gemini-config/install.ps1
 ```
 
+On Windows, `~/.gemini/GEMINI.md` and `~/.gemini/config/hooks.json` are symbolic links to the repo files, so a `git pull` or merge shows up without a reinstall. Making a symbolic link without admin rights needs Developer Mode: Settings > System > For developers. Without it, run the installer from an elevated PowerShell. If either path is already a link to some other file, the installer stops and names it; remove that link and rerun.
+
 Linux and macOS:
 
 ```bash

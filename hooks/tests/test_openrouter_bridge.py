@@ -479,5 +479,114 @@ class InstallerTest(unittest.TestCase):
                                              "b": {"serverUrl": "u"}, "c": {"command": "n"}})
 
 
+INSTALL_SHELLS = [s for s in ("pwsh", "powershell") if os.name == "nt" and shutil.which(s)]
+
+
+def link_target(path):
+    return os.path.normcase(os.readlink(path)).removeprefix("\\\\?\\")
+
+
+def squash(text):
+    # Windows PowerShell wraps error text at the console width, even mid-word.
+    return "".join(text.split())
+
+
+@unittest.skipUnless(INSTALL_SHELLS, "needs PowerShell on Windows")
+class InstallPs1LinkTest(unittest.TestCase):
+    """Runs a copy of install.ps1 from a stand-in repo into temp dirs, never the real home."""
+
+    def fresh(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+        self.repo = self.root / "repo"
+        for d in ("rules", "agents", "hooks", "scripts/openrouter", "skills"):
+            (self.repo / d).mkdir(parents=True)
+        (self.repo / "rules" / "local.md").write_text("x")
+        (self.repo / "mcp_config.json").write_text('{"mcpServers": {}}')
+        for name in ("GEMINI.md", "hooks.json"):
+            (self.repo / name).write_text(f"repo {name}")
+        self.installer = self.repo / "install.ps1"
+        shutil.copy(REPO / "install.ps1", self.installer)
+        self.gemini = self.root / "gemini"
+        (self.gemini / "config").mkdir(parents=True)
+        self.links = {"GEMINI.md": self.gemini / "GEMINI.md", "hooks.json": self.gemini / "config" / "hooks.json"}
+
+    def install(self, shell, runs=1):
+        call = (f"& '{self.installer}' -GeminiDir '{self.gemini}' -AgentsSkillsDir '{self.root / 'skills'}' "
+                f"-ScriptsDir '{self.root / 'scripts'}'")
+        return subprocess.run([shell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", "; ".join([call] * runs)],
+                              capture_output=True, text=True)
+
+    def assert_linked(self, name):
+        link = self.links[name]
+        self.assertTrue(os.path.islink(link), link)
+        self.assertEqual(link_target(link), os.path.normcase(self.repo / name))
+
+    def test_fresh_install_links_files_and_follows_repo_edits(self):
+        for shell in INSTALL_SHELLS:
+            with self.subTest(shell=shell):
+                self.fresh()
+                # Two runs in one session: the second must leave the links alone and re-run Add-Type cleanly.
+                r = self.install(shell, runs=2)
+                self.assertEqual(r.returncode, 0, r.stderr)
+                for name in self.links:
+                    self.assert_linked(name)
+                    # git checkout deletes and rewrites a file, which a hard link would not follow.
+                    (self.repo / name).unlink()
+                    (self.repo / name).write_text("merged")
+                    self.assertEqual(self.links[name].read_text(), "merged")
+
+    def test_correct_symlink_left_alone(self):
+        for shell in INSTALL_SHELLS:
+            with self.subTest(shell=shell):
+                self.fresh()
+                self.assertEqual(self.install(shell).returncode, 0)
+                before = {n: os.lstat(p).st_ino for n, p in self.links.items()}
+                r = self.install(shell)
+                self.assertEqual(r.returncode, 0, r.stderr)
+                self.assertEqual({n: os.lstat(p).st_ino for n, p in self.links.items()}, before)
+
+    def test_plain_file_and_hard_link_replaced(self):
+        for shell in INSTALL_SHELLS:
+            with self.subTest(shell=shell):
+                self.fresh()
+                self.links["GEMINI.md"].write_text("old copy")
+                other = self.root / "other.json"
+                other.write_text("other")
+                os.link(other, self.links["hooks.json"])
+                r = self.install(shell)
+                self.assertEqual(r.returncode, 0, r.stderr)
+                for name in self.links:
+                    self.assert_linked(name)
+                self.assertEqual(other.read_text(), "other")
+
+    def test_link_elsewhere_refused(self):
+        for shell in INSTALL_SHELLS:
+            with self.subTest(shell=shell):
+                self.fresh()
+                other = self.root / "other.md"
+                other.write_text("other")
+                os.symlink(other, self.links["GEMINI.md"])
+                r = self.install(shell)
+                self.assertNotEqual(r.returncode, 0)
+                self.assertIn("linksto", squash(r.stdout + r.stderr))
+                self.assertEqual(link_target(self.links["GEMINI.md"]), os.path.normcase(other))
+
+    def test_missing_privilege_names_developer_mode(self):
+        for shell in INSTALL_SHELLS:
+            with self.subTest(shell=shell):
+                self.fresh()
+                text = self.installer.read_text(encoding="utf-8")
+                # Flag 0 drops the unprivileged-create flag, so Windows refuses as it does without Developer Mode.
+                patched = text.replace("CreateSymbolicLink($dst, $src, 2)", "CreateSymbolicLink($dst, $src, 0)")
+                self.assertNotEqual(patched, text, "CreateSymbolicLink call not found in install.ps1")
+                self.installer.write_text(patched, encoding="utf-8")
+                r = self.install(shell)
+                self.assertNotEqual(r.returncode, 0)
+                self.assertIn(squash("Turn on Windows Developer Mode (Settings > System > For developers) or run elevated"),
+                              squash(r.stdout + r.stderr))
+
+
 if __name__ == "__main__":
     unittest.main()
