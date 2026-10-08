@@ -15,7 +15,6 @@
 - 2026-09-26: ONBOARD.md:38 states a CLI thinking level that nobody has checked. Verify it or remove it.
 - 2026-09-26: The benchmark numbers in README.md:52 need a source URL.
 - 2026-09-26: Remove or justify the noqa markers in hooks/tests/test_compress.py:18 and scripts/compress-docs.py:26.
-- 2026-09-26: install.ps1:13 uses Test-Path, which returns false for a broken junction, so a broken link is not replaced.
 - 2026-09-26: rules/code.md:14 and rules/yagni.md:34 both state the ceiling rule. Keep it in one place.
 - 2026-09-26: The `*.ts` glob in rules/frontend.md also matches back-end TypeScript, so the rule loads when it does not apply.
 - 2026-09-26: scripts/agy-audit.py:732 counts a reviewer that was killed before it reported as a pass.
