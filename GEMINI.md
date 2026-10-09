@@ -96,7 +96,7 @@ Before each tool call or reply, check these points. A read or search needs only 
 ## Tools
 
 - Native tools first: `view_file`, `grep_search`, `find_by_name`, `replace_file_content`, `write_to_file`, `run_command`. Shell only when no native tool can do it.
-- MCP when it covers the domain: `playwright` for a local browser, `renpy` for a Ren'Py project, `rea` for reverse engineering a shipped binary, Electron/JavaScript app, .NET assembly or firmware (never a source repo you can read; target path rule in `rules/local.md`).
+- MCP when covers domain: `playwright` for local browser, `renpy` for Ren'Py project, `rea` for reverse engineering shipped binary, Electron/JavaScript app, .NET assembly or firmware (never source repo you can read; target path rule in `rules/local.md`).
 - Load a skill before hand-rolling its procedure: `commit-msg` for a commit message, `a11y-audit` for accessibility, `mcp-builder` for an MCP server, `skill-creator` for a new skill, `webapp-testing` for a browser flow, `pdf` for PDF work, `renpy-docs` for Ren'Py syntax, `antigravity-docs` for agent config.
 - Before writing a script or helper, look in `~/scripts`, `<ws>/.agents/scripts`, `~/.gemini/config/scripts` and the repo. An existing tool covers it: run it. Nearly covers it: extend it. Never copy-fork.
 - The second time you need the same throwaway script or one-liner, promote it: `~/scripts/<verb-noun>.sh|.py` for cross-repo use, `<ws>/.agents/scripts/` for one repo. It needs `--help`, arguments instead of hard-coded paths, and a non-zero exit on failure.
