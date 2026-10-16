@@ -13,7 +13,7 @@
     },
     "rea": {
       "command": "ssh",
-      "args": ["-T", "daniel@192.168.3.45", "rea", "mcp"]
+      "args": ["-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", "daniel@192.168.3.45", "rea", "mcp"]
     },
     "claude-code-docs": {
       "serverUrl": "https://code.claude.com/docs/mcp"

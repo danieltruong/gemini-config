@@ -5,16 +5,17 @@
 - 2026-10-14 gemini-config: move creative and script writing in rules/openrouter.md and the glm_chat default off z-ai/glm-5.3-flash to deepseek/deepseek-v4.1-flash, with reasoning disabled in openrouter_bridge.py (GLM reasoning cannot be disabled).
 - 2026-10-21: recheck the 2026-10-07 OpenRouter role change (critique to V4.1 Flash high, security to glm-5.3 max, creative to glm-5.3-flash): python scripts/agy-audit.py --days 14, judge by rework and ci_first_try, not pass_share.
 - 2026-11-04: Recheck `xiaomi/mimo-v2.6-pro` for coder A/B: loop issues on the flash sibling (XiaomiMiMo/MiMo-Code#2497, #2498) closed, and Vals TB4.0 still ranks it first under $0.50/test.
-- 2026-10-30 gemini-config: recheck Argon Medium session + flash-tier subagents (from inherit Flash High, 2026-10-16): python scripts/agy-audit.py --days 13 (skips 2026-10-16 probe runs), ci_first_try and rework vs prior 2 weeks
-- 2026-09-26: GEMINI.md:55 asks for one check per change, but GEMINI.md:76 says the writer never writes tests. Make the two agree.
+- 2026-10-16 gemini-config: A/B the reviewer on Gemini 3.1 Pro (High) vs flash-tier Gemini 3.8 Flash before keeping it on `flash`; use 3 to 5 saved diffs and a separate blind judge, and report to Daniel before changing a model again.
+- 2026-11-16 gemini-config: recheck Argon Medium session + flash-tier subagents (from inherit Flash High, 2026-10-16): `python scripts/agy-audit.py`, ci_first_try and rework for ISO weeks 43-44 vs 40-41 (a run from 2026-10-26 to 2026-11-01 shows 40-41); week 42 holds the change and probe runs.
+- 2026-09-26: GEMINI.md:54 asks for one check per change, but GEMINI.md:74 says the writer never writes tests. Make the two agree.
 - 2026-09-26: The footer in agents/reviewer.md:31 conflicts with rules/yagni.md:60. Pick one wording.
-- 2026-09-26: ONBOARD.md:38 states a CLI thinking level that nobody has checked. Verify it or remove it.
+- 2026-09-26: ONBOARD.md:40 states a CLI thinking level that nobody has checked. Verify it or remove it.
 - 2026-09-26: The benchmark numbers in README.md:54 need a source URL.
 - 2026-09-26: Remove or justify the noqa markers in hooks/tests/test_compress.py:18 and scripts/compress-docs.py:26.
 - 2026-09-26: rules/code.md:14 and rules/yagni.md:34 both state the ceiling rule. Keep it in one place.
 - 2026-09-26: The `*.ts` glob in rules/frontend.md also matches back-end TypeScript, so the rule loads when it does not apply.
-- 2026-09-26: scripts/agy-audit.py:759 counts a reviewer that was killed before it reported as a pass.
-- 2026-09-26: scripts/agy-audit.py:1129 matches the reviewer by exact name instead of `REVIEWER_AGENT`. Use the one definition.
+- 2026-09-26: scripts/agy-audit.py:757 counts a reviewer that was killed before it reported as a pass.
+- 2026-09-26: scripts/agy-audit.py:1126 matches the reviewer by exact name instead of `REVIEWER_AGENT`. Use the one definition.
 - 2026-09-26: scripts/ai-docs-lint.py:43 demands frontmatter in any project's rules/ directory when run from stop_gate. Limit it to config rule dirs.
 - 2026-09-26: scripts/ai-docs-lint.py:226 still prints warnings under --quiet.
 - 2026-09-26: scripts/compress-docs.py:38 builds the backup key twice. Keep one.

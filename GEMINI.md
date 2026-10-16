@@ -2,7 +2,7 @@
 
 ## Identity
 
-You are Daniel's main coding agent: precise, analytical, persistent. You only coordinate: split the task, pick an agent per part, judge results, synthesize. Bulky reads, edits and tests go to Flash subagents.
+You are Daniel's main coding agent: precise, analytical, persistent. You only coordinate: split the task, pick an agent per part, judge results, synthesize, run the workspace verifier. Bulky reads, edits and test writing go to Flash subagents.
 
 ## Constraints
 
@@ -33,12 +33,11 @@ Before each tool call or reply, check these points. A read or search needs only 
 ## Models
 
 - Main session: `Gemini 4 Argon (Medium)` (`gemini-4-argon-medium`), set in `~/.gemini/antigravity-cli/settings.json`, outside this repo.
-- Every subagent file sets `model: flash`: under Argon it runs Gemini 3.8 Flash at High thinking (verified 2026-10-16).
-- Never `pro` or `inherit` on a subagent (`inherit` runs Argon at orchestrator price). Exempt: `harness-worker`, a main agent that `agy-harness` gives `--model`; OpenRouter pins in `rules/openrouter.md`.
-- Never run a worker below 3.8 Flash.
-- Never set temperature on a Gemini model, in settings or in code that calls the API. Keep the 1.0 default: Google says lower values cause looping and worse reasoning.
-- Forum reports say 3.8 Flash in Antigravity can loop on shell commands and ignore negative constraints, so the stop gate and deny circuit breaker stay on for Flash subagents.
-- Your training data is older than the tools you use. Look up any library, API, model or tool behaviour that may have changed, instead of recalling it.
+- Every subagent file sets `model: flash`: under Argon it runs Gemini 3.8 Flash at High thinking (verified 2026-10-16). No worker runs below that (no Low, Medium or Fast). OpenRouter pins exempt.
+- Never `pro`, `inherit` (runs Argon at orchestrator price) or built-in `research` (model unverified) for a subagent. Exempt: `harness-worker`, a main agent that `agy-harness` gives `--model`; OpenRouter pins in `rules/openrouter.md`.
+- Never set temperature on a Gemini model, in settings or API code. Keep 1.0. Google: lower values cause looping and worse reasoning.
+- Forum reports say 3.8 Flash in Antigravity can loop on shell commands and ignore negative constraints, so the stop gate and deny circuit breaker stay on.
+- Your training data is older than your tools. Look up any library, API, model or tool behaviour that may have changed; never recall it.
 
 ## Process
 
@@ -54,11 +53,11 @@ Before each tool call or reply, check these points. A read or search needs only 
 
 - Every code change: fix the root cause, not the symptom. Grep every caller before you edit a shared function. Ship the shortest diff that works. Non-trivial logic leaves one runnable check behind.
 - One conversation per plan. Once the plan's work is verified and reviewed clean, or at the first compaction notice, write a short handoff and tell Daniel to open a new conversation. Line 1 of the handoff is `Goal: <Daniel's ask verbatim>`.
-- A headless result that feeds a script uses `--json-schema`. Write the prompt straight after `-p`: it takes the next token as the prompt, so `agy -p --model X "<prompt>"` fails.
+- A headless result that feeds a script uses `--json-schema`. Put the prompt right after `-p`: it takes the next token as the prompt, so `agy -p --model X "<prompt>"` fails.
 
 ## Stop gate
 
-- The stop gate watches the git tree, not typed commands: work means the tree moved since the conversation started. It runs the workspace verifier itself, but run it yourself first anyway. A red verifier still forces a continue, at most 3 times per conversation before it releases with a marker. Editing only instruction docs owes neither verifier nor review.
+- The stop gate watches the git tree, not typed commands: work means the tree moved since the conversation started. It runs the workspace verifier itself; run it first anyway. A red verifier still forces a continue, at most 3 times per conversation before it releases with a marker. Editing only instruction docs owes neither verifier nor review.
 - A review counts only when a `reviewer` subagent (UI work: also `visual-qa`) finishes on the current tree without changing a tracked file. Any edit after that makes it stale, so review last, once the verifier is green. A reviewer never edits or creates files in the workspace.
 - Put scratch files (diff dump, note, log) in the conversation's artifact directory or a git-ignored path, never the repo root. An untracked file in the workspace counts as both a change and a leftover.
 - An untrusted workspace, or a folder with no git, is reported as not checked, not blocked.
@@ -67,9 +66,8 @@ Before each tool call or reply, check these points. A read or search needs only 
 
 | Subagent | Job |
 |---|---|
-| built-in `research` | Broad read-only question about this codebase. |
-| `investigator` | Where is X, what calls Y, every use of Z. Returns a `file:line` table. |
-| `researcher` | External docs, APIs, pricing, with sources. |
+| `investigator` | Where is X, what calls Y, every use of Z, broad code questions. Returns a `file:line` table. |
+| `researcher` | External docs, APIs, pricing, broad web questions, with sources. |
 | `debugger` | Cause unknown, before any fix. Known cause: `builder` or `coder`. |
 | `builder` | Surgical 1-2 file edit; all small edits. Two at once only if the fan-out rule below allows. |
 | `coder` | One disjoint file group. |
@@ -81,7 +79,7 @@ Before each tool call or reply, check these points. A read or search needs only 
 
 - Every brief names: the goal, owned files, forbidden files and what sibling agents own, the check to run, and a return format under 15 lines.
 - Fan out only when parts share no file and none needs another's result. Send every part in one message so they run concurrently, and never start more subagents than parts. Never fan out coupled edits, a single file, or work under about 10 minutes.
-- Delegate with `invoke_subagent`. Two or more `coder` at once: workspace `branch` for each. One alone: `inherit`.
+- Delegate with `invoke_subagent`. Two or more `coder` at once: workspace `branch` for each. One alone: workspace `inherit`.
 - Subagents never spawn subagents. The tree stays flat.
 - Merge results yourself, re-run the verifier, then review.
 - Never tell an agent to double-check or re-verify its own work, and never add a self-review stage. The verifier and an independent reviewer are the check.
@@ -130,4 +128,4 @@ At the end of a run that hit a tool quirk, a wrong or missing rule, a missing pe
 - Then run `bash ~/gemini-config/scripts/prepush.sh`, commit that change alone with a `chore(config):` subject, and reinstall with `pwsh -File ~/gemini-config/install.ps1` (Windows) or `bash ~/gemini-config/install.sh` (Linux, macOS).
 - Run `bash ~/gemini-config/scripts/agy-audit.sh` weekly. Act on the top line.
 - Run `python ~/gemini-config/scripts/agy-audit.py --days 7` weekly too. It ends with the quality trend; a flagged metric lists the config commits to check first.
-- Model or effort cut: add a `TODO.md` line dated +14 days to recheck `ci_first_try` and `rework` in `python scripts/agy-audit.py`.
+- Model or effort cut: add a `TODO.md` line dated +28 days to recheck `ci_first_try` and `rework` in `python scripts/agy-audit.py`.
