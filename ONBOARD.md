@@ -20,7 +20,7 @@ bash ~/gemini-config/install.sh            # Linux, macOS
 
 The repo's `mcp_config.json` holds `mcpjungle`, `playwright`, `deepseek`, `rea` and `claude-code-docs`. Create `~/.gemini/config/mcp_config.local.json` for the rest, then rerun the installer: the servers that need a local app (`reaper`, `blender`, `godot-ai`, `renpy`), a `deepseek` override when this machine needs another Python, and the `Authorization` header for `mcpjungle`. Keep that header out of the repo.
 
-`rea` runs `ssh daniel@192.168.3.45 rea mcp`, so it needs LAN reach to that host and key auth for that user. Its ssh options (`BatchMode=yes`, `ConnectTimeout=5`) make a box without either fail within 5 seconds instead of hanging or asking for a password. There is no local way to turn it off: the installer merges local entries per key, so `"rea": { "disabled": true }` only adds that key, and agy ignores `disabled` (see README). The merge cannot remove a repo server either.
+`rea` runs `ssh daniel@192.168.3.45 rea mcp`, so it needs LAN reach to that host and key auth for that user. Its ssh options (`BatchMode=yes`, `ConnectTimeout=5`) make a box without either fail within 5 seconds instead of hanging or asking for a password. To turn it off on such a box, override its `command` and `args` in `mcp_config.local.json` with a command that exits at once (on Windows: `"command": "cmd", "args": ["/c", "exit"]`), then rerun the installer. The installer merges local entries per key, so this entry replaces the ssh command. `"rea": { "disabled": true }` does not work: it only adds that key, and agy ignores `disabled` (see README). The merge cannot remove a repo server.
 
 ```json
 { "mcpServers": { "renpy": { "command": "python", "args": ["-m", "renpy_mcp.server"] } } }
