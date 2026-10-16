@@ -13,8 +13,8 @@
 - 2026-09-26: Remove or justify the noqa markers in hooks/tests/test_compress.py:18 and scripts/compress-docs.py:26.
 - 2026-09-26: rules/code.md:14 and rules/yagni.md:34 both state the ceiling rule. Keep it in one place.
 - 2026-09-26: The `*.ts` glob in rules/frontend.md also matches back-end TypeScript, so the rule loads when it does not apply.
-- 2026-09-26: scripts/agy-audit.py:732 counts a reviewer that was killed before it reported as a pass.
-- 2026-09-26: scripts/agy-audit.py:1093 matches the reviewer by exact name instead of `REVIEWER_AGENT`. Use the one definition.
+- 2026-09-26: scripts/agy-audit.py:759 counts a reviewer that was killed before it reported as a pass.
+- 2026-09-26: scripts/agy-audit.py:1129 matches the reviewer by exact name instead of `REVIEWER_AGENT`. Use the one definition.
 - 2026-09-26: scripts/ai-docs-lint.py:43 demands frontmatter in any project's rules/ directory when run from stop_gate. Limit it to config rule dirs.
 - 2026-09-26: scripts/ai-docs-lint.py:226 still prints warnings under --quiet.
 - 2026-09-26: scripts/compress-docs.py:38 builds the backup key twice. Keep one.
