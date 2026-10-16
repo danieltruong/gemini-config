@@ -41,7 +41,7 @@ agy 1.1.27 does not dispatch `PostToolUse` hooks. `PreToolUse`, `PreInvocation` 
 
 The `reinforce` hook runs at `PreInvocation`. On the first turn and every tenth it repeats three working rules: reply tersely, ship the shortest working diff, add no filler. On every turn it records the baseline `stop-gate` compares against, and once per conversation it repeats any note about work an earlier run left unchecked.
 
-Machine-local MCP servers go in `~/.gemini/config/mcp_config.local.json`. The installer merges it over the repo file. It is not tracked. The installer also turns a leading `~/` (or `~\` on Windows) in any server's `args` into the real home path.
+The repo file holds `mcpjungle`, `playwright`, `deepseek`, `rea` and `claude-code-docs`. Machine-local MCP servers go in `~/.gemini/config/mcp_config.local.json`: the ones that need a local app (`reaper`, `blender`, `godot-ai`, `renpy`), any `deepseek` override, and the `Authorization` header for `mcpjungle`. The installer merges it over the repo file. It is not tracked. The installer also turns a leading `~/` (or `~\` on Windows) in any server's `args` into the real home path.
 
 The `deepseek` MCP server runs on whichever `python` is first on PATH. Run `pip install mcp` with that same Python. The server reads `OPENROUTER_API_KEY` from the environment. To use another Python, override the `deepseek` entry's `command` in `mcp_config.local.json`. The same server holds the GLM tools. DeepSeek V4.1 Flash writes code and does review, planning and root-cause work. GLM 5.3 Flash writes creative text and scripts and handles images. GLM 5.3 checks security, plan verification and high-risk diffs. `rules/openrouter.md` has the full split.
 
@@ -49,9 +49,9 @@ The `deepseek` MCP server runs on whichever `python` is first on PATH. Run `pip 
 
 ## Subagents
 
-The main agent does the judgement work itself. It hands work to a subagent only for parts that can run in parallel without each other, for a check that has to be independent, or when the work would not fit in its own context. Each subagent starts with a clean context and one job, so nobody inherits another agent's assumptions. None of them can spawn a subagent of its own.
+The main agent only coordinates. It splits the task, picks a subagent for each part, judges what comes back and writes the answer. Bulky reading, every edit and every test go to a subagent. Each subagent starts with a clean context and one job, so nobody inherits another agent's assumptions. None of them can spawn a subagent of its own.
 
-Every agent file sets `model: inherit`, so each one runs on the session model, Gemini 3.8 Flash (High). Artificial Analysis scores 3.8 Flash above 3.1 Pro (41 vs 30 on its index) and well ahead on agentic benchmarks. The thinking level behind the `flash` and `pro` tiers is not documented, and inherit is the only way to be sure a subagent runs at High. So no subagent sets a Gemini tier. The exception is an OpenRouter model pinned by `rules/openrouter.md`; `agy-audit.py` does not count those as drift.
+The session runs Gemini 4 Argon (Medium). Every subagent file sets `model: flash`. A probe on 2026-10-16 showed that under an Argon session this tier runs Gemini 3.8 Flash with the same thinking as Flash High, and that the file's tier wins over the `inherit` the main agent passes at spawn time. `inherit` would run the subagent on Argon at orchestrator price, so no subagent uses it. The exception is `harness-worker`: it is a main agent, and `agy-harness` passes `--model` for it. Artificial Analysis scores 3.8 Flash above 3.1 Pro (41 vs 30 on its index) and well ahead on agentic benchmarks, so no subagent uses `pro`. An OpenRouter model pinned by `rules/openrouter.md` is also allowed; `agy-audit.py` does not count those as drift.
 
 | Agent | Writes files | Returns |
 |---|---|---|
@@ -66,7 +66,7 @@ Every agent file sets `model: inherit`, so each one runs on the session model, G
 | `visual-qa` | no | table of page, bullet, pass or fail, defect |
 | `researcher` | no | answer first, then one source URL per claim |
 
-Diagnose an unknown cause before any fix. The main agent does it itself, or sends it to `debugger` when the evidence would flood its context or needs an independent look; guessing in an agent that can write files is how a symptom gets patched. Send the diff to `security-reviewer` as well as `reviewer` when it touches auth, input parsing, or anything reachable from the internet.
+Diagnose an unknown cause before any fix. The main agent sends it to `debugger`, or to `investigator` when the question is only where the code is; guessing in an agent that can write files is how a symptom gets patched. A known cause goes straight to `builder` or `coder`. Send the diff to `security-reviewer` as well as `reviewer` when it touches auth, input parsing, or anything reachable from the internet.
 
 A brief has to name the goal, the owned files, the forbidden files, what sibling agents own, the check to run, and the return format. `reviewer` gets the diff and nothing else, since sharing the plan that produced the code makes it agree with the code.
 

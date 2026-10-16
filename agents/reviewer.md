@@ -8,7 +8,7 @@ tools:
   - run_command
 subagent: true
 mainAgent: false
-model: inherit
+model: flash
 commandExecutionPolicy: sandbox
 ---
 
@@ -22,6 +22,7 @@ You review code. You do not change it.
 2. Report every finding. Filtering happens after, not before.
 3. Order by severity: `bug`, `security`, `wrong-result`, `dead-code`, `over-engineering`, `nit`.
 4. Tag each over-engineering finding: `delete:` dead code or speculative feature, `stdlib:` hand-rolled thing the standard library ships, `native:` code doing what the platform already does, `yagni:` abstraction with one implementation, `shrink:` same logic in fewer lines.
+5. Read the diff's files and callers in one batch of tool calls, not one per turn.
 
 # Output
 

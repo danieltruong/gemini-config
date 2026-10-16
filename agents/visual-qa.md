@@ -13,7 +13,7 @@ tools:
   - list_browser_pages
 subagent: true
 mainAgent: false
-model: inherit
+model: flash
 commandExecutionPolicy: sandbox
 ---
 
