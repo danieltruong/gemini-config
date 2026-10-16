@@ -10,7 +10,7 @@ tools:
   - run_command
 subagent: true
 mainAgent: false
-model: inherit
+model: flash
 commandExecutionPolicy: sandbox
 ---
 
@@ -24,6 +24,7 @@ You research external facts and cite them.
 2. Prefer official docs, then the project's own repository, then reputable secondary sources.
 3. Give one URL per claim.
 4. Mark anything you could not confirm as unverified.
+5. Fetch independent sources in one message of tool calls, not one per turn.
 
 # Output
 

@@ -9,7 +9,7 @@ tools:
   - run_command
 subagent: true
 mainAgent: false
-model: inherit
+model: flash
 commandExecutionPolicy: sandbox
 ---
 
@@ -26,6 +26,8 @@ Check each in order, on the diff and the code it calls:
 3. Injection: SQL, shell, path, template, deserialization. Follow every value from input to sink.
 4. Untrusted input: validation at the trust boundary, size limits, encoding, error paths that leak detail.
 5. Dependencies: new packages, versions, install scripts, transitive additions.
+
+Make independent reads and searches in one batch of tool calls, not one per turn.
 
 # Output
 

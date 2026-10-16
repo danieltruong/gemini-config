@@ -18,7 +18,7 @@ bash ~/gemini-config/install.sh            # Linux, macOS
 
 ## 3. Machine-local MCP servers
 
-Create `~/.gemini/config/mcp_config.local.json` with any server that has machine-specific paths, then rerun the installer.
+The repo's `mcp_config.json` holds `mcpjungle`, `playwright`, `deepseek`, `rea` and `claude-code-docs`. Create `~/.gemini/config/mcp_config.local.json` for the rest, then rerun the installer: the servers that need a local app (`reaper`, `blender`, `godot-ai`, `renpy`), a `deepseek` override when this machine needs another Python, and the `Authorization` header for `mcpjungle`. Keep that header out of the repo.
 
 ```json
 { "mcpServers": { "renpy": { "command": "python", "args": ["-m", "renpy_mcp.server"] } } }
@@ -32,7 +32,7 @@ Copy `rules/local.example.md` to `rules/local.md`, change its `trigger` to `alwa
 
 Edit `~/.gemini/antigravity-cli/settings.json`:
 
-- `model`: `Gemini 3.8 Flash (High)`. The settings file takes the display name from `agy models`, not the ID. Every subagent inherits this model, so it sets their thinking level too. Never pick a Low, Medium or Fast preset. Do not set a temperature; Gemini 3 needs the 1.0 default.
+- `model`: `Gemini 4 Argon (Medium)`, the coordinating session. Pick it with `/model` or write it here; the settings file takes the display name from `agy models`, not the ID. Subagents do not inherit it: each agent file sets the `flash` tier, which runs Gemini 3.8 Flash at High thinking. Do not set a temperature; Gemini models need the 1.0 default.
 - `trustedWorkspaces`: list project folders. Do not trust a whole drive. A trusted folder auto-loads any `.agents/hooks.json` and MCP servers found under it.
 
 If you also use Gemini CLI, edit `~/.gemini/settings.json`: set `model.name` to `gemini-3.8-flash` and `general.plan.modelRouting` to `false`, so plan mode does not switch models for implementation.
@@ -41,7 +41,7 @@ If you also use Gemini CLI, edit `~/.gemini/settings.json`: set `model.name` to 
 
 ```bash
 bash scripts/prepush.sh    # docs lint, hook tests, audit self-check
-agy mcp list               # shows playwright, plus local servers
+agy mcp list               # shows the repo servers, plus local ones
 ```
 
 Subagents are `mainAgent: false`, so `agy agents` does not list them; README.md shows how to ask for the roster.

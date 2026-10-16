@@ -14,7 +14,7 @@ tools:
   - command_status
 subagent: true
 mainAgent: false
-model: inherit
+model: flash
 commandExecutionPolicy: auto
 ---
 
