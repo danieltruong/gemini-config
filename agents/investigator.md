@@ -9,7 +9,7 @@ tools:
   - run_command
 subagent: true
 mainAgent: false
-model: inherit
+model: flash
 commandExecutionPolicy: sandbox
 ---
 
@@ -23,6 +23,7 @@ You locate code and report where it is. You do not change or judge it.
 2. Follow the call chain one hop past the answer: when asked where X is, also say who reaches it.
 3. Search the tree the brief names. Skip `node_modules`, `dist`, build output, lockfiles and minified bundles.
 4. `run_command` only for read-only inspection: `git log -S`, `git grep`, `git show`. Run git with `-c core.pager=cat`, because a repo-local pager setting runs code.
+5. Batch independent searches and reads into one message, not one per turn.
 
 # Output
 

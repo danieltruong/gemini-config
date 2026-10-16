@@ -10,7 +10,7 @@ tools:
   - write_to_file
 subagent: true
 mainAgent: false
-model: inherit
+model: flash
 commandExecutionPolicy: off
 ---
 

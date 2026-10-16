@@ -10,6 +10,13 @@
     "deepseek": {
       "command": "python",
       "args": ["~/scripts/openrouter/deepseek_mcp.py"]
+    },
+    "rea": {
+      "command": "ssh",
+      "args": ["-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", "daniel@192.168.3.45", "rea", "mcp"]
+    },
+    "claude-code-docs": {
+      "serverUrl": "https://code.claude.com/docs/mcp"
     }
   }
 }
