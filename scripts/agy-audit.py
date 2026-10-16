@@ -349,13 +349,42 @@ def checkout_key(path):
     return os.path.normcase(path)
 
 
-def off_session_model(requested, session_model):
-    """Did a subagent spawn pin a model other than the exact one its parent ran on?
-    Every agent inherits, so a tier alias ("flash", "pro") counts as drift too.
-    OpenRouter pins do not."""
-    requested = requested.strip().lower()
-    return (requested not in INHERIT_MODELS and requested != session_model.strip().lower()
-            and requested not in OPENROUTER_MODELS)
+POLICY_FLASH = "gemini-3.8-flash"
+
+
+def top_model(models):
+    return models.most_common(1)[0][0] if models else ""
+
+
+def model_policy(model):
+    """Class of a subagent model: "inherit", "flash", "openrouter" or "off". Argon orchestrates,
+    subagents run Flash 3.8, so argon, pro and other gemini are drift; OpenRouter pins are not."""
+    model = model.strip().lower()
+    if model in INHERIT_MODELS:
+        return "inherit"
+    if model == "flash" or model.startswith(POLICY_FLASH):
+        return "flash"
+    if model in OPENROUTER_MODELS:
+        return "openrouter"
+    return "off"
+
+
+def off_policy_model(requested):
+    """Did a subagent spawn request a model the policy does not allow?"""
+    return model_policy(requested) == "off"
+
+
+def subagent_policy(rec, by_id):
+    """Class of the model a subagent mostly ran on, None if none. A pinned slug counts only under
+    an OpenRouter launcher parent; a parent outside the window is trusted (only it routes there)."""
+    cls = model_policy(top_model(rec["models"]))
+    if cls == "inherit":
+        return None
+    parent = by_id.get(rec["parent"])
+    if (cls == "openrouter" and parent and parent["models"]
+            and model_policy(top_model(parent["models"])) != "openrouter"):
+        return "off"
+    return cls
 
 
 def peak_overlap(spans):
@@ -568,7 +597,6 @@ def audit_conversation(root, cid, summary, since):
             rec["models"][gen["model"]] += 1
     order = [g["model"] for g in gens if g["model"]]
     rec["model_switches"] = sum(1 for a, b in zip(order, order[1:]) if a != b)
-    session_model = rec["models"].most_common(1)[0][0] if rec["models"] else ""
 
     last_signature = None
     repeat_run = 0
@@ -679,8 +707,7 @@ def audit_conversation(root, cid, summary, since):
             for spec in specs:
                 rec["subagents"][str(spec.get("TypeName") or spec.get("Role") or "?")] += 1
                 rec["subagent_models"][str(spec.get("Model") or "?")] += 1
-                rec["off_model_spawns"] += off_session_model(
-                    str(spec.get("Model") or ""), session_model)
+                rec["off_model_spawns"] += off_policy_model(str(spec.get("Model") or ""))
             if name == "send_message":
                 sent.append(str(args.get("Message") or ""))
             if name in EDIT_TOOLS:
@@ -1089,6 +1116,15 @@ def report(records, days, since, out_dir, snapshot_dir, skipped, quality):
             children[rec["parent"]].append((rec["start"], rec["end"]))
     peaks = collections.Counter({parent: peak_overlap(spans)
                                  for parent, spans in children.items()})
+    # recorded model, not the spawn request: a flash-tier agent still spawns as inherit
+    by_id = {r["conversation_id"]: r for r in records}
+    policy, off_models = collections.Counter(flash=0, openrouter=0, off=0), collections.Counter()
+    for rec in records:
+        cls = subagent_policy(rec, by_id) if rec["is_subagent"] else None
+        if cls:
+            policy[cls] += 1
+            if cls == "off":
+                off_models[top_model(rec["models"])] += 1
     reviewer_diffs = sorted(r["reviewer_diff_lines"] for r in records
                             if r["agent_name"] == "reviewer" and r["reviewer_diff_lines"])
 
@@ -1145,13 +1181,17 @@ def report(records, days, since, out_dir, snapshot_dir, skipped, quality):
     line("conversations on 2+ models / switches",
          f"{sum(1 for r in records if len(r['models']) > 1)} / "
          f"{sum(r['model_switches'] for r in records)}")
-    # policy is model: inherit, so a spawn pinning another model is drift
-    line("subagent spawns off the session model", sum(r["off_model_spawns"] for r in records))
+    # policy: inherit or the flash tier; a spawn pinning argon, pro or another gemini is drift
+    line("subagent spawns asking off-policy model",sum(r["off_model_spawns"] for r in records))
     print("    subagent model requests:")
     submodels = collections.Counter()
     for rec in records:
         submodels.update(rec["subagent_models"])
     top(submodels, 5)
+    line("subagent conversations off policy",
+         f"{policy['off']} of {sum(policy.values())} "
+         f"(flash {policy['flash']}, openrouter session {policy['openrouter']})")
+    top(off_models, 5)
 
     print("\nTOOL USE")
     line("tool calls", total_tool_calls)
@@ -1338,6 +1378,7 @@ def report(records, days, since, out_dir, snapshot_dir, skipped, quality):
         "reviewer_diff_lines_median": percentile(reviewer_diffs, 0.5),
         "reviewer_diff_lines_max": max(reviewer_diffs, default=0),
         "tokens_total": tok_in + tok_cached + tok_out,
+        "subagents_off_policy": policy["off"],
     }
     path, previous, delta = save_snapshot(metrics, snapshot_dir)
     print(f"snapshot: {path}")
@@ -1382,12 +1423,28 @@ def self_check():
         "failed at line N in <hex>"
     assert workspace_of('["file:///F:/Factory/renpy/Birth%20Battle"]') == \
         "F:/Factory/renpy/Birth Battle"
-    for requested in ("gemini-3.1-pro", "flash", "pro", "gemini-3.8-flash",
-                      "deepseek/deepseek-r2", "z-ai/glm-4.6"):
-        assert off_session_model(requested, "gemini-3.8-flash-high"), requested
-    for requested in ("", "inherit", "Inherit", "gemini-3.8-flash-high", "Gemini-3.8-Flash-High",
-                      "deepseek/deepseek-v4.1-flash", "z-ai/glm-5.3-flash", "Z-AI/GLM-5.3"):
-        assert not off_session_model(requested, "gemini-3.8-flash-high"), requested
+    for requested in ("gemini-3.1-pro", "pro", "gemini-4-argon", "Gemini-4-Argon-Trial",
+                      "gemini-3.1-pro-low", "deepseek/deepseek-r2", "z-ai/glm-4.6"):
+        assert off_policy_model(requested), requested
+    for requested in ("", "inherit", "Inherit", "flash", "gemini-3.8-flash",
+                      "Gemini-3.8-Flash-High", "deepseek/deepseek-v4.1-flash",
+                      "z-ai/glm-5.3-flash", "Z-AI/GLM-5.3"):
+        assert not off_policy_model(requested), requested
+
+    def sub(cid, model, parent=""):
+        return {"conversation_id": cid, "parent": parent,
+                "models": collections.Counter({model: 3} if model else {})}
+    launcher, argon = sub("L", "deepseek/deepseek-v4.1-flash"), sub("A", "gemini-4-argon-trial")
+    by_id = {"L": launcher, "A": argon}
+    assert subagent_policy(sub("s1", "gemini-3.8-flash-tiered", "A"), by_id) == "flash"
+    assert subagent_policy(sub("s2", "gemini-3.8-flash-n", "A"), by_id) == "flash"
+    assert subagent_policy(sub("s3", "gemini-4-argon-trial", "A"), by_id) == "off"
+    assert subagent_policy(sub("s4", "gemini-3.1-pro-low", "A"), by_id) == "off"
+    assert subagent_policy(sub("s5", "deepseek/deepseek-v4.1-flash", "L"), by_id) == "openrouter"
+    assert subagent_policy(sub("s6", "deepseek/deepseek-v4.1-flash", "gone"), by_id) == "openrouter"
+    assert subagent_policy(sub("s7", "deepseek/deepseek-v4.1-flash", "A"), by_id) == "off"
+    assert subagent_policy(sub("s8", "deepseek/deepseek-r2", "L"), by_id) == "off"
+    assert subagent_policy(sub("s9", ""), by_id) is None
 
     assert result_failed('{"success":true,"exit_code":0}') == ""
     assert result_failed('{"success":true,"exit_code":2}') == "exit_code 2"
