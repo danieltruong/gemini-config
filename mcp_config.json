@@ -27,8 +27,7 @@
         "FASTEMBED_CACHE_PATH": "F:/qdrant/fastembed_cache",
         "TOOL_STORE_DESCRIPTION": "Save a note that every coding agent on this machine can find later. Use it for every decision and why, gotcha, fix that worked, failed approach, and external fact you learn. Write 1 to 3 plain sentences. Metadata: repo, date (ISO), kind. Never store secrets.",
         "TOOL_FIND_DESCRIPTION": "Search notes left by any coding agent on this machine. Call it first, before reading code or searching the web, with the repo name and task topic. Call it again when stuck, before a decision, and before asking the user."
-      },
-      "timeout": 60000
+      }
     }
   }
 }

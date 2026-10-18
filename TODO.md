@@ -7,7 +7,7 @@
 - 2026-11-04: Recheck `xiaomi/mimo-v2.6-pro` for coder A/B: loop issues on the flash sibling (XiaomiMiMo/MiMo-Code#2497, #2498) closed, and Vals TB4.0 still ranks it first under $0.50/test.
 - 2026-10-16 gemini-config: A/B the reviewer on Gemini 3.1 Pro (High) vs flash-tier Gemini 3.8 Flash before keeping it on `flash`; use 3 to 5 saved diffs and a separate blind judge, and report to Daniel before changing a model again.
 - 2026-11-16 gemini-config: recheck Argon Medium session + flash-tier subagents (from inherit Flash High, 2026-10-16): `python scripts/agy-audit.py`, ci_first_try and rework for ISO weeks 43-44 vs 40-41 (a run from 2026-10-26 to 2026-11-01 shows 40-41); week 42 holds the change and probe runs.
-- 2026-09-26: GEMINI.md:54 asks for one check per change, but GEMINI.md:74 says the writer never writes tests. Make the two agree.
+- 2026-09-26: GEMINI.md:52 asks for one check per change, but GEMINI.md:72 says the writer never writes tests. Make the two agree.
 - 2026-09-26: The footer in agents/reviewer.md:31 conflicts with rules/yagni.md:60. Pick one wording.
 - 2026-09-26: ONBOARD.md:40 states a CLI thinking level that nobody has checked. Verify it or remove it.
 - 2026-09-26: The benchmark numbers in README.md:54 need a source URL.
