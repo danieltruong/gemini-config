@@ -17,6 +17,16 @@
     },
     "claude-code-docs": {
       "serverUrl": "https://code.claude.com/docs/mcp"
+    },
+    "qdrant": {
+      "command": "uvx",
+      "args": ["mcp-server-qdrant"],
+      "env": {
+        "QDRANT_URL": "http://127.0.0.1:6333",
+        "COLLECTION_NAME": "agent-memory",
+        "FASTEMBED_CACHE_PATH": "F:/qdrant/fastembed_cache"
+      },
+      "timeout": 60000
     }
   }
 }
