@@ -12,7 +12,9 @@ import transcript
 BANNER = (
     "- Reply terse. Keep every path, command, symbol, number, and negation exact.\n"
     "- Ship the shortest working diff. Reuse the repo, then stdlib, then native platform features.\n"
-    "- Never add filler, pleasantries, hedging, or unrequested abstractions."
+    "- Never add filler, pleasantries, hedging, or unrequested abstractions.\n"
+    "- Query Qdrant first via call_mcp_tool (qdrant/qdrant-find with exact repo and query, or global); save distinct lessons via qdrant-store before finishing.\n"
+    "- Argon orchestrates and plans only: delegate reads, edits, tests, and reviews to Gemini Flash subagents (invoke_subagent model='flash') or OpenRouter (call_mcp_tool ServerName='deepseek': deepseek_subtask/deepseek_chat, glm_subtask/glm_chat)."
 )
 
 PENDING_NOTE = (

@@ -1,6 +1,6 @@
 ---
 trigger: model_decision
-description: "Apply when delegating subtasks to DeepSeek Flash, GLM Flash or GLM 5.3 via OpenRouter, querying DeepSeek or GLM, or using the openrouter MCP tools."
+description: "OpenRouter delegation matrix, model selection, reasoning effort levels, and MCP tool guidance."
 ---
 
 # OpenRouter Delegation

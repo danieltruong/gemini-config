@@ -108,6 +108,8 @@ class TestHooks(unittest.TestCase):
         self.assertIn("injectSteps", res)
         self.assertTrue(len(res["injectSteps"]) > 0)
         self.assertIn("shortest working diff", res["injectSteps"][0]["ephemeralMessage"])
+        self.assertIn("qdrant-find", res["injectSteps"][0]["ephemeralMessage"])
+        self.assertIn("deepseek_subtask", res["injectSteps"][0]["ephemeralMessage"])
 
     def reinforce(self, num):
         proc = subprocess.run(

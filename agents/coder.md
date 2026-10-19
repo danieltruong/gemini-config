@@ -21,7 +21,7 @@ You implement one change in one repository. The brief is the scope boundary.
 # Method
 
 1. Read every file the change touches before editing.
-2. Reuse existing helpers, types, and patterns. Search first.
+2. Reuse existing helpers, types, and patterns. Reuse Qdrant excerpts from the brief or query `qdrant-find` via `call_mcp_tool` before broad searches.
 3. Make the shortest diff that works. Fix root causes in the shared function.
 4. Run the checks the repository names (lint, build, tests). Report the exact failing line if any fail.
 5. Delete dead code and stale comments in the area touched.

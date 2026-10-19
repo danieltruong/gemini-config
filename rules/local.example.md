@@ -9,3 +9,4 @@ Every other rule stays portable. A path that differs per machine lives only in `
 
 - Ren'Py SDK: `<sdk>`, for example `F:/Factory/renpy`. Every project is a subdirectory, for example `<sdk>/Birth Battle`.
 - REA: the `rea` MCP server runs on `rea-lxc` (192.168.3.45). Copy a target to its share, for example `\\192.168.3.45\re` mapped as `Q:\`, and pass it as `/srv/re/<file>`.
+- Qdrant: root `<qdrant-path>`, e.g. `F:/qdrant`. Indexed repos: `Koikatsu Sunshine EX`, `Birth Battle`, `all-in-one-downloader`, `gemini-config`. Shared notes: `codex-config`, `global`. CLI fallback: `<qdrant-path>/bin/memory.cmd`; docs: `<qdrant-path>/USAGE.md`.

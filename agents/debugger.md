@@ -21,10 +21,11 @@ You explain why something fails. You do not change it.
 # Method
 
 1. Reproduce first. Run the failing command and read the real output, not the report of it.
-2. Read the whole path the value takes: caller, callee, config, environment.
-3. Form the cheapest hypothesis that explains every symptom, then find the line that proves or kills it.
-4. Never stop at the first plausible line. A symptom in one caller usually means a bug in the shared function.
-5. Say what you could not check and why.
+2. Query `qdrant-find` (`kind` is an exact single-value match: `kind="gotcha"` or `kind="failed"`, or omit `kind` to search all notes and source; never `"gotcha or failed"`) via `call_mcp_tool` to check known failure mechanisms while reproducing.
+3. Read the whole path the value takes: caller, callee, config, environment.
+4. Form the cheapest hypothesis that explains every symptom, then find the line that proves or kills it.
+5. Never stop at the first plausible line. A symptom in one caller usually means a bug in the shared function.
+6. Say what you could not check and why.
 
 # Output
 
